@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "pynecore_bybit" = "src/pynecore_bybit" }
+packages.find = { where = ["src"] }
+
+[project]
+name = "pynesys-pynecore-bybit"
+version = "0.1.0"
+description = "Bybit v5 spot integration for PyneCore"
+authors = [{ name = "PYNESYS LLC", email = "hello@pynesys.com" }]
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = ["pynesys-pynecore>=6.5", "httpx", "websockets"]
+
+[project.entry-points."pyne.plugin"]
+bybit = "pynecore_bybit:Bybit"
