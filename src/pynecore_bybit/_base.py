@@ -1,16 +1,28 @@
 """Type-only shared base class for the Bybit plugin's mix-ins.
 
-Mirrors the Capital.com / Coinbase plugin layout — every mix-in inherits
+Mirrors the Capital.com / cTrader plugin layout — every mix-in inherits
 from :class:`_BybitBase` so static analysers (PyCharm, pyright) can resolve
 ``self.<attr>`` and Bybit-private cross-mix-in method calls without
-warnings. Instance attribute annotations and Bybit-private method
-signatures grow here as additional mix-ins land (the broker surface
-arrives in M2; the base then moves under ``BrokerPlugin``).
+warnings. The class declares:
+
+* Every instance attribute the constructor sets, as a class-level type
+  annotation. The runtime ``__init__`` of the final :class:`Bybit` class
+  assigns concrete values; the annotations exist purely for the type
+  system.
+
+* Bybit-private method signatures that one mix-in calls on another (with
+  ``...`` body). The implementation lives in whichever mix-in owns the
+  concern.
+
+Since M2 the base derives from :class:`~pynecore.core.plugin.broker.BrokerPlugin`
+(which extends the live-provider surface), so the provider mix-ins keep
+working unchanged while the broker mix-ins add the execution side.
 """
 import asyncio
 from typing import TYPE_CHECKING
 
-from pynecore.core.plugin.live_provider import LiveProviderPlugin
+from pynecore.core.broker.models import LegType
+from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.types.ohlcv import OHLCV
 
 from .config import BybitConfig
@@ -18,12 +30,15 @@ from .config import BybitConfig
 if TYPE_CHECKING:
     import httpx
 
+    from pynecore.core.broker.spot_inventory import SpotInventoryManager
+
     from .hosts import BybitHosts
+    from .inventory import _BybitSpotPort
     from .models import InstrumentInfo
     from .ws import BybitWebSocket
 
 
-class _BybitBase(LiveProviderPlugin[BybitConfig]):
+class _BybitBase(BrokerPlugin[BybitConfig]):
     """Shared instance state + Bybit-private cross-mix-in surface.
 
     Concrete implementations live in the individual mix-ins; this class
@@ -34,6 +49,11 @@ class _BybitBase(LiveProviderPlugin[BybitConfig]):
     plugin_name = "Bybit"
     Config = BybitConfig
     timezone = 'UTC'
+
+    # ``orderLinkId`` accepts up to 36 characters (letters, digits, dash,
+    # underscore) — wider than the canonical 30, so canonical ids pass
+    # through unshortened.
+    client_order_id_max_len = 36
 
     # The kline topic pushes only on trade activity (plus the confirm
     # snapshot at bar close), so a quiet instrument legitimately produces
@@ -59,8 +79,7 @@ class _BybitBase(LiveProviderPlugin[BybitConfig]):
 
     # --- Instrument resolution state (provider.py) ---
     # Normalized instrument-rule cache keyed by ``(category, symbol)``,
-    # shared by symbol resolution, SymInfo synthesis and (from M2) order
-    # quantization.
+    # shared by symbol resolution, SymInfo synthesis and order quantization.
     _instruments: 'dict[tuple[str, str], InstrumentInfo]'
     # The chart symbol's resolved instrument, pinned on first use.
     _market: 'InstrumentInfo | None'
@@ -91,6 +110,44 @@ class _BybitBase(LiveProviderPlugin[BybitConfig]):
     # (``None`` = no backfill pending). See ``connect()`` for the ordering
     # invariant it protects.
     _pending_closed: 'list[OHLCV] | None'
+    # Most recent trade price observed on the kline stream (forming or
+    # closed bar close). Feeds the spot position mark and the market-order
+    # minimum-notional pre-check; ``None`` before the first push.
+    _last_price: float | None
+
+    # --- Broker state (state.py / execution.py / events.py) ---
+    # Private-stream connection, owned by the ``watch_orders`` loop.
+    _private_ws: 'BybitWebSocket | None'
+    # Raw private-stream frames (order / execution / wallet topics),
+    # produced by the WS callback, consumed by ``watch_orders``. ``None``
+    # sentinel = the private transport died (reconnect needed).
+    _private_events: 'asyncio.Queue[dict | None] | None'
+    # Core spot inventory manager, constructed on the first broker call
+    # after ``store_ctx`` is available. ``None`` without persistence.
+    _spot_manager: 'SpotInventoryManager | None'
+    # The inventory port instance behind ``_spot_manager`` — the event
+    # stream reuses its execution-row parser. ``None`` alongside the manager.
+    _spot_port: '_BybitSpotPort | None'
+    # One-shot guard + lock around the broker-startup sequence
+    # (manager construction + ``startup()``), shared by every entry point
+    # on the broker event loop.
+    _broker_started: bool
+    _broker_start_lock: asyncio.Lock
+    # In-memory Pine-identity index for dispatched orders, keyed by the
+    # ``orderLinkId``: ``(pine_id, from_entry, leg_type)``. The BrokerStore
+    # rows are the durable copy; this map serves the persistence-off test
+    # paths and saves a store read per event.
+    _order_identity: 'dict[str, tuple[str | None, str | None, LegType]]'
+    # ``execId`` values already booked/emitted, bounded replay dedup for
+    # the private execution stream (the ledger dedups durably; this saves
+    # the store round-trip on the common echo).
+    _seen_exec_ids: 'set[str]'
+    # Dispatch quantity + cumulative fill per ``orderLinkId`` — the
+    # in-memory partial-vs-filled discriminator behind the BrokerStore's
+    # durable ``filled_qty`` cursor (and its stand-in when persistence
+    # is off).
+    _dispatch_qty: 'dict[str, float]'
+    _filled_cum: 'dict[str, float]'
 
     # ------------------------------------------------------------------
     # Bybit-private cross-mix-in method surface.
@@ -132,3 +189,24 @@ class _BybitBase(LiveProviderPlugin[BybitConfig]):
     def _release_pending_closed(self) -> None: ...
 
     def _enqueue_closed(self, queue: 'asyncio.Queue[OHLCV | None]', bar: OHLCV) -> None: ...
+
+    # --- Broker lifecycle (state.py) ---
+    def _spot_market(self) -> 'InstrumentInfo': ...
+
+    async def _ensure_broker_started(self) -> None: ...
+
+    async def _fetch_wallet_coin(self, coin: str) -> dict: ...
+
+    # --- Execution internals (execution.py) ---
+    def _record_identity(self, coid: str, *, pine_id: str | None,
+                         from_entry: str | None, leg_type: LegType,
+                         qty: float) -> None: ...
+
+    def _resolve_identity(
+            self, order_link_id: str | None, order_id: str | None,
+    ) -> 'tuple[str | None, str | None, LegType | None]': ...
+
+    async def _order_post(self, endpoint: str, body: dict, *,
+                          coid: str, context: str) -> dict: ...
+
+    async def _lookup_order_by_coid(self, coid: str) -> dict | None: ...

@@ -314,6 +314,10 @@ class _LiveProviderMixin(_BybitBase):
                 )
             except (KeyError, ValueError, TypeError):
                 continue
+            # Every push carries the instrument's latest trade price —
+            # feeds the spot position mark and the market-order
+            # minimum-notional pre-check.
+            self._last_price = bar.close
             if bar.is_closed:
                 if self._pending_closed is not None:
                     # Reconnect backfill still pending — hold the bar back

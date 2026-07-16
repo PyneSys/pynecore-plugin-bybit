@@ -1,4 +1,5 @@
-"""Static lookup tables and pure time helpers for the Bybit plugin.
+"""Static lookup tables, pure time helpers and exact decimal grid helpers
+for the Bybit plugin.
 
 Kept separate from ``provider.py`` so timeframe conversions and chunking
 constants are reachable without importing the full provider mix-in. Internal
@@ -6,6 +7,7 @@ tuning knobs live here as module constants, deliberately NOT in the config
 dataclass (see the ``config.py`` module docstring).
 """
 from datetime import UTC, datetime
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 # TradingView timeframe -> Bybit kline ``interval`` value. Bybit v5 serves
 # minute intervals as plain numbers plus D/W/M; there is no 45-minute or
@@ -76,6 +78,84 @@ WS_PING_INTERVAL_S: float = 20.0
 # half-open and force-closed. With pings answered every ~20 s, 60 s of
 # silence means three missed pongs — a dead transport by Bybit's cadence.
 WS_STALE_THRESHOLD_S: float = 60.0
+
+# Unified trading account type — the only account type the broker mix-ins
+# support (verified on the global demo: ``unifiedMarginStatus: 3``).
+ACCOUNT_TYPE_UNIFIED: str = 'UNIFIED'
+
+# ``GET /v5/execution/list`` accepts at most a 7-day ``startTime``/``endTime``
+# window per request; the inventory catch-up walks longer gaps in windows of
+# this size (milliseconds).
+EXECUTION_WINDOW_MS: int = 7 * 86_400 * 1000
+
+# ``GET /v5/execution/list`` page size (server maximum).
+EXECUTION_PAGE_LIMIT: int = 100
+
+# Overlap subtracted from the execution-history time cursor on every read
+# (milliseconds). A time-scoped cursor can race a fill landing in the same
+# millisecond as the previous read's newest row; the ledger dedups on
+# ``execId``, so re-reading a short overlap is free and closes the race.
+EXECUTION_CURSOR_OVERLAP_MS: int = 60_000
+
+# ``GET /v5/order/realtime`` page size (server maximum for one page).
+OPEN_ORDERS_PAGE_LIMIT: int = 50
+
+# Cadence of the spot-inventory reconcile pass (lease heartbeat + balance
+# invariant), piggybacked onto the ``watch_orders`` loop.
+SPOT_RECONCILE_CADENCE_S: float = 10.0
+
+# Private-stream topics the broker mix-ins consume.
+PRIVATE_WS_TOPICS: tuple[str, ...] = ('order', 'execution', 'wallet')
+
+# Reconnect backoff schedule for the private WS (seconds); the last value
+# repeats. The public stream's reconnects stay framework-driven — this is
+# only for the plugin-owned private stream inside ``watch_orders``.
+PRIVATE_WS_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
+
+
+def format_decimal(value: Decimal) -> str:
+    """Serialize a decimal to Bybit's plain-string wire form.
+
+    Exponent-free, trailing zeros stripped, ``-0`` collapsed — one value,
+    one string, exactly the shape Bybit's JSON number-strings use.
+    """
+    if value == 0:
+        return '0'
+    text = format(value, 'f')
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return text
+
+
+def quantize_qty(qty: float, step_str: str) -> Decimal:
+    """Floor ``qty`` onto the instrument's base-quantity grid, exactly.
+
+    Uses the raw grid *string* (spot ``basePrecision`` / derivatives
+    ``qtyStep``) so the arithmetic is exact for every grid Bybit quotes.
+    Flooring (never rounding up) keeps a sell inside the held inventory
+    and an entry inside the account's buying power.
+
+    :param qty: Pine-side quantity (base units).
+    :param step_str: Raw grid string from ``instruments-info``.
+    :return: The floored quantity as an exact :class:`~decimal.Decimal`.
+    """
+    step = Decimal(step_str)
+    if step <= 0:
+        return Decimal(str(qty))
+    return (Decimal(str(qty)) / step).to_integral_value(ROUND_DOWN) * step
+
+
+def round_price(price: float, tick_str: str) -> Decimal:
+    """Snap ``price`` to the instrument's tick grid (nearest, half up).
+
+    :param price: Pine-side absolute price.
+    :param tick_str: Raw ``priceFilter.tickSize`` string.
+    :return: The snapped price as an exact :class:`~decimal.Decimal`.
+    """
+    tick = Decimal(tick_str)
+    if tick <= 0:
+        return Decimal(str(price))
+    return (Decimal(str(price)) / tick).to_integral_value(ROUND_HALF_UP) * tick
 
 
 def add_interval(ts: int, interval: str, n: int) -> int:

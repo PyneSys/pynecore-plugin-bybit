@@ -36,8 +36,11 @@ class InstrumentInfo:
     :ivar status: Raw instrument status (``"Trading"`` when tradable).
     :ivar tick_size_str: Raw ``priceFilter.tickSize`` string.
     :ivar tick_size: ``tick_size_str`` parsed as float — ``SymInfo.mintick``.
-    :ivar qty_step: Order-quantity grid: ``lotSizeFilter.basePrecision``
-        (spot) or ``lotSizeFilter.qtyStep`` (derivatives). Drives
+    :ivar qty_step_str: Raw order-quantity grid string
+        (``lotSizeFilter.basePrecision`` for spot, ``lotSizeFilter.qtyStep``
+        for derivatives) — kept verbatim so order quantities quantize on an
+        exact decimal grid.
+    :ivar qty_step: ``qty_step_str`` parsed as float. Drives
         ``SymInfo.mincontract``.
     :ivar min_order_qty: Minimum order quantity in base units (derivatives;
         0.0 for spot, where the minimum is quote-denominated instead).
@@ -64,6 +67,7 @@ class InstrumentInfo:
     status: str
     tick_size_str: str
     tick_size: float
+    qty_step_str: str
     qty_step: float
     min_order_qty: float
     min_order_amt: float
@@ -120,14 +124,14 @@ def parse_instrument(category: str, entry: dict) -> InstrumentInfo:
     lot = entry.get('lotSizeFilter') or {}
     tick_str = str(price_filter.get('tickSize') or '')
     if category == CATEGORY_SPOT:
-        qty_step = _to_float(lot.get('basePrecision'))
+        qty_step_str = str(lot.get('basePrecision') or '')
         min_order_qty = 0.0
         min_order_amt = _to_float(lot.get('minOrderAmt'))
         min_notional = 0.0
         max_limit_qty = _to_float(lot.get('maxLimitOrderQty'))
         max_market_qty = _to_float(lot.get('maxMarketOrderQty'))
     else:
-        qty_step = _to_float(lot.get('qtyStep'))
+        qty_step_str = str(lot.get('qtyStep') or '')
         min_order_qty = _to_float(lot.get('minOrderQty'))
         min_order_amt = 0.0
         min_notional = _to_float(lot.get('minNotionalValue'))
@@ -144,7 +148,8 @@ def parse_instrument(category: str, entry: dict) -> InstrumentInfo:
         status=str(entry.get('status') or ''),
         tick_size_str=tick_str,
         tick_size=_to_float(tick_str),
-        qty_step=qty_step,
+        qty_step_str=qty_step_str,
+        qty_step=_to_float(qty_step_str),
         min_order_qty=min_order_qty,
         min_order_amt=min_order_amt,
         min_notional=min_notional,

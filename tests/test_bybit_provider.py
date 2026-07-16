@@ -37,6 +37,7 @@ def _instrument(category: str, symbol: str, **overrides) -> InstrumentInfo:
         status='Trading',
         tick_size_str='0.10',
         tick_size=0.1,
+        qty_step_str='0.001',
         qty_step=0.001,
         min_order_qty=0.0,
         min_order_amt=1.0,
@@ -204,7 +205,7 @@ def __test_bybit_update_symbol_info__():
     plugin._market = _instrument(
         'inverse', 'BTCUSD', contract_type='InversePerpetual',
         quote_coin='USD', settle_coin='BTC',
-        tick_size_str='0.5', tick_size=0.5, qty_step=1.0,
+        tick_size_str='0.5', tick_size=0.5, qty_step_str='1', qty_step=1.0,
     )
     si = plugin.update_symbol_info()
     assert si.type == 'swap'
