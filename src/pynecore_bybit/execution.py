@@ -1,4 +1,4 @@
-"""Order-execution mix-in for the Bybit plugin (spot, M2).
+"""Order-execution mix-in for the Bybit plugin (spot M2, linear M3).
 
 Implements the write side of :class:`~pynecore.core.plugin.broker.BrokerPlugin`:
 every ``execute_*`` and ``modify_*`` path over ``POST /v5/order/*``, plus
@@ -15,15 +15,32 @@ Spot execution model:
   stop-market SL leg. The engine owns the OCA cascade between them and
   the partial-fill amends; spot has no reduce-only flag, the semantics
   hold structurally (a sell cannot exceed the held inventory).
+
+Linear execution model (differences):
+
+- No ``isLeverage`` / ``marketUnit`` — derivative quantities are always
+  base-denominated contracts. Conditional orders are plain trigger orders
+  (``triggerPrice`` + ``triggerDirection``; ``orderFilter=StopOrder`` is a
+  spot-only concept).
+- Exit legs and closes carry the native ``reduceOnly`` flag; the bracket
+  itself stays the engine-driven SOFTWARE pair until the ``trading-stop``
+  position attach is verified live (per the plan's conservative rule).
+- On a hedge-mode account entries stamp the intent side's ``positionIdx``
+  and the reduce/close/bracket paths run through the core one-way
+  emulator's ``PositionPort`` primitives (``positions.py``) instead of
+  ``execute_close`` / ``_place_exit_leg``.
+
+Shared across categories:
+
 - ``orderLinkId`` carries the deterministic client-order-id (NATIVE
-  idempotency): a duplicate submission is rejected with retCode 170141
-  and resolved by looking the original order up by the same id.
+  idempotency): a duplicate submission is rejected (spot 170141, linear
+  110072) and resolved by looking the original order up by the same id.
 - Every dispatch row is persisted BEFORE the wire send (when persistence
   is on): the spot inventory attribution keys on the ``orderLinkId``
   being resolvable, so a crash between send and ack must not orphan a
   fill into "foreign activity" (which would trip the balance invariant).
 
-M2 scope note: this is the forward dispatch path — persist-first crash
+Scope note: this is the forward dispatch path — persist-first crash
 *recovery*, disappearance detection and the cancel-tentative state machine
 are the robustness milestone, mirroring the cTrader plugin's phasing.
 """
@@ -76,8 +93,16 @@ from .exceptions import (
     map_broker_error,
     reject_error,
 )
-from .helpers import format_decimal, quantize_qty, round_price
+from .helpers import (
+    CATEGORY_SPOT,
+    TRIGGER_DIRECTION_FALL,
+    TRIGGER_DIRECTION_RISE,
+    format_decimal,
+    quantize_qty,
+    round_price,
+)
 from .models import InstrumentInfo
+from .positions import HEDGE_IDX_BUY, HEDGE_IDX_SELL, POSITION_MODE_HEDGE
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +216,7 @@ class _ExecutionMixin(_BybitBase):
 
     async def _lookup_order_by_coid(self, coid: str) -> dict | None:
         """Find an order by its ``orderLinkId`` (open set, then history)."""
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         for endpoint in ('/v5/order/realtime', '/v5/order/history'):
             try:
                 result = await self._call(endpoint, {
@@ -232,11 +257,14 @@ class _ExecutionMixin(_BybitBase):
     ) -> None:
         """Enforce the venue's per-order bounds without clamping.
 
-        Quantity ceilings (``maxMarketOrderQty`` / ``maxLimitOrderQty``)
-        and the QUOTE-denominated spot minimum (``minOrderAmt``) both skip
-        loudly — a single out-of-range order must not halt the bot. The
-        market-order notional check uses the latest observed trade price;
-        with no price seen yet the venue-side reject is the backstop.
+        Quantity ceilings (``maxMarketOrderQty`` / ``maxLimitOrderQty`` on
+        spot, ``maxMktOrderQty`` / ``maxOrderQty`` on linear), the linear
+        base-denominated minimum (``minOrderQty``) and the
+        QUOTE-denominated minimum notional (spot ``minOrderAmt`` / linear
+        ``minNotionalValue``) all skip loudly — a single out-of-range
+        order must not halt the bot. The market-order notional check uses
+        the latest observed trade price; with no price seen yet the
+        venue-side reject is the backstop.
         """
         cap = (market.max_market_order_qty if is_market
                else market.max_limit_order_qty)
@@ -248,19 +276,28 @@ class _ExecutionMixin(_BybitBase):
                 context={'symbol': market.symbol, 'qty': float(qty),
                          'max_qty': cap},
             )
-        if market.min_order_amt > 0:
+        if 0 < float(qty) < market.min_order_qty:
+            raise OrderSkippedByPlugin(
+                f"Skipping {label}: size {qty} below the {market.symbol} "
+                f"per-order minimum {market.min_order_qty}. No order sent.",
+                intent_key=intent_key, reason="below_min_size",
+                context={'symbol': market.symbol, 'qty': float(qty),
+                         'min_order_qty': market.min_order_qty},
+            )
+        min_notional = market.min_order_amt or market.min_notional
+        if min_notional > 0:
             ref_price = price
             if ref_price is None and self._last_price is not None:
                 ref_price = Decimal(str(self._last_price))
             if ref_price is not None \
-                    and float(qty * ref_price) < market.min_order_amt:
+                    and float(qty * ref_price) < min_notional:
                 raise OrderSkippedByPlugin(
                     f"Skipping {label}: notional {float(qty * ref_price):.8g} "
                     f"{market.quote_coin} below the {market.symbol} minimum "
-                    f"{market.min_order_amt}. No order sent.",
+                    f"{min_notional}. No order sent.",
                     intent_key=intent_key, reason="below_min_notional",
                     context={'symbol': market.symbol, 'qty': float(qty),
-                             'min_order_amt': market.min_order_amt},
+                             'min_notional': min_notional},
                 )
 
     # --- persistence helpers -----------------------------------------------------
@@ -316,19 +353,38 @@ class _ExecutionMixin(_BybitBase):
 
     @override
     async def execute_entry(self, envelope: DispatchEnvelope) -> list[ExchangeOrder]:
-        """Open or add to the spot inventory (MARKET / LIMIT / STOP entry)."""
+        """Open or add to the position/inventory (MARKET / LIMIT / STOP entry)."""
         await self._ensure_broker_started()
         intent = envelope.intent
         assert isinstance(intent, EntryIntent)
-        market = await asyncio.to_thread(self._spot_market)
-        coid = envelope.client_order_id(
-            KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
-        )
+        market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} {intent.side.upper()} entry "
                  f"id={intent.pine_id!r}")
         qty = self._quantize_or_skip(
             market, intent.qty, intent_key=intent.intent_key, label=label,
         )
+        return await self._place_entry_order(envelope, intent, market, qty)
+
+    async def _place_entry_order(
+            self, envelope: DispatchEnvelope, intent: EntryIntent,
+            market: InstrumentInfo, qty: Decimal,
+    ) -> list[ExchangeOrder]:
+        """Build, persist and POST one entry order of ``qty`` (grid units).
+
+        Shared by :meth:`execute_entry` and the hedge-emulation
+        ``place_leg`` primitive (which sizes the residual leg itself).
+        Category shape: spot sends ``isLeverage=0`` + base-coin market
+        units and uses ``orderFilter=StopOrder`` conditionals; linear
+        sends plain trigger orders (``triggerPrice`` +
+        ``triggerDirection``) and, on a hedge account, stamps the
+        ``positionIdx`` of the intent side.
+        """
+        coid = envelope.client_order_id(
+            KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
+        )
+        label = (f"{market.symbol} {intent.side.upper()} entry "
+                 f"id={intent.pine_id!r}")
+        is_spot = market.category == CATEGORY_SPOT
 
         body: dict = {
             'category': market.category,
@@ -336,13 +392,18 @@ class _ExecutionMixin(_BybitBase):
             'side': _SIDE_WIRE[intent.side],
             'qty': format_decimal(qty),
             'orderLinkId': coid,
-            'isLeverage': 0,
         }
+        if is_spot:
+            body['isLeverage'] = 0
+        elif self._position_mode == POSITION_MODE_HEDGE:
+            body['positionIdx'] = (HEDGE_IDX_BUY if intent.side == 'buy'
+                                   else HEDGE_IDX_SELL)
         price: Decimal | None = None
         is_market = intent.order_type is not OrderType.LIMIT
         if intent.order_type is OrderType.MARKET:
             body['orderType'] = 'Market'
-            body['marketUnit'] = 'baseCoin'
+            if is_spot:
+                body['marketUnit'] = 'baseCoin'
         elif intent.order_type is OrderType.LIMIT:
             if intent.limit is None:
                 raise ExchangeOrderRejectedError(
@@ -360,8 +421,15 @@ class _ExecutionMixin(_BybitBase):
                 )
             trigger = round_price(intent.stop, market.tick_size_str)
             body['orderType'] = 'Market'
-            body['marketUnit'] = 'baseCoin'
-            body['orderFilter'] = 'StopOrder'
+            if is_spot:
+                body['marketUnit'] = 'baseCoin'
+                body['orderFilter'] = 'StopOrder'
+            else:
+                # A buy stop sits above the market (triggers on a rise),
+                # a sell stop below (triggers on a fall).
+                body['triggerDirection'] = (TRIGGER_DIRECTION_RISE
+                                            if intent.side == 'buy'
+                                            else TRIGGER_DIRECTION_FALL)
             body['triggerPrice'] = format_decimal(trigger)
         self._preflight_order(
             market, qty, is_market=is_market, price=price,
@@ -442,7 +510,7 @@ class _ExecutionMixin(_BybitBase):
                 f"Bybit spot has no trailing-stop support "
                 f"(exit id={intent.pine_id!r})"
             )
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} exit id={intent.pine_id!r} "
                  f"from={intent.from_entry!r}")
         qty = self._quantize_or_skip(
@@ -507,24 +575,38 @@ class _ExecutionMixin(_BybitBase):
             market: InstrumentInfo, qty: Decimal, *,
             leg: str, price: Decimal,
     ) -> ExchangeOrder:
-        """Place one bracket leg: plain limit (TP) or conditional market (SL)."""
+        """Place one bracket leg: plain limit (TP) or conditional market (SL).
+
+        On linear both legs carry the native ``reduceOnly`` flag; the SL
+        is a plain trigger order (an exit stop triggers against the
+        position: a sell SL on a fall, a buy SL on a rise).
+        """
         coid = envelope.client_order_id(KIND_EXIT_TP if leg == 'tp' else KIND_EXIT_SL)
+        is_spot = market.category == CATEGORY_SPOT
         body: dict = {
             'category': market.category,
             'symbol': market.symbol,
             'side': _SIDE_WIRE[intent.side],
             'qty': format_decimal(qty),
             'orderLinkId': coid,
-            'isLeverage': 0,
         }
+        if is_spot:
+            body['isLeverage'] = 0
+        else:
+            body['reduceOnly'] = True
         if leg == 'tp':
             body['orderType'] = 'Limit'
             body['price'] = format_decimal(price)
             body['timeInForce'] = 'GTC'
         else:
             body['orderType'] = 'Market'
-            body['marketUnit'] = 'baseCoin'
-            body['orderFilter'] = 'StopOrder'
+            if is_spot:
+                body['marketUnit'] = 'baseCoin'
+                body['orderFilter'] = 'StopOrder'
+            else:
+                body['triggerDirection'] = (TRIGGER_DIRECTION_FALL
+                                            if intent.side == 'sell'
+                                            else TRIGGER_DIRECTION_RISE)
             body['triggerPrice'] = format_decimal(price)
         leg_type = LegType.TAKE_PROFIT if leg == 'tp' else LegType.STOP_LOSS
         self._record_identity(coid, pine_id=intent.pine_id,
@@ -574,11 +656,17 @@ class _ExecutionMixin(_BybitBase):
 
     @override
     async def execute_close(self, envelope: DispatchEnvelope) -> ExchangeOrder:
-        """Reduce the inventory with a market sell (or cover with a buy)."""
+        """Reduce the position/inventory with a market order.
+
+        Spot sells the held base inventory (or covers with a buy); linear
+        sends a native ``reduceOnly`` market order against the one-way
+        position (a hedge account routes closes through the emulator's
+        ``close_leg`` primitive instead of this path).
+        """
         await self._ensure_broker_started()
         intent = envelope.intent
         assert isinstance(intent, CloseIntent)
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         coid = envelope.client_order_id(KIND_CLOSE)
         label = f"{market.symbol} close id={intent.pine_id!r}"
         qty = self._quantize_or_skip(
@@ -593,11 +681,14 @@ class _ExecutionMixin(_BybitBase):
             'symbol': market.symbol,
             'side': _SIDE_WIRE[intent.side],
             'orderType': 'Market',
-            'marketUnit': 'baseCoin',
             'qty': format_decimal(qty),
             'orderLinkId': coid,
-            'isLeverage': 0,
         }
+        if market.category == CATEGORY_SPOT:
+            body['marketUnit'] = 'baseCoin'
+            body['isLeverage'] = 0
+        else:
+            body['reduceOnly'] = True
         self._record_identity(coid, pine_id=None,
                               from_entry=intent.pine_id, leg_type=LegType.CLOSE,
                               qty=float(qty))
@@ -686,7 +777,7 @@ class _ExecutionMixin(_BybitBase):
         await self._ensure_broker_started()
         intent = envelope.intent
         assert isinstance(intent, CancelIntent)
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         cancelled_any = True
         for coid in self._live_coids_for_cancel(intent):
             if await self._cancel_by_coid(market, coid):
@@ -743,7 +834,7 @@ class _ExecutionMixin(_BybitBase):
         await self._ensure_broker_started()
         intent = envelope.intent
         assert isinstance(intent, CancelIntent)
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         coids = self._live_coids_for_cancel(intent)
         if not coids:
             return CancelDispositionOutcome.UNKNOWN
@@ -796,7 +887,7 @@ class _ExecutionMixin(_BybitBase):
     @override
     async def cancel_broker_order_ref(self, ref: str) -> None:
         """Cancel a residual order by its raw ``orderId`` (idempotent)."""
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         try:
             await self._call('/v5/order/cancel', method='post', body={
                 'category': market.category,
@@ -826,7 +917,7 @@ class _ExecutionMixin(_BybitBase):
     async def execute_cancel_all(self, symbol: str | None = None) -> int:
         """Cancel every open order of the (single) instrument, natively."""
         await self._ensure_broker_started()
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         try:
             result = await self._call('/v5/order/cancel-all', method='post', body={
                 'category': market.category,
@@ -872,7 +963,7 @@ class _ExecutionMixin(_BybitBase):
         old_coid = old.client_order_id(
             KIND_ENTRY_STOP if old_intent.stop_fired_market else KIND_ENTRY,
         )
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} {intent.side.upper()} entry amend "
                  f"id={intent.pine_id!r}")
         qty = self._quantize_or_skip(
@@ -954,7 +1045,7 @@ class _ExecutionMixin(_BybitBase):
         )
         if not same_shape:
             return await super().modify_exit(old, new)
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} exit amend id={new_intent.pine_id!r} "
                  f"from={new_intent.from_entry!r}")
         qty = self._quantize_or_skip(

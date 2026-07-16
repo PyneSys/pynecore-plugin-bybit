@@ -28,8 +28,18 @@ from pynecore.types.ohlcv import OHLCV
 from .config import BybitConfig
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+    from typing import Callable
+
     import httpx
 
+    from pynecore.core.broker.models import (
+        DispatchEnvelope,
+        EntryIntent,
+        ExchangeOrder,
+        ExchangePosition,
+        PositionLeg,
+    )
     from pynecore.core.broker.spot_inventory import SpotInventoryManager
 
     from .hosts import BybitHosts
@@ -148,6 +158,15 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # is off).
     _dispatch_qty: 'dict[str, float]'
     _filled_cum: 'dict[str, float]'
+    # Account position mode of the linear category, detected once by
+    # ``_ensure_broker_started`` (``positions.POSITION_MODE_*``). ``None``
+    # before broker startup and on spot runs.
+    _position_mode: str | None
+    # Last-known venue position size per ``positionIdx`` (linear only),
+    # fed by the private WS ``position`` topic and the reconcile snapshot.
+    # ``None`` until the first snapshot — the entry-row flat sweep must
+    # never fire on ignorance.
+    _linear_sizes: 'dict[int, float] | None'
 
     # ------------------------------------------------------------------
     # Bybit-private cross-mix-in method surface.
@@ -193,9 +212,54 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # --- Broker lifecycle (state.py) ---
     def _spot_market(self) -> 'InstrumentInfo': ...
 
+    def _broker_market(self) -> 'InstrumentInfo': ...
+
     async def _ensure_broker_started(self) -> None: ...
 
     async def _fetch_wallet_coin(self, coin: str) -> dict: ...
+
+    # --- Linear position path (positions.py) ---
+    async def _detect_position_mode(self, market: 'InstrumentInfo') -> str: ...
+
+    async def _fetch_position_rows(self, market: 'InstrumentInfo') -> list[dict]: ...
+
+    def _ingest_position_sizes(self, rows: list[dict]) -> None: ...
+
+    def _linear_is_flat(self) -> bool: ...
+
+    async def _fetch_linear_position(
+            self, market: 'InstrumentInfo',
+    ) -> 'ExchangePosition | None': ...
+
+    # PositionPort transport primitives (hedge-mode one-way emulation) —
+    # declared on the base so ``position_port = self`` satisfies the core
+    # Protocol from any mix-in (the cTrader plugin's pattern).
+    async def fetch_raw_positions(self, symbol: str) -> 'list[PositionLeg]': ...
+
+    async def get_volume_quantizer(
+            self, symbol: str,
+    ) -> 'Callable[[float], int]': ...
+
+    async def close_leg(
+            self, symbol: str, leg_id: str, volume: int, coid: str,
+    ) -> None: ...
+
+    async def reject_out_of_range(
+            self, envelope: 'DispatchEnvelope', qty: float,
+    ) -> None: ...
+
+    async def place_leg(
+            self, envelope: 'DispatchEnvelope', qty: float,
+    ) -> 'list[ExchangeOrder]': ...
+
+    async def amend_bracket(
+            self, symbol: str, leg_id: str, *,
+            side: str,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_offset: float | None,
+            coid: str,
+    ) -> None: ...
 
     # --- Execution internals (execution.py) ---
     def _record_identity(self, coid: str, *, pine_id: str | None,
@@ -210,3 +274,15 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
                           coid: str, context: str) -> dict: ...
 
     async def _lookup_order_by_coid(self, coid: str) -> dict | None: ...
+
+    def _quantize_or_skip(self, market: 'InstrumentInfo', qty: float, *,
+                          intent_key: str, label: str) -> 'Decimal': ...
+
+    def _preflight_order(self, market: 'InstrumentInfo', qty: 'Decimal', *,
+                         is_market: bool, price: 'Decimal | None',
+                         intent_key: str, label: str) -> None: ...
+
+    async def _place_entry_order(
+            self, envelope: 'DispatchEnvelope', intent: 'EntryIntent',
+            market: 'InstrumentInfo', qty: 'Decimal',
+    ) -> 'list[ExchangeOrder]': ...

@@ -6,8 +6,10 @@ constants are reachable without importing the full provider mix-in. Internal
 tuning knobs live here as module constants, deliberately NOT in the config
 dataclass (see the ``config.py`` module docstring).
 """
+import re
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
+from hashlib import sha256
 
 # TradingView timeframe -> Bybit kline ``interval`` value. Bybit v5 serves
 # minute intervals as plain numbers plus D/W/M; there is no 45-minute or
@@ -100,17 +102,54 @@ EXECUTION_CURSOR_OVERLAP_MS: int = 60_000
 # ``GET /v5/order/realtime`` page size (server maximum for one page).
 OPEN_ORDERS_PAGE_LIMIT: int = 50
 
-# Cadence of the spot-inventory reconcile pass (lease heartbeat + balance
-# invariant), piggybacked onto the ``watch_orders`` loop.
-SPOT_RECONCILE_CADENCE_S: float = 10.0
+# Cadence of the reconcile pass piggybacked onto the ``watch_orders`` loop:
+# spot runs the inventory reconcile (lease heartbeat + balance invariant),
+# linear refreshes the venue position snapshot behind the flat sweep.
+RECONCILE_CADENCE_S: float = 10.0
 
-# Private-stream topics the broker mix-ins consume.
+# Private-stream topics the broker mix-ins consume. The ``position`` topic
+# is appended on the linear category only — spot has no position object.
 PRIVATE_WS_TOPICS: tuple[str, ...] = ('order', 'execution', 'wallet')
+PRIVATE_WS_TOPIC_POSITION: str = 'position'
+
+# ``triggerDirection`` values of conditional (trigger) orders on the
+# derivative categories: a buy stop triggers when the price RISES to the
+# trigger, a sell stop when it FALLS — for entries and protective stops
+# alike, the side determines the direction.
+TRIGGER_DIRECTION_RISE: int = 1
+TRIGGER_DIRECTION_FALL: int = 2
 
 # Reconnect backoff schedule for the private WS (seconds); the last value
 # repeats. The public stream's reconnects stay framework-driven — this is
 # only for the plugin-owned private stream inside ``watch_orders``.
 PRIVATE_WS_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
+
+
+# ``orderLinkId`` budget and charset (letters, digits, dash, underscore) —
+# see the plugin's ``client_order_id_max_len`` declaration in ``_base.py``.
+ORDER_LINK_ID_MAX_LEN: int = 36
+_LINK_ID_INVALID = re.compile(r'[^A-Za-z0-9_-]')
+
+
+def wire_link_id(coid: str) -> str:
+    """Map a core client-order-id onto Bybit's ``orderLinkId`` charset.
+
+    Bybit accepts up to 36 characters of letters, digits, dashes and
+    underscores. Canonical dispatch ids already conform and pass through
+    unchanged; the core one-way emulator's composed per-leg close ids
+    (``{parent_coid}:{leg_id}``) carry a colon, which maps to an
+    underscore. The mapping is deterministic, so a restart re-dispatch of
+    the same emulator coid converges on the same wire id and the
+    duplicate-reject + lookup path stays idempotent; canonical ids never
+    contain an underscore, so a mapped id cannot collide with a
+    directly-dispatched one. A (never expected) overlong result is
+    shortened with a deterministic hash tail.
+    """
+    wire = _LINK_ID_INVALID.sub('_', coid)
+    if len(wire) <= ORDER_LINK_ID_MAX_LEN:
+        return wire
+    digest = sha256(coid.encode('utf-8')).hexdigest()[:9]
+    return f"{wire[:ORDER_LINK_ID_MAX_LEN - 10]}_{digest}"
 
 
 def format_decimal(value: Decimal) -> str:

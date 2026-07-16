@@ -112,6 +112,24 @@ DUPLICATE_COID_CODES = frozenset({170141, 110072})
 AMBIGUOUS_DISPOSITION_CODES = frozenset({10000, 10016})
 
 
+def is_benign_trading_stop_reject(exc: BybitAPIError) -> bool:
+    """Whether a ``/v5/position/trading-stop`` reject is a benign no-op.
+
+    Measured live on the global demo (2026-07-16):
+
+    - Setting a level on a flat/vanished position rejects with the GENERIC
+      parameter code 10001 and ``retMsg`` "can not set tp/sl/ts for zero
+      position" — the leg is gone, the bracket is moot. The code alone is
+      not safe to swallow (10001 also covers genuinely malformed
+      requests), so the message is matched too.
+    - Re-sending the current levels (idempotent re-amend, or clearing an
+      already-clear bracket) rejects with 34040 "not modified".
+    """
+    if exc.ret_code == 34040:
+        return True
+    return exc.ret_code == 10001 and 'zero position' in str(exc)
+
+
 def map_broker_error(exc: BybitAPIError) -> BrokerError | None:
     """Translate a Bybit ``retCode`` reject into the core broker taxonomy.
 

@@ -1,4 +1,4 @@
-"""Live order-event stream mix-in for the Bybit plugin (spot, M2).
+"""Live order-event stream mix-in for the Bybit plugin (spot M2, linear M3).
 
 Implements :meth:`watch_orders` (``watch_orders = NATIVE``) over the private
 WebSocket stream (``/v5/private``): the ``execution`` topic drives fills,
@@ -26,9 +26,12 @@ The only deliberate raises are the halt signals
 (:class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError`
 descendants) from the inventory manager's fail-closed paths.
 
-The spot-inventory reconcile pass (lease heartbeat + balance invariant +
-stream-gap catch-up) piggybacks on this loop at a fixed cadence, mirroring
-the cTrader plugin's reconcile piggyback pattern.
+A per-category reconcile pass piggybacks on this loop at a fixed cadence,
+mirroring the cTrader plugin's reconcile piggyback pattern: spot runs the
+inventory reconcile (lease heartbeat + balance invariant + stream-gap
+catch-up), linear refreshes the venue position snapshot behind the
+entry-row flat sweep (the ``position`` WS topic keeps it fresh in
+between).
 """
 import asyncio
 import logging
@@ -53,9 +56,11 @@ from pynecore.core.plugin import override
 from ._base import _BybitBase
 from .exceptions import BybitError
 from .helpers import (
+    CATEGORY_LINEAR,
     PRIVATE_WS_BACKOFF_S,
+    PRIVATE_WS_TOPIC_POSITION,
     PRIVATE_WS_TOPICS,
-    SPOT_RECONCILE_CADENCE_S,
+    RECONCILE_CADENCE_S,
 )
 from .state import parse_exchange_order
 from .ws import BybitWebSocket
@@ -99,21 +104,25 @@ class _EventStreamMixin(_BybitBase):
         loop top).
         """
         await self._ensure_broker_started()
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
+        is_linear = market.category == CATEGORY_LINEAR
         loop = asyncio.get_running_loop()
-        next_reconcile = loop.time() + SPOT_RECONCILE_CADENCE_S
+        next_reconcile = loop.time() + RECONCILE_CADENCE_S
         while True:
             self._raise_pending_halt()
             ws = self._private_ws
             if ws is None or not ws.is_open:
-                await self._open_private_ws()
+                await self._open_private_ws(market)
             queue = self._private_events
             assert queue is not None
             now = loop.time()
             if now >= next_reconcile:
-                for event in await self._run_spot_reconcile(market):
+                recovered = (await self._run_linear_reconcile(market)
+                             if is_linear
+                             else await self._run_spot_reconcile(market))
+                for event in recovered:
                     yield event
-                next_reconcile = loop.time() + SPOT_RECONCILE_CADENCE_S
+                next_reconcile = loop.time() + RECONCILE_CADENCE_S
                 continue
             try:
                 frame = await asyncio.wait_for(queue.get(), timeout=next_reconcile - now)
@@ -138,7 +147,7 @@ class _EventStreamMixin(_BybitBase):
 
     # --- private transport ------------------------------------------------------
 
-    async def _open_private_ws(self) -> None:
+    async def _open_private_ws(self, market: 'InstrumentInfo') -> None:
         """(Re)open + authenticate the private stream, with bounded backoff.
 
         Never raises for transient trouble: credential validity was
@@ -170,10 +179,15 @@ class _EventStreamMixin(_BybitBase):
                 on_message=_on_message,
                 on_closed=_on_closed,
             )
+            topics = list(PRIVATE_WS_TOPICS)
+            if market.category == CATEGORY_LINEAR:
+                # The position topic feeds the last-known-size cache the
+                # entry-row flat sweep keys off; spot has no position object.
+                topics.append(PRIVATE_WS_TOPIC_POSITION)
             try:
                 await ws.open(api_key=self.config.api_key,
                               api_secret=self.config.api_secret)
-                await ws.subscribe(list(PRIVATE_WS_TOPICS))
+                await ws.subscribe(topics)
             except BybitError as e:
                 await ws.close()
                 delay = PRIVATE_WS_BACKOFF_S[min(attempt, len(PRIVATE_WS_BACKOFF_S) - 1)]
@@ -209,7 +223,28 @@ class _EventStreamMixin(_BybitBase):
             return self._translate_executions(frame, market)
         if topic == 'order':
             return self._translate_order_rows(frame, market)
+        if topic == PRIVATE_WS_TOPIC_POSITION:
+            self._ingest_position_frame(frame, market)
         return []
+
+    def _ingest_position_frame(
+            self, frame: dict, market: 'InstrumentInfo',
+    ) -> None:
+        """Fold one ``position`` push into the net-size cache (linear).
+
+        No OrderEvent is emitted — position accounting is driven by fills;
+        the push only keeps the flat sweep's view fresh between reconcile
+        snapshots.
+        """
+        rows = [
+            entry for entry in frame.get('data') or ()
+            if str(entry.get('symbol') or '') == market.symbol
+            and str(entry.get('category') or market.category) == market.category
+        ]
+        if not rows:
+            return
+        self._ingest_position_sizes(rows)
+        self._close_entry_rows_when_flat(market)
 
     def _translate_executions(
             self, frame: dict, market: 'InstrumentInfo',
@@ -221,7 +256,19 @@ class _EventStreamMixin(_BybitBase):
         for entry in frame.get('data') or ():
             if str(entry.get('symbol') or '') != market.symbol:
                 continue
+            if str(entry.get('category') or market.category) != market.category:
+                # The same symbol name can exist in several categories
+                # (spot and linear BTCUSDT) — activity of the other
+                # category must not be attributed to this run.
+                continue
             if str(entry.get('execType') or 'Trade') != 'Trade':
+                # Non-trade executions (linear ``Funding`` / ``Settle`` /
+                # ADL / bust rows) carry no order fill: funding is a
+                # settle-coin cashflow the wallet read reflects, the
+                # size-changing exotics surface through the venue-
+                # authoritative position read. No OrderEvent slot exists
+                # for a fill-less cash event (cTrader skips swaps the
+                # same way).
                 continue
             exec_id = str(entry.get('execId') or '')
             if not exec_id or exec_id in self._seen_exec_ids:
@@ -260,22 +307,31 @@ class _EventStreamMixin(_BybitBase):
         return events
 
     def _close_entry_rows_when_flat(self, market: 'InstrumentInfo') -> None:
-        """Close the fully filled entry rows once the ledger is flat.
+        """Close the fully filled entry rows once the position is gone.
 
         Entry rows live as long as the position they opened (parent-row
-        lifecycle, cTrader pattern) — see :meth:`_fill_event`. Sub-grid
-        fee dust counts as flat, matching :meth:`get_position`. A row
-        still carrying the engine's ``defensive_close_pending`` marker is
-        left for a later sweep: the engine clears the marker when the
-        defensive close settles, and closing the row before that would
-        orphan the restart replay of the marker.
+        lifecycle, cTrader pattern) — see :meth:`_fill_event`. The
+        flatness source is category-specific: spot reads the inventory
+        ledger (sub-grid fee dust counts as flat, matching
+        :meth:`get_position`); linear reads the last-known venue position
+        cache, which starts unknown — the sweep never fires on ignorance.
+        A row still carrying the engine's ``defensive_close_pending``
+        marker is left for a later sweep: the engine clears the marker
+        when the defensive close settles, and closing the row before that
+        would orphan the restart replay of the marker.
         """
-        manager = self._spot_manager
-        if manager is None or self.store_ctx is None:
+        if self.store_ctx is None:
             return
-        net = manager.fold.net_base
-        if net > 0 and (market.qty_step <= 0 or float(net) >= market.qty_step):
-            return
+        if market.category == CATEGORY_LINEAR:
+            if not self._linear_is_flat():
+                return
+        else:
+            manager = self._spot_manager
+            if manager is None:
+                return
+            net = manager.fold.net_base
+            if net > 0 and (market.qty_step <= 0 or float(net) >= market.qty_step):
+                return
         for row in self.store_ctx.iter_live_orders(symbol=market.symbol):
             extras = row.extras or {}
             if extras.get('kind') not in (ENTRY_KIND_POSITION,
@@ -341,7 +397,9 @@ class _EventStreamMixin(_BybitBase):
             status=OrderStatus.FILLED if is_full else OrderStatus.PARTIALLY_FILLED,
             timestamp=ts_ms / 1000.0 if ts_ms else epoch_time(),
             fee=fee,
-            fee_currency=str(entry.get('feeCurrency') or ''),
+            # Linear execution rows carry no ``feeCurrency`` — the fee is
+            # always the settle coin (empty for spot, where the row has it).
+            fee_currency=str(entry.get('feeCurrency') or '') or market.settle_coin,
             reduce_only=leg_type is not LegType.ENTRY,
             client_order_id=coid or None,
         )
@@ -394,7 +452,30 @@ class _EventStreamMixin(_BybitBase):
             ))
         return events
 
-    # --- spot inventory reconcile --------------------------------------------------
+    # --- reconcile passes ------------------------------------------------------
+
+    async def _run_linear_reconcile(
+            self, market: 'InstrumentInfo',
+    ) -> list[OrderEvent]:
+        """Refresh the venue position snapshot behind the flat sweep.
+
+        The REST read is the gap-fill backstop of the ``position`` push
+        (a reconnect can drop pushes); transient failures are logged and
+        swallowed — the stream must survive them, the next pass retries.
+        Emits no events: linear position accounting is fill-driven, the
+        stream-gap fill recovery itself is the robustness milestone.
+        """
+        try:
+            rows = await self._fetch_position_rows(market)
+        except Exception as exc:  # noqa: BLE001 - the reconcile pass must not kill the stream
+            logger.warning(
+                "Bybit linear position reconcile pass failed (transient): %s",
+                exc, exc_info=True,
+            )
+            return []
+        self._ingest_position_sizes(rows)
+        self._close_entry_rows_when_flat(market)
+        return []
 
     async def _run_spot_reconcile(
             self, market: 'InstrumentInfo',

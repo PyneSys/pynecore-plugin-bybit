@@ -1,20 +1,22 @@
-"""Broker state-query mix-in for the Bybit plugin (spot, M2).
+"""Broker state-query mix-in for the Bybit plugin (spot M2, linear M3).
 
 Implements the read side of :class:`~pynecore.core.plugin.broker.BrokerPlugin`
 plus the broker lifecycle glue:
 
-- :meth:`get_capabilities` — the spot capability profile (derivatives
-  arrive in M3/M4; a non-spot chart symbol is refused up front).
+- :meth:`get_capabilities` — the per-category capability profile (inverse
+  arrives in M4; an inverse chart symbol is refused up front).
 - :attr:`account_id` — lazily latched from ``GET /v5/user/query-api``.
   Bybit's whole data-provider path is public, so unlike Capital.com /
   cTrader there is no earlier authenticated moment on the warmup path;
   the first read of the property (the startup contract probe) performs
   the one signed identity call and caches it.
-- :meth:`_ensure_broker_started` — one-shot construction + fail-closed
-  ``startup()`` of the core
-  :class:`~pynecore.core.broker.spot_inventory.SpotInventoryManager`,
-  awaited by every broker entry point so it always precedes the engine's
-  startup reconcile (whose first ``get_position`` read lands here).
+- :meth:`_ensure_broker_started` — the per-category one-shot startup
+  (spot: fail-closed
+  :class:`~pynecore.core.broker.spot_inventory.SpotInventoryManager`
+  startup; linear: position-mode detection + hedge-mode opt-in to the
+  core one-way emulation), awaited by every broker entry point so it
+  always precedes the engine's startup reconcile (whose first
+  ``get_position`` read lands here).
 - :meth:`get_open_orders` / :meth:`get_position` / :meth:`get_balance`.
 """
 import asyncio
@@ -43,6 +45,7 @@ from .exceptions import (
 )
 from .helpers import (
     ACCOUNT_TYPE_UNIFIED,
+    CATEGORY_LINEAR,
     CATEGORY_SPOT,
     OPEN_ORDERS_PAGE_LIMIT,
 )
@@ -149,29 +152,44 @@ class _StateMixin(_BybitBase):
     def _spot_market(self) -> InstrumentInfo:
         """Return the chart instrument, refusing non-spot categories.
 
-        The broker surface is spot-only in M2 — linear lands in M3,
-        inverse in M4. Raising :class:`ExchangeCapabilityError` makes the
-        startup path perform a graceful stop with a clear message instead
-        of dispatching against an unimplemented execution model.
+        For the spot-only code paths (the inventory port construction);
+        the shared broker paths gate through :meth:`_broker_market`.
         """
-        market = self._get_market()
+        market = self._broker_market()
         if market.category != CATEGORY_SPOT:
             raise ExchangeCapabilityError(
-                f"Bybit broker support currently covers spot only; "
+                f"Bybit spot inventory path invoked on a {market.category} "
+                f"instrument ({market.symbol!r}) — this is a plugin bug"
+            )
+        return market
+
+    def _broker_market(self) -> InstrumentInfo:
+        """Return the chart instrument, refusing unimplemented categories.
+
+        The broker surface covers spot (M2) and linear (M3) — inverse
+        lands in M4 (its settle-coin accounting model is open). Raising
+        :class:`ExchangeCapabilityError` makes the startup path perform a
+        graceful stop with a clear message instead of dispatching against
+        an unimplemented execution model.
+        """
+        market = self._get_market()
+        if market.category not in (CATEGORY_SPOT, CATEGORY_LINEAR):
+            raise ExchangeCapabilityError(
+                f"Bybit broker support covers spot and linear; "
                 f"{market.symbol!r} is a {market.category} instrument "
-                f"(derivatives arrive in a later milestone)"
+                f"(inverse arrives in a later milestone)"
             )
         return market
 
     @override
     def get_capabilities(self) -> ExchangeCapabilities:
-        """Declare the spot capability profile.
+        """Declare the chart instrument's category capability profile.
 
-        Verified live on the global demo (2026-07-16): conditional
-        ``StopOrder`` placement, ``/v5/order/amend`` price amend on a live
-        spot order, ``orderLinkId`` duplicate rejection (retCode 170141)
-        and ``/v5/order/cancel-all``. Deliberately conservative where the
-        venue has no primitive:
+        **Spot** — verified live on the global demo (2026-07-16):
+        conditional ``StopOrder`` placement, ``/v5/order/amend`` price
+        amend on a live spot order, ``orderLinkId`` duplicate rejection
+        (retCode 170141) and ``/v5/order/cancel-all``. Deliberately
+        conservative where the venue has no primitive:
 
         - ``tp_sl_bracket`` SOFTWARE — the plugin places a plain limit TP
           leg and a conditional stop SL leg; the engine owns the OCA
@@ -188,7 +206,34 @@ class _StateMixin(_BybitBase):
         - ``short_selling`` UNSUPPORTED — the spot ledger models
           long-only exposure (mutually exclusive with the inventory
           port by core contract).
+
+        **Linear** — the position-based profile: ``reduce_only`` /
+        ``fetch_position`` / ``short_selling`` NATIVE (explicit
+        ``reduceOnly`` flag, ``/v5/position/list``, shorting is natural).
+        The exit bracket stays the engine-driven SOFTWARE pair of
+        reduce-only order legs (the ``trading-stop`` position attach is
+        assessed on the demo before any raise, per the plan), so
+        ``tp_sl_bracket`` / ``oca_cancel`` match spot. ``trailing_stop``
+        UNSUPPORTED until the ``trading-stop`` trailing activation
+        semantics are verified live — same no-false-promise rule as spot.
         """
+        market = self._broker_market()
+        if market.category == CATEGORY_SPOT:
+            return ExchangeCapabilities(
+                stop_order=CapabilityLevel.NATIVE,
+                trailing_stop=CapabilityLevel.UNSUPPORTED,
+                tp_sl_bracket=CapabilityLevel.SOFTWARE,
+                partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+                partial_qty_bracket_exit_pyramiding=CapabilityLevel.SOFTWARE,
+                oca_cancel=CapabilityLevel.SOFTWARE,
+                amend_order=CapabilityLevel.PARTIAL_NATIVE,
+                cancel_all=CapabilityLevel.NATIVE,
+                reduce_only=CapabilityLevel.SOFTWARE,
+                watch_orders=CapabilityLevel.NATIVE,
+                fetch_position=CapabilityLevel.SOFTWARE,
+                idempotency=CapabilityLevel.NATIVE,
+                short_selling=CapabilityLevel.UNSUPPORTED,
+            )
         return ExchangeCapabilities(
             stop_order=CapabilityLevel.NATIVE,
             trailing_stop=CapabilityLevel.UNSUPPORTED,
@@ -198,32 +243,56 @@ class _StateMixin(_BybitBase):
             oca_cancel=CapabilityLevel.SOFTWARE,
             amend_order=CapabilityLevel.PARTIAL_NATIVE,
             cancel_all=CapabilityLevel.NATIVE,
-            reduce_only=CapabilityLevel.SOFTWARE,
+            reduce_only=CapabilityLevel.NATIVE,
             watch_orders=CapabilityLevel.NATIVE,
-            fetch_position=CapabilityLevel.SOFTWARE,
+            fetch_position=CapabilityLevel.NATIVE,
             idempotency=CapabilityLevel.NATIVE,
-            short_selling=CapabilityLevel.UNSUPPORTED,
+            short_selling=CapabilityLevel.NATIVE,
         )
 
     # --- broker startup -------------------------------------------------------
 
     async def _ensure_broker_started(self) -> None:
-        """Construct + start the core spot inventory manager, once.
+        """Run the category's one-shot broker startup sequence.
 
         Awaited by every broker entry point (state reads, dispatches and
         the ``watch_orders`` loop), so whichever the engine drives first
         — in production the startup reconcile's ``get_position`` — runs
-        the fail-closed inventory startup before any dispatch. Without
-        persistence (``store_ctx is None``: unit tests, one-shot paths)
-        the manager stays ``None`` and the plugin serves venue state
-        directly.
+        it before any dispatch.
+
+        Spot constructs + fail-closed-starts the core spot inventory
+        manager; without persistence (``store_ctx is None``: unit tests,
+        one-shot paths) the manager stays ``None`` and the plugin serves
+        venue state directly.
+
+        Linear detects the account's position mode once. A HEDGE account
+        opts into the core one-way emulation by publishing the
+        :class:`~pynecore.core.plugin.broker.PositionPort` surface
+        (``position_port = self``, the cTrader HEDGED precedent); a
+        one-way account keeps the cheaper netting-native ``execute_*``
+        path. The engine reads ``position_port`` per dispatch, so setting
+        it here — before the first dispatch — is race-free.
         """
         if self._broker_started:
             return
         async with self._broker_start_lock:
             if self._broker_started:
                 return
-            market = await asyncio.to_thread(self._spot_market)
+            market = await asyncio.to_thread(self._broker_market)
+            if market.category == CATEGORY_LINEAR:
+                from .positions import POSITION_MODE_HEDGE
+                mode = await self._detect_position_mode(market)
+                self._position_mode = mode
+                if mode == POSITION_MODE_HEDGE:
+                    self.position_port = self
+                logger.info(
+                    "Bybit linear broker ready: %s position mode%s",
+                    mode.replace('_', '-'),
+                    " (core one-way emulation active)"
+                    if mode == POSITION_MODE_HEDGE else "",
+                )
+                self._broker_started = True
+                return
             if self.store_ctx is not None:
                 from pynecore.core.broker.spot_inventory import SpotInventoryManager
                 from .inventory import spot_port_for
@@ -260,14 +329,14 @@ class _StateMixin(_BybitBase):
 
     @override
     async def get_open_orders(self, symbol: str | None = None) -> list[ExchangeOrder]:
-        """Fetch the account's open spot orders via ``GET /v5/order/realtime``.
+        """Fetch the account's open orders via ``GET /v5/order/realtime``.
 
-        Cursor-paged; covers plain and conditional (``StopOrder``) orders —
-        the realtime endpoint returns both for spot. ``symbol`` defaults to
-        the chart instrument.
+        Cursor-paged; covers plain and conditional (trigger) orders — the
+        realtime endpoint returns both for spot and linear. ``symbol``
+        defaults to the chart instrument.
         """
         await self._ensure_broker_started()
-        market = await asyncio.to_thread(self._spot_market)
+        market = await asyncio.to_thread(self._broker_market)
         native_symbol = market.symbol
         if symbol is not None and symbol not in (self.symbol, native_symbol):
             # Single-instrument plugin: an unknown symbol has no orders
@@ -294,8 +363,14 @@ class _StateMixin(_BybitBase):
 
     @override
     async def get_position(self, symbol: str) -> ExchangePosition | None:
-        """Synthesize the spot position from the core inventory ledger.
+        """Return the chart symbol's position (category-specific source).
 
+        **Linear** reads the venue's native position object: a one-way
+        account serves the single ``/v5/position/list`` row directly; a
+        hedge account aggregates its raw legs through the core emulator's
+        netting view (the cTrader HEDGED pattern).
+
+        **Spot** synthesizes from the core inventory ledger.
         ``None`` is an authoritative flat by engine contract. Sub-grid
         dust counts as flat: Bybit charges the buy-side fee in the BASE
         coin, so a full buy→sell round trip leaves a residue below
@@ -312,6 +387,18 @@ class _StateMixin(_BybitBase):
         matching the pre-persistence test paths of the other plugins.
         """
         await self._ensure_broker_started()
+        market = await asyncio.to_thread(self._broker_market)
+        if market.category == CATEGORY_LINEAR:
+            from .positions import POSITION_MODE_HEDGE
+            try:
+                if self._position_mode == POSITION_MODE_HEDGE:
+                    from pynecore.core.broker.emulator import aggregate_positions
+                    return aggregate_positions(
+                        symbol, await self.fetch_raw_positions(symbol),
+                    )
+                return await self._fetch_linear_position(market)
+            except BybitError as e:
+                raise self._classify_read_error(e) from e
         manager = self._spot_manager
         if manager is None:
             return None
@@ -324,10 +411,9 @@ class _StateMixin(_BybitBase):
             vwap = manager.fold.vwap
             mark = float(vwap) if vwap is not None else 0.0
         position = manager.synthesize_position(mark)
-        if position is not None:
-            market = await asyncio.to_thread(self._spot_market)
-            if market.qty_step > 0 and position.size < market.qty_step:
-                return None
+        if position is not None \
+                and market.qty_step > 0 and position.size < market.qty_step:
+            return None
         return position
 
     @override

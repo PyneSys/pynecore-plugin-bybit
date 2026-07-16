@@ -8,10 +8,12 @@ SDK), composed from concern-scoped mix-ins on top of a shared
 
 The provider side serves historical OHLCV download, ``SymInfo`` synthesis
 and live WebSocket kline streaming for the ``spot``, ``linear`` and
-``inverse`` categories. The broker side (M2) covers spot order execution
-— entries, SOFTWARE exit brackets, cancels, in-place amends, the private
-order/execution event stream and the core spot-inventory integration;
-the derivatives execution models land in the next milestones.
+``inverse`` categories. The broker side covers spot (M2) and linear (M3)
+order execution — entries, SOFTWARE exit brackets, cancels, in-place
+amends, the private order/execution/position event stream, the core
+spot-inventory integration on spot and the venue position model (with
+hedge-mode one-way emulation) on linear; the inverse execution model
+lands in a later milestone.
 """
 import asyncio
 from pathlib import Path
@@ -22,6 +24,7 @@ from .events import _EventStreamMixin
 from .execution import _ExecutionMixin
 from .hosts import resolve_hosts
 from .live_provider import _LiveProviderMixin
+from .positions import _PositionsMixin
 from .provider import _ProviderMixin
 from .rest import _RestMixin
 from .state import _StateMixin
@@ -34,6 +37,7 @@ __all__ = [
 class Bybit(
     _EventStreamMixin,
     _ExecutionMixin,
+    _PositionsMixin,
     _StateMixin,
     _LiveProviderMixin,
     _ProviderMixin,
@@ -44,16 +48,20 @@ class Bybit(
 
     Provides historical OHLCV download, ``SymInfo`` and live WebSocket
     market-data streaming for Bybit spot, linear and inverse instruments,
-    plus live spot order execution over the same key pair. Spot pairs use
-    the plain symbol (``BTCUSDT``), perpetuals the ``.P`` suffix
-    (``BTCUSDT.P``), dated futures their native Bybit name.
+    plus live spot and linear order execution over the same key pair.
+    Spot pairs use the plain symbol (``BTCUSDT``), perpetuals the ``.P``
+    suffix (``BTCUSDT.P``), dated futures their native Bybit name.
 
     Spot execution integrates the core spot-inventory layer: the plugin
     exposes a :class:`~pynecore.core.broker.spot_inventory.SpotInventoryPort`
     over ``/v5/execution/list`` + ``/v5/account/wallet-balance`` and the
     core :class:`~pynecore.core.broker.spot_inventory.SpotInventoryManager`
     owns the fill ledger, the balance invariant and the position
-    synthesis. Order idempotency is exchange-native via ``orderLinkId``.
+    synthesis. Linear execution reads the venue's native position object
+    (``/v5/position/list`` + the private ``position`` topic); a one-way
+    account runs the netting-native path, a hedge account opts into the
+    core one-way emulation through the plugin's ``PositionPort``. Order
+    idempotency is exchange-native via ``orderLinkId``.
     """
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
@@ -108,3 +116,5 @@ class Bybit(
         self._seen_exec_ids = set()
         self._dispatch_qty = {}
         self._filled_cum = {}
+        self._position_mode = None
+        self._linear_sizes = None

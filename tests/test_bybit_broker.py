@@ -7,11 +7,13 @@ from decimal import Decimal
 import pytest
 
 from pynecore.core.broker.exceptions import (
+    ExchangeCapabilityError,
     ExchangeOrderRejectedError,
     OrderSkippedByPlugin,
 )
 from pynecore.core.broker.models import (
     CancelIntent,
+    CapabilityLevel,
     CloseIntent,
     DispatchEnvelope,
     EntryIntent,
@@ -24,6 +26,10 @@ from pynecore_bybit.exceptions import BybitAPIError
 from pynecore_bybit.helpers import format_decimal, quantize_qty, round_price
 from pynecore_bybit.inventory import spot_port_for
 from pynecore_bybit.models import InstrumentInfo
+from pynecore_bybit.positions import (
+    POSITION_MODE_HEDGE,
+    POSITION_MODE_ONE_WAY,
+)
 
 
 def main():
@@ -31,6 +37,42 @@ def main():
     Dummy main function to be a valid Pyne script
     """
     pass
+
+
+def _linear_instrument(**overrides) -> InstrumentInfo:
+    """Build a linear BTCUSDT perpetual for broker tests."""
+    values = dict(
+        category='linear',
+        symbol='BTCUSDT',
+        base_coin='BTC',
+        quote_coin='USDT',
+        settle_coin='USDT',
+        status='Trading',
+        tick_size_str='0.10',
+        tick_size=0.1,
+        qty_step_str='0.001',
+        qty_step=0.001,
+        min_order_qty=0.001,
+        min_order_amt=0.0,
+        min_notional=5.0,
+        max_limit_order_qty=1500.0,
+        max_market_order_qty=150.0,
+        contract_type='LinearPerpetual',
+        delivery_time=None,
+    )
+    values.update(overrides)
+    return InstrumentInfo(**values)
+
+
+def _position_row(**overrides) -> dict:
+    """Build one raw ``/v5/position/list`` row (flat one-way default)."""
+    values = dict(
+        symbol='BTCUSDT', positionIdx=0, size='0', side='',
+        avgPrice='', unrealisedPnl='', liqPrice='', leverage='10',
+        tradeMode=0, createdTime='',
+    )
+    values.update(overrides)
+    return values
 
 
 def _instrument(**overrides) -> InstrumentInfo:
@@ -390,3 +432,303 @@ def __test_bybit_spot_port_execution_mapping__():
     assert batch.executions == ()
     assert batch.next_cursor is not None
     assert not batch.has_more
+
+
+def _linear_plugin(responses=None, *, started=True) -> '_FakeBrokerBybit':
+    """Fake plugin pinned to the linear perpetual.
+
+    ``started=True`` skips the position-mode detection REST call so
+    body-shape tests need no canned position rows.
+    """
+    plugin = _FakeBrokerBybit(responses=responses)
+    plugin._market = _linear_instrument()
+    if started:
+        plugin._broker_started = True
+        plugin._position_mode = POSITION_MODE_ONE_WAY
+    return plugin
+
+
+def __test_bybit_linear_capabilities_and_gate__():
+    """Linear capability profile; inverse refused up front"""
+    plugin = _linear_plugin()
+    caps = plugin.get_capabilities()
+    assert caps.reduce_only is CapabilityLevel.NATIVE
+    assert caps.fetch_position is CapabilityLevel.NATIVE
+    assert caps.short_selling is CapabilityLevel.NATIVE
+    assert caps.stop_order is CapabilityLevel.NATIVE
+    assert caps.idempotency is CapabilityLevel.NATIVE
+    # Conservative until verified live on the demo.
+    assert caps.trailing_stop is CapabilityLevel.UNSUPPORTED
+    assert caps.tp_sl_bracket is CapabilityLevel.SOFTWARE
+    assert caps.oca_cancel is CapabilityLevel.SOFTWARE
+
+    plugin = _FakeBrokerBybit()
+    plugin._market = _linear_instrument(
+        category='inverse', symbol='BTCUSD', quote_coin='USD',
+        settle_coin='BTC', contract_type='InversePerpetual',
+    )
+    with pytest.raises(ExchangeCapabilityError):
+        plugin._broker_market()
+
+
+def __test_bybit_position_mode_detection__():
+    """positionIdx row pattern -> mode; hedge opts into the PositionPort"""
+    # One-way: the symbol query serves a single positionIdx=0 row.
+    plugin = _linear_plugin(
+        responses=[{'list': [_position_row()]}], started=False,
+    )
+    asyncio.run(plugin._ensure_broker_started())
+    assert plugin._position_mode == POSITION_MODE_ONE_WAY
+    assert plugin.position_port is None
+
+    # Hedge: two aggregate legs (positionIdx 1 and 2), zero size included.
+    plugin = _linear_plugin(
+        responses=[{'list': [_position_row(positionIdx=1),
+                             _position_row(positionIdx=2)]}],
+        started=False,
+    )
+    asyncio.run(plugin._ensure_broker_started())
+    assert plugin._position_mode == POSITION_MODE_HEDGE
+    assert plugin.position_port is plugin
+
+
+def __test_bybit_linear_entry_bodies__():
+    """Linear entries: no spot-isms, trigger orders, hedge positionIdx"""
+    # MARKET: no isLeverage / marketUnit (derivative qty is base contracts).
+    plugin = _linear_plugin(responses=[{'orderId': '601'}])
+    orders = asyncio.run(plugin.execute_entry(_entry_envelope(qty=0.002)))
+    _, _, body = plugin.calls[-1]
+    assert body['category'] == 'linear'
+    assert 'isLeverage' not in body
+    assert 'marketUnit' not in body
+    assert 'positionIdx' not in body
+    assert body['qty'] == '0.002'
+    assert orders[0].id == '601'
+
+    # STOP entry: plain trigger order, direction follows the side.
+    plugin = _linear_plugin(responses=[{'orderId': '602'}])
+    asyncio.run(plugin.execute_entry(_entry_envelope(
+        qty=0.002, order_type=OrderType.STOP, stop=120000.0,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert 'orderFilter' not in body
+    assert body['triggerPrice'] == '120000'
+    assert body['triggerDirection'] == 1  # buy stop triggers on a rise
+
+    plugin = _linear_plugin(responses=[{'orderId': '603'}])
+    asyncio.run(plugin.execute_entry(_entry_envelope(
+        qty=0.002, side='sell', order_type=OrderType.STOP, stop=80000.0,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['triggerDirection'] == 2  # sell stop triggers on a fall
+
+    # Hedge account: the entry stamps the intent side's leg index.
+    plugin = _linear_plugin(responses=[{'orderId': '604'}])
+    plugin._position_mode = POSITION_MODE_HEDGE
+    asyncio.run(plugin.execute_entry(_entry_envelope(qty=0.002)))
+    assert plugin.calls[-1][2]['positionIdx'] == 1
+    plugin._responses = [{'orderId': '605'}]
+    asyncio.run(plugin.execute_entry(_entry_envelope(qty=0.002, side='sell')))
+    assert plugin.calls[-1][2]['positionIdx'] == 2
+
+    # The linear base-denominated minimum skips loudly.
+    plugin = _linear_plugin()
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(plugin.execute_entry(_entry_envelope(qty=0.0004)))
+    assert exc.value.reason == 'below_min_size'
+
+
+def __test_bybit_linear_exit_close_reduce_only__():
+    """Linear bracket legs and closes carry the native reduceOnly flag"""
+    plugin = _linear_plugin(responses=[{'orderId': '611'}, {'orderId': '612'}])
+    legs = asyncio.run(plugin.execute_exit(DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='TP/SL', from_entry='Long', symbol='BTCUSDT', side='sell',
+            qty=0.002, tp_price=110000.0, sl_price=90000.0,
+        ),
+        run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+    )))
+    assert len(legs) == 2
+    _, _, tp_body = plugin.calls[0]
+    _, _, sl_body = plugin.calls[1]
+    assert tp_body['reduceOnly'] is True
+    assert 'isLeverage' not in tp_body
+    assert sl_body['reduceOnly'] is True
+    assert 'orderFilter' not in sl_body
+    assert sl_body['triggerDirection'] == 2  # sell SL triggers on a fall
+    assert sl_body['triggerPrice'] == '90000'
+
+    plugin = _linear_plugin(responses=[{'orderId': '613'}])
+    order = asyncio.run(plugin.execute_close(DispatchEnvelope(
+        intent=CloseIntent(pine_id='Long', symbol='BTCUSDT', side='sell',
+                           qty=0.002),
+        run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['reduceOnly'] is True
+    assert 'marketUnit' not in body
+    assert order.reduce_only is True
+
+
+def __test_bybit_linear_get_position__():
+    """Venue position read: zero-size row is flat, live row maps fully"""
+    plugin = _linear_plugin(responses=[{'list': [_position_row()]}])
+    assert asyncio.run(plugin.get_position('BTCUSDT')) is None
+
+    plugin = _linear_plugin(responses=[{'list': [_position_row(
+        size='0.002', side='Sell', avgPrice='100000', unrealisedPnl='-1.5',
+        liqPrice='198000', leverage='10', tradeMode=1,
+        createdTime='1752600000000',
+    )]}])
+    position = asyncio.run(plugin.get_position('BTCUSDT'))
+    assert position is not None
+    assert position.side == 'short'
+    assert position.size == 0.002
+    assert position.entry_price == 100000.0
+    assert position.unrealized_pnl == -1.5
+    assert position.liquidation_price == 198000.0
+    assert position.margin_mode == 'isolated'
+
+    # Hedge mode: the raw legs are netted through the core emulator.
+    plugin = _linear_plugin(responses=[{'list': [
+        _position_row(positionIdx=1, size='0.003', side='Buy',
+                      avgPrice='100000', createdTime='1752600000000'),
+        _position_row(positionIdx=2, size='0.001', side='Sell',
+                      avgPrice='101000', createdTime='1752600060000'),
+    ]}])
+    plugin._position_mode = POSITION_MODE_HEDGE
+    position = asyncio.run(plugin.get_position('BTCUSDT'))
+    assert position is not None
+    assert position.side == 'long'
+    assert position.size == pytest.approx(0.002)
+
+
+def __test_bybit_position_port_primitives__():
+    """PositionPort: leg parse/order, quantizer, close_leg, trading-stop"""
+    plugin = _linear_plugin(responses=[{'list': [
+        _position_row(positionIdx=2, size='0.001', side='Sell',
+                      avgPrice='101000', createdTime='1752600060000'),
+        _position_row(positionIdx=1, size='0.003', side='Buy',
+                      avgPrice='100000', createdTime='1752600000000'),
+        _position_row(positionIdx=0, size='0'),
+    ]}])
+    legs = asyncio.run(plugin.fetch_raw_positions('BTCUSDT'))
+    assert [leg.leg_id for leg in legs] == ['1', '2']  # oldest first
+    assert legs[0].side == 'buy' and legs[0].qty == 0.003
+    assert legs[1].side == 'sell' and legs[1].entry_price == 101000.0
+
+    quantizer = asyncio.run(plugin.get_volume_quantizer('BTCUSDT'))
+    assert quantizer(0.0025) == 2  # 2 whole 0.001 steps, floored
+
+    # close_leg: reduce-only market order against the leg's index. The
+    # emulator composes the coid as ``{parent}:{leg_id}`` — the colon is
+    # outside Bybit's orderLinkId charset and must map to an underscore
+    # on the wire (identity keyed by the same mapped id).
+    plugin = _linear_plugin(responses=[{'orderId': '701'}])
+    asyncio.run(plugin.close_leg(
+        'BTCUSDT', '1', 2, 't3st-0a1b2c3d-0sgls2iio-c0:1',
+    ))
+    endpoint, _, body = plugin.calls[-1]
+    assert endpoint == '/v5/order/create'
+    assert body['side'] == 'Sell'  # closing the Buy leg
+    assert body['qty'] == '0.002'
+    assert body['reduceOnly'] is True
+    assert body['positionIdx'] == 1
+    assert body['orderLinkId'] == 't3st-0a1b2c3d-0sgls2iio-c0_1'
+    assert plugin._order_identity['t3st-0a1b2c3d-0sgls2iio-c0_1'] == \
+           (None, None, LegType.CLOSE)
+
+    # amend_bracket: trading-stop attach; all-None clears with "0"s.
+    plugin = _linear_plugin(responses=[{}])
+    asyncio.run(plugin.amend_bracket(
+        'BTCUSDT', '2', side='buy', tp_price=90000.04, sl_price=110000.0,
+        trail_offset=None, coid='coid-bracket',
+    ))
+    endpoint, _, body = plugin.calls[-1]
+    assert endpoint == '/v5/position/trading-stop'
+    assert body['positionIdx'] == 2
+    assert body['tpslMode'] == 'Full'
+    assert body['takeProfit'] == '90000'
+    assert body['stopLoss'] == '110000'
+    assert body['trailingStop'] == '0'
+
+    # Measured benign rejects: zero position (10001 + message) and
+    # "not modified" (34040) are no-ops; a real reject propagates.
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("can not set tp/sl/ts for zero position", ret_code=10001),
+    ])
+    asyncio.run(plugin.amend_bracket(
+        'BTCUSDT', '1', side='sell', tp_price=None, sl_price=None,
+        trail_offset=None, coid='c1',
+    ))
+    plugin._responses = [BybitAPIError("not modified", ret_code=34040)]
+    asyncio.run(plugin.amend_bracket(
+        'BTCUSDT', '1', side='sell', tp_price=None, sl_price=None,
+        trail_offset=None, coid='c2',
+    ))
+    plugin._responses = [BybitAPIError("bad params", ret_code=10001)]
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(plugin.amend_bracket(
+            'BTCUSDT', '1', side='sell', tp_price=90000.0, sl_price=None,
+            trail_offset=None, coid='c3',
+        ))
+
+
+def __test_bybit_linear_event_filters_and_flat_sweep__():
+    """Category/execType filters and the position-cache flat sweep"""
+    plugin = _linear_plugin()
+    market = plugin._market
+    assert market is not None
+    plugin._record_identity('coid-lin', pine_id='Long', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.002)
+
+    # A spot fill of the same symbol name must not be attributed.
+    assert plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'category': 'spot', 'symbol': 'BTCUSDT', 'execType': 'Trade',
+            'execId': 'lx-1', 'orderId': '801', 'orderLinkId': 'coid-lin',
+            'side': 'Buy', 'execQty': '0.002', 'execPrice': '100000',
+            'execTime': '1752600000000',
+        }],
+    }, market) == []
+
+    # Funding rows carry no order fill -> skipped.
+    assert plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'category': 'linear', 'symbol': 'BTCUSDT', 'execType': 'Funding',
+            'execId': 'lx-2', 'orderId': '', 'orderLinkId': '',
+            'side': 'Buy', 'execQty': '0.002', 'execPrice': '100000',
+            'execTime': '1752600000000',
+        }],
+    }, market) == []
+
+    # A real linear fill translates; the fee currency is the settle coin.
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'category': 'linear', 'symbol': 'BTCUSDT', 'execType': 'Trade',
+            'execId': 'lx-3', 'orderId': '801', 'orderLinkId': 'coid-lin',
+            'side': 'Buy', 'execQty': '0.002', 'execPrice': '100000',
+            'execFee': '0.11', 'execTime': '1752600000000',
+        }],
+    }, market)
+    assert len(events) == 1
+    assert events[0].event_type == 'filled'
+    assert events[0].fee_currency == 'USDT'
+
+    # Flat sweep gating: unknown -> not flat; sized -> not flat; zero -> flat.
+    assert plugin._linear_is_flat() is False
+    plugin._ingest_position_frame({
+        'topic': 'position',
+        'data': [{'category': 'linear', 'symbol': 'BTCUSDT',
+                  'positionIdx': 0, 'size': '0.002', 'side': 'Buy'}],
+    }, market)
+    assert plugin._linear_is_flat() is False
+    plugin._ingest_position_frame({
+        'topic': 'position',
+        'data': [{'category': 'linear', 'symbol': 'BTCUSDT',
+                  'positionIdx': 0, 'size': '0', 'side': ''}],
+    }, market)
+    assert plugin._linear_is_flat() is True
