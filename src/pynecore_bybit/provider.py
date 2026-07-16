@@ -132,7 +132,11 @@ class _ProviderMixin(_BybitBase):
         if not entries:
             return None
         info = parse_instrument(category, entries[0])
+        # The parse may correct a mislabeled derivative row (Bybit serves
+        # the inverse contract under a linear query too) — cache under the
+        # query key AND the true category so both lookups hit.
         self._instruments[(category, info.symbol)] = info
+        self._instruments[(info.category, info.symbol)] = info
         return info
 
     def _resolve_market(self, symbol: str) -> InstrumentInfo:
@@ -241,9 +245,21 @@ class _ProviderMixin(_BybitBase):
         minmove, pricescale = market.price_grid()
 
         ticker = f"{market.symbol}.P" if market.is_perpetual else market.symbol
-        # Inverse contracts are denominated in whole USD contracts and settle
-        # in the base coin; ``pointvalue`` stays 1.0 for M1 (data-only) —
-        # the settle-coin accounting model is an M4 (broker) concern.
+        # Pine-side quantities are BASE-denominated on every category. TV
+        # models inverse contracts with the plain linear accounting too
+        # (measured: fractional qty trades, profit == qty * Δprice in the
+        # quote currency, pointvalue == 1) — the venue-side USD-contract
+        # mapping is a broker concern (execution/positions mix-ins). The
+        # venue qty grid is the Pine grid for spot/linear, but for inverse
+        # it is whole USD contracts, which is meaningless as a base grid;
+        # TV reports the linear sibling's lot instead (BTCUSD -> 0.001 =
+        # BTCUSDT qtyStep, ETHUSD -> 0.01 = ETHUSDT qtyStep; measured).
+        # Mirror that; without a linear sibling fall back to 0.0 so the
+        # provider chain estimates a sensible default.
+        mincontract = market.qty_step
+        if market.category == CATEGORY_INVERSE:
+            sibling = self._fetch_instrument(CATEGORY_LINEAR, f"{market.base_coin}USDT")
+            mincontract = sibling.qty_step if sibling is not None else 0.0
         return SymInfo(
             prefix='BYBIT',
             description=f"{market.base_coin}/{market.quote_coin}"
@@ -261,9 +277,9 @@ class _ProviderMixin(_BybitBase):
             pricescale=pricescale,
             minmove=minmove,
             pointvalue=1.0,
-            # The order-quantity grid (basePrecision / qtyStep); 0.0 lets the
-            # provider chain fall back to estimation when Bybit omits it.
-            mincontract=market.qty_step,
+            # The Pine order-quantity grid (see the mincontract derivation
+            # above); 0.0 lets the provider chain fall back to estimation.
+            mincontract=mincontract,
             opening_hours=list(_24_7_OPENING_HOURS),
             session_starts=list(_24_7_SESSION_STARTS),
             session_ends=list(_24_7_SESSION_ENDS),
@@ -361,13 +377,14 @@ class _ProviderMixin(_BybitBase):
             on_progress(end_dt.replace(tzinfo=None))
 
 
-def _syminfo_type_for(market: InstrumentInfo) -> Literal['crypto', 'swap', 'futures']:
+def _syminfo_type_for(market: InstrumentInfo) -> Literal['crypto', 'futures']:
     """Map an instrument to the PyneCore ``SymInfo.type`` literal.
 
-    Spot pairs are ``"crypto"`` (matching the Coinbase plugin and the
-    ``default_mincontract`` heuristic), perpetual contracts ``"swap"`` and
-    dated futures ``"futures"`` — the TradingView bucket names.
+    TradingView reports ``"crypto"`` for spot pairs AND crypto perpetuals
+    (measured live on ``BYBIT:BTCUSDT.P`` and ``BYBIT:BTCUSD.P``,
+    ``syminfo.type == "crypto"``); only dated futures fall into the
+    ``"futures"`` bucket (unmeasured — no dated Bybit future was reachable
+    on TV at the time).
     """
-    if market.category == CATEGORY_SPOT:
-        return 'crypto'
-    return 'swap' if market.is_perpetual else 'futures'
+    return 'crypto' if market.category == CATEGORY_SPOT or market.is_perpetual \
+        else 'futures'

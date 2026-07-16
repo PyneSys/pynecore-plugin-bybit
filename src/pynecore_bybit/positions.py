@@ -1,6 +1,6 @@
-"""Linear-derivative position mix-in for the Bybit plugin (M3).
+"""Derivative position mix-in for the Bybit plugin (linear M3, inverse M4).
 
-Implements the venue position path of the linear category:
+Implements the venue position path of the derivative categories:
 
 - Position-mode detection (one-way vs hedge). Measured on the global demo
   (2026-07-16): a symbol-filtered ``GET /v5/position/list`` returns one row
@@ -20,11 +20,21 @@ Implements the venue position path of the linear category:
   of the emulator's general multi-leg model, addressed by the index.
 - The last-known net-size cache the event stream's entry-row flat sweep
   keys off (fed by the private WS ``position`` topic and the periodic
-  reconcile snapshot).
+  reconcile snapshot). Wire units (contracts on inverse) — the sweep only
+  asks "flat or not".
+- The inverse net-position mirror (venue contracts + the base reported to
+  the core), seeded from the venue at startup and folded from this
+  strategy's own fills — the reduce-side base->contract conversions in
+  ``execution.py`` run through its effective anchor.
 
 The hedge bracket primitive (:meth:`amend_bracket`) maps to
 ``POST /v5/position/trading-stop`` — a position attribute Bybit overwrites
-wholesale, so an all-``None`` amend clears it, mirroring cTrader.
+wholesale, so an all-``None`` amend clears it, mirroring cTrader. The
+``PositionPort`` surface is linear-only: Bybit supports hedge mode on USDT
+perpetuals and inverse futures only, and the port's price-blind volume
+contract cannot carry the inverse base->contract conversion, so an
+inverse hedge account is refused at broker startup with instructions to
+switch to one-way mode.
 """
 import asyncio
 import logging
@@ -51,7 +61,7 @@ from .exceptions import (
     map_broker_error,
     reject_error,
 )
-from .helpers import format_decimal, round_price, wire_link_id
+from .helpers import contracts_to_base, format_decimal, round_price, wire_link_id
 from .models import InstrumentInfo
 
 logger = logging.getLogger(__name__)
@@ -68,7 +78,7 @@ _MARGIN_MODE = {0: 'cross', 1: 'isolated'}
 
 
 class _PositionsMixin(_BybitBase):
-    """Linear position path: mode detection, venue reads, PositionPort."""
+    """Derivative position path: mode detection, venue reads, PositionPort."""
 
     # --- mode detection ------------------------------------------------------
 
@@ -110,32 +120,36 @@ class _PositionsMixin(_BybitBase):
         The cache only drives the entry-row flat sweep between reconcile
         snapshots; the engine-facing reads stay REST-authoritative.
         """
-        sizes = self._linear_sizes
+        sizes = self._deriv_sizes
         if sizes is None:
             sizes = {}
-            self._linear_sizes = sizes
+            self._deriv_sizes = sizes
         for row in rows:
             idx = int(row.get('positionIdx') or 0)
             sizes[idx] = self._position_row_size(row)
 
-    def _linear_is_flat(self) -> bool:
+    def _deriv_is_flat(self) -> bool:
         """Whether the last-known venue position of the symbol is flat.
 
         ``False`` while no position snapshot has been seen yet — the sweep
         must never close entry rows on ignorance.
         """
-        sizes = self._linear_sizes
+        sizes = self._deriv_sizes
         if sizes is None:
             return False
         return all(size <= 0.0 for size in sizes.values())
 
-    async def _fetch_linear_position(
+    async def _fetch_deriv_position(
             self, market: InstrumentInfo,
     ) -> ExchangePosition | None:
         """Read the one-way position from the venue (``None`` = flat).
 
         ``None`` is an authoritative flat by engine contract; a zero-size
-        row (Bybit serves those for symbol queries) reports flat.
+        row (Bybit serves those for symbol queries) reports flat. Inverse
+        rows are contract-denominated; the core-facing size converts to
+        base at the position's average entry price (the adoption anchor —
+        the startup mirror seed uses the same conversion, so the core's
+        adopted base and the reduce-side dispatches stay consistent).
         """
         rows = await self._fetch_position_rows(market)
         self._ingest_position_sizes(rows)
@@ -144,12 +158,23 @@ class _PositionsMixin(_BybitBase):
             if size <= 0.0:
                 continue
             side = str(row.get('side') or '').lower()
+            entry_price = float(row.get('avgPrice') or 0.0)
+            unrealized = float(row.get('unrealisedPnl') or 0.0)
+            if market.is_inverse and entry_price > 0.0:
+                size = contracts_to_base(size, entry_price)
+                # Inverse unrealised PnL arrives in the settle coin; the
+                # core's openprofit is quote-denominated — convert at the
+                # mark price (falling back to the last trade, then the
+                # entry price, so the number is never left settle-coined).
+                mark = (float(row.get('markPrice') or 0.0)
+                        or self._last_price or entry_price)
+                unrealized *= mark
             return ExchangePosition(
                 symbol=self.symbol or market.symbol,
                 side='long' if side == 'buy' else 'short',
                 size=size,
-                entry_price=float(row.get('avgPrice') or 0.0),
-                unrealized_pnl=float(row.get('unrealisedPnl') or 0.0),
+                entry_price=entry_price,
+                unrealized_pnl=unrealized,
                 liquidation_price=float(row.get('liqPrice') or 0.0) or None,
                 leverage=float(row.get('leverage') or 0.0),
                 margin_mode=_MARGIN_MODE.get(
@@ -157,6 +182,45 @@ class _PositionsMixin(_BybitBase):
                 ),
             )
         return None
+
+    # --- inverse net-position mirror --------------------------------------------
+
+    def _inverse_seed_net(self, rows: list[dict]) -> None:
+        """Seed the inverse mirror from the venue's position rows.
+
+        An adopted position anchors at its average entry price — the same
+        conversion :meth:`_fetch_deriv_position` reports to the core, so
+        a core full-close of the adopted base lands exactly back on the
+        venue's contract count.
+        """
+        contracts = 0.0
+        base = 0.0
+        for row in rows:
+            size = self._position_row_size(row)
+            if size <= 0.0:
+                continue
+            side = str(row.get('side') or '').lower()
+            avg = float(row.get('avgPrice') or 0.0)
+            if side not in ('buy', 'sell') or avg <= 0.0:
+                continue
+            sign = 1.0 if side == 'buy' else -1.0
+            contracts += sign * size
+            base += sign * contracts_to_base(size, avg)
+        self._inverse_net_contracts = contracts
+        self._inverse_net_base = base
+
+    def _apply_inverse_fill(self, side: str, contracts: float, base: float) -> None:
+        """Fold one own fill into the inverse net-position mirror.
+
+        Contract counts are whole numbers, so their float sum is exact —
+        when it reaches zero the base side (which does accumulate float
+        noise across the division per fill) snaps to exactly flat.
+        """
+        sign = 1.0 if side == 'buy' else -1.0
+        self._inverse_net_contracts += sign * contracts
+        self._inverse_net_base += sign * base
+        if self._inverse_net_contracts == 0.0:
+            self._inverse_net_base = 0.0
 
     # --- PositionPort transport surface (core one-way emulation) ---------------
     #

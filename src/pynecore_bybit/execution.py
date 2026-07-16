@@ -18,7 +18,7 @@ Spot execution model:
 
 Linear execution model (differences):
 
-- No ``isLeverage`` / ``marketUnit`` — derivative quantities are always
+- No ``isLeverage`` / ``marketUnit`` — linear quantities are
   base-denominated contracts. Conditional orders are plain trigger orders
   (``triggerPrice`` + ``triggerDirection``; ``orderFilter=StopOrder`` is a
   spot-only concept).
@@ -30,11 +30,36 @@ Linear execution model (differences):
   emulator's ``PositionPort`` primitives (``positions.py``) instead of
   ``execute_close`` / ``_place_exit_leg``.
 
+Inverse execution model (differences from linear):
+
+- Wire quantities are whole USD contracts while the Pine side stays
+  base-denominated (TV semantics, measured). Every dispatch converts at
+  an explicit anchor price — entries at the limit / trigger / last trade
+  price, reduce paths (exit legs, closes) at the net-position mirror's
+  effective anchor so a core full-close lands exactly on the venue's
+  contract count even after price drift between entries. The per-coid
+  anchor is remembered (map + store-row extras) and the event stream
+  converts the fills back at the SAME anchor, so a full fill sums exactly
+  to the dispatched base quantity.
+- The dispatch bookkeeping (``_dispatch_qty`` / ``_filled_cum`` /
+  BrokerStore row qty) runs in the WIRE domain (contracts); only the
+  core-facing ``ExchangeOrder`` / ``OrderEvent`` objects carry base.
+- ``minNotionalValue`` is the contract count itself (1 contract == 1 USD)
+  and the qty ceilings / ``minOrderQty`` are contract-denominated, so the
+  preflight checks run in the wire domain.
+- Hedge mode is refused at startup on inverse (Bybit supports it on USDT
+  perpetuals and inverse futures only, and the ``PositionPort`` volume
+  contract cannot carry the price-dependent base->contract conversion).
+
 Shared across categories:
 
 - ``orderLinkId`` carries the deterministic client-order-id (NATIVE
   idempotency): a duplicate submission is rejected (spot 170141, linear
   110072) and resolved by looking the original order up by the same id.
+  A live or filled original is adopted; a DEAD original (Bybit never
+  allows client-id reuse, even after a confirmed cancel — measured live)
+  raises ``ClientOrderIdSpentError`` so the engine re-dispatches under a
+  fresh id instead of adopting a cancelled order as live.
 - Every dispatch row is persisted BEFORE the wire send (when persistence
   is on): the spot inventory attribution keys on the ``orderLinkId``
   being resolvable, so a crash between send and ack must not orphan a
@@ -46,11 +71,12 @@ are the robustness milestone, mirroring the cTrader plugin's phasing.
 """
 import asyncio
 import logging
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from time import time as epoch_time
 
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
+    ClientOrderIdSpentError,
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -97,6 +123,8 @@ from .helpers import (
     CATEGORY_SPOT,
     TRIGGER_DIRECTION_FALL,
     TRIGGER_DIRECTION_RISE,
+    base_to_contracts,
+    contracts_to_base,
     format_decimal,
     quantize_qty,
     round_price,
@@ -107,6 +135,19 @@ from .positions import HEDGE_IDX_BUY, HEDGE_IDX_SELL, POSITION_MODE_HEDGE
 logger = logging.getLogger(__name__)
 
 _SIDE_WIRE = {'buy': 'Buy', 'sell': 'Sell'}
+
+#: Terminal ``orderStatus`` values with nothing live and no fill behind
+#: them: the order died without becoming a position. A duplicate
+#: ``orderLinkId`` reject that resolves to one of these means the id is
+#: SPENT (Bybit never allows client-id reuse — measured live on the demo:
+#: spot 170141, inverse 110072 on a re-create after a confirmed cancel),
+#: so adopting the row as a live order would silently leave the intent
+#: without a working order. ``PartiallyFilledCanceled`` belongs here: its
+#: fills were already reported on the ORIGINAL dispatch, the id itself is
+#: dead.
+_DEAD_ORDER_STATUSES = frozenset({
+    'Cancelled', 'PartiallyFilledCanceled', 'Deactivated', 'Rejected',
+})
 
 
 class _ExecutionMixin(_BybitBase):
@@ -171,9 +212,15 @@ class _ExecutionMixin(_BybitBase):
           raises its taxonomy class; anything else is a definitive
           :class:`ExchangeOrderRejectedError` — Bybit rejected before
           booking, nothing is live.
-        - A duplicate ``orderLinkId`` reject means the original landed:
-          the existing order is looked up by the id and returned as the
-          result, keeping retries idempotent end-to-end.
+        - A duplicate ``orderLinkId`` reject means the venue already knows
+          the id. A live (or filled) original is adopted as the result,
+          keeping retries idempotent end-to-end. A DEAD original
+          (cancelled / rejected — nothing live, no fill) means the id is
+          spent: Bybit never allows client-id reuse, so the create did NOT
+          land and adopting the dead row would silently report a working
+          order that does not exist. That case raises
+          :class:`ClientOrderIdSpentError` — the sync engine re-anchors
+          the envelope and re-dispatches under a fresh id.
         """
         try:
             return await self._call(endpoint, method='post', body=body, auth=True)
@@ -181,10 +228,18 @@ class _ExecutionMixin(_BybitBase):
             if e.ret_code in DUPLICATE_COID_CODES:
                 existing = await self._lookup_order_by_coid(coid)
                 if existing is not None:
+                    status = str(existing.get('orderStatus') or '')
+                    if status in _DEAD_ORDER_STATUSES:
+                        raise ClientOrderIdSpentError(
+                            f"Bybit {context}: orderLinkId {coid} is spent — "
+                            f"the venue refused the create as a duplicate and "
+                            f"the original order is terminal "
+                            f"({status}); nothing is live under this id"
+                        ) from e
                     logger.info(
                         "Bybit %s: duplicate orderLinkId %s — adopting the "
-                        "already-landed order %s",
-                        context, coid, existing.get('orderId'),
+                        "already-landed order %s (status %s)",
+                        context, coid, existing.get('orderId'), status,
                     )
                     return existing
                 raise OrderDispositionUnknownError(
@@ -257,14 +312,17 @@ class _ExecutionMixin(_BybitBase):
     ) -> None:
         """Enforce the venue's per-order bounds without clamping.
 
-        Quantity ceilings (``maxMarketOrderQty`` / ``maxLimitOrderQty`` on
-        spot, ``maxMktOrderQty`` / ``maxOrderQty`` on linear), the linear
-        base-denominated minimum (``minOrderQty``) and the
-        QUOTE-denominated minimum notional (spot ``minOrderAmt`` / linear
-        ``minNotionalValue``) all skip loudly — a single out-of-range
-        order must not halt the bot. The market-order notional check uses
-        the latest observed trade price; with no price seen yet the
-        venue-side reject is the backstop.
+        ``qty`` arrives in the WIRE domain (base units on spot/linear,
+        whole USD contracts on inverse), which is the domain every venue
+        bound is quoted in. Quantity ceilings (``maxMarketOrderQty`` /
+        ``maxLimitOrderQty`` on spot, ``maxMktOrderQty`` / ``maxOrderQty``
+        on derivatives), the derivative minimum (``minOrderQty``) and the
+        QUOTE-denominated minimum notional (spot ``minOrderAmt`` /
+        derivative ``minNotionalValue``) all skip loudly — a single
+        out-of-range order must not halt the bot. The linear market-order
+        notional check uses the latest observed trade price (with no price
+        seen yet the venue-side reject is the backstop); on inverse the
+        contract count IS the notional.
         """
         cap = (market.max_market_order_qty if is_market
                else market.max_limit_order_qty)
@@ -286,6 +344,19 @@ class _ExecutionMixin(_BybitBase):
             )
         min_notional = market.min_order_amt or market.min_notional
         if min_notional > 0:
+            if market.is_inverse:
+                # 1 contract == 1 USD: the wire quantity IS the quote
+                # notional, no price reference needed.
+                if float(qty) < min_notional:
+                    raise OrderSkippedByPlugin(
+                        f"Skipping {label}: notional {float(qty):.8g} "
+                        f"{market.quote_coin} below the {market.symbol} "
+                        f"minimum {min_notional}. No order sent.",
+                        intent_key=intent_key, reason="below_min_notional",
+                        context={'symbol': market.symbol, 'qty': float(qty),
+                                 'min_notional': min_notional},
+                    )
+                return
             ref_price = price
             if ref_price is None and self._last_price is not None:
                 ref_price = Decimal(str(self._last_price))
@@ -299,6 +370,148 @@ class _ExecutionMixin(_BybitBase):
                     context={'symbol': market.symbol, 'qty': float(qty),
                              'min_notional': min_notional},
                 )
+
+    # --- inverse contract mapping ------------------------------------------------
+
+    def _inverse_anchor_for(self, coid: str, *,
+                            fallback: float | None = None) -> Decimal | None:
+        """Resolve the base<->contract anchor price of one inverse dispatch.
+
+        In-memory map first (always current in-process), then the
+        BrokerStore row's ``anchor`` extra (survives restarts), then the
+        caller's fallback (typically the execution price — degrades the
+        exact base summation to a per-slice approximation, but never
+        drops a fill).
+        """
+        anchor = self._wire_anchor.get(coid)
+        if anchor is not None:
+            return anchor
+        if self.store_ctx is not None and coid:
+            row = self.store_ctx.get_order(coid)
+            raw = (row.extras or {}).get('anchor') if row is not None else None
+            if raw:
+                anchor = Decimal(str(raw))
+                self._wire_anchor[coid] = anchor
+                return anchor
+        if fallback is not None and fallback > 0:
+            return Decimal(str(fallback))
+        return None
+
+    async def _inverse_ref_price(
+            self, market: InstrumentInfo, price: Decimal | None,
+    ) -> Decimal:
+        """Pick the entry-side conversion anchor.
+
+        The order's own limit / trigger price when it has one (the price
+        the fill is expected at), else the last trade seen on the kline
+        stream, else one REST ticker read — a market entry must convert
+        at SOME live price; with none obtainable the entry is rejected
+        (a definitive per-order reject, the engine keeps running).
+        """
+        if price is not None and price > 0:
+            return price
+        if self._last_price is not None and self._last_price > 0:
+            return Decimal(str(self._last_price))
+        try:
+            result = await self._call('/v5/market/tickers', {
+                'category': market.category,
+                'symbol': market.symbol,
+            })
+        except BybitError as e:
+            raise ExchangeOrderRejectedError(
+                f"Bybit inverse conversion needs a reference price and the "
+                f"ticker read failed for {market.symbol}: {e}"
+            ) from e
+        rows = result.get('list') or []
+        last = float((rows[0] if rows else {}).get('lastPrice') or 0.0)
+        if last > 0:
+            return Decimal(str(last))
+        raise ExchangeOrderRejectedError(
+            f"Bybit reports no last price for {market.symbol} — cannot "
+            f"convert the base quantity to inverse contracts"
+        )
+
+    def _inverse_entry_contracts(
+            self, market: InstrumentInfo, qty: float, anchor: Decimal, *,
+            intent_key: str, label: str,
+    ) -> Decimal:
+        """Convert a base-denominated quantity to contracts at a fixed anchor.
+
+        Entries anchor at their own price level; the in-place amend
+        paths reuse the dispatch's recorded anchor through this helper.
+        """
+        contracts = base_to_contracts(qty, anchor, market.qty_step_str)
+        if contracts <= 0:
+            raise OrderSkippedByPlugin(
+                f"Skipping {label}: size {qty} converts to zero contracts "
+                f"at {anchor} on the {market.symbol} grid "
+                f"({market.qty_step_str}). No order sent.",
+                intent_key=intent_key, reason="below_min_size",
+                context={'symbol': market.symbol, 'qty': qty,
+                         'anchor': float(anchor),
+                         'qty_step': market.qty_step_str},
+            )
+        return contracts
+
+    async def _inverse_reduce_contracts(
+            self, market: InstrumentInfo, qty: float, *,
+            intent_key: str, label: str,
+    ) -> tuple[Decimal, Decimal]:
+        """Convert a reduce-side base quantity (exit leg / close) to contracts.
+
+        Converts through the net-position mirror's effective anchor
+        (venue contracts over the base reported to the core), so the
+        proportions the engine computes in base land on the same
+        proportions in contracts. A request covering the whole mirrored
+        base snaps onto the venue's exact contract count — this is what
+        makes a core full-close leave zero residue even after the
+        reversal auto-flip repriced part of the position. With no known
+        position (defensive orders on a flat book) the last-price entry
+        anchor applies and the venue's reduce-only handling is the
+        backstop.
+
+        :return: ``(contracts, anchor)`` — the anchor is recorded per coid
+            so the fills convert back to exactly the requested base.
+        """
+        net_c = abs(self._inverse_net_contracts)
+        net_b = abs(self._inverse_net_base)
+        if net_c > 0.0 and net_b > 0.0:
+            anchor = Decimal(str(net_c)) / Decimal(str(net_b))
+            if qty >= net_b * (1.0 - 1e-9):
+                contracts = quantize_qty(net_c, market.qty_step_str)
+            else:
+                contracts = min(
+                    base_to_contracts(qty, anchor, market.qty_step_str),
+                    quantize_qty(net_c, market.qty_step_str),
+                )
+        else:
+            anchor = await self._inverse_ref_price(market, None)
+            contracts = base_to_contracts(qty, anchor, market.qty_step_str)
+        if contracts <= 0:
+            raise OrderSkippedByPlugin(
+                f"Skipping {label}: size {qty} converts to zero contracts "
+                f"at {anchor} on the {market.symbol} grid "
+                f"({market.qty_step_str}). No order sent.",
+                intent_key=intent_key, reason="below_min_size",
+                context={'symbol': market.symbol, 'qty': qty,
+                         'anchor': float(anchor),
+                         'qty_step': market.qty_step_str},
+            )
+        return contracts, anchor
+
+    def _record_anchor(self, coid: str, anchor: Decimal | None,
+                       extras: dict) -> dict:
+        """Remember a dispatch's conversion anchor (map + row extras)."""
+        if anchor is None:
+            return extras
+        self._wire_anchor[coid] = anchor
+        return {**extras, 'anchor': format_decimal(anchor)}
+
+    def _core_qty(self, qty: Decimal, anchor: Decimal | None) -> float:
+        """The core-facing (base) value of a wire quantity."""
+        if anchor is None:
+            return float(qty)
+        return contracts_to_base(qty, anchor)
 
     # --- persistence helpers -----------------------------------------------------
 
@@ -360,24 +573,49 @@ class _ExecutionMixin(_BybitBase):
         market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} {intent.side.upper()} entry "
                  f"id={intent.pine_id!r}")
+        if market.is_inverse:
+            anchor = await self._inverse_ref_price(
+                market, self._entry_anchor_price(intent, market),
+            )
+            qty = self._inverse_entry_contracts(
+                market, intent.qty, anchor,
+                intent_key=intent.intent_key, label=label,
+            )
+            return await self._place_entry_order(
+                envelope, intent, market, qty, anchor,
+            )
         qty = self._quantize_or_skip(
             market, intent.qty, intent_key=intent.intent_key, label=label,
         )
         return await self._place_entry_order(envelope, intent, market, qty)
 
+    @staticmethod
+    def _entry_anchor_price(
+            intent: EntryIntent, market: InstrumentInfo,
+    ) -> Decimal | None:
+        """The entry order's own price level (the expected fill price)."""
+        if intent.order_type is OrderType.LIMIT and intent.limit is not None:
+            return round_price(intent.limit, market.tick_size_str)
+        if intent.order_type is OrderType.STOP and intent.stop is not None:
+            return round_price(intent.stop, market.tick_size_str)
+        return None
+
     async def _place_entry_order(
             self, envelope: DispatchEnvelope, intent: EntryIntent,
             market: InstrumentInfo, qty: Decimal,
+            anchor: Decimal | None = None,
     ) -> list[ExchangeOrder]:
-        """Build, persist and POST one entry order of ``qty`` (grid units).
+        """Build, persist and POST one entry order of ``qty`` (wire units).
 
         Shared by :meth:`execute_entry` and the hedge-emulation
         ``place_leg`` primitive (which sizes the residual leg itself).
         Category shape: spot sends ``isLeverage=0`` + base-coin market
-        units and uses ``orderFilter=StopOrder`` conditionals; linear
-        sends plain trigger orders (``triggerPrice`` +
-        ``triggerDirection``) and, on a hedge account, stamps the
-        ``positionIdx`` of the intent side.
+        units and uses ``orderFilter=StopOrder`` conditionals; the
+        derivatives send plain trigger orders (``triggerPrice`` +
+        ``triggerDirection``) and, on a hedge account, stamp the
+        ``positionIdx`` of the intent side. On inverse ``qty`` arrives in
+        contracts with its conversion ``anchor``; the core-facing return
+        value converts back to base at the same anchor.
         """
         coid = envelope.client_order_id(
             KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
@@ -439,6 +677,9 @@ class _ExecutionMixin(_BybitBase):
         entry_kind = (ENTRY_KIND_POSITION
                       if intent.order_type is OrderType.MARKET
                       else ENTRY_KIND_WORKING)
+        extras = self._record_anchor(coid, anchor, {
+            'kind': entry_kind, 'order_type': intent.order_type.value,
+        })
         self._record_identity(coid, pine_id=intent.pine_id,
                               from_entry=None, leg_type=LegType.ENTRY,
                               qty=float(qty))
@@ -449,6 +690,10 @@ class _ExecutionMixin(_BybitBase):
                 intent_key=intent.intent_key, pine_entry_id=intent.pine_id,
                 kind=entry_kind, order_type=intent.order_type.value,
             )
+            if anchor is not None:
+                # The conversion anchor must survive a restart; merge it
+                # into the row extras right after the insert.
+                self.store_ctx.upsert_order(coid, extras=extras)
             self.store_ctx.log_event(
                 'dispatch_submitted', client_order_id=coid,
                 intent_key=intent.intent_key,
@@ -462,22 +707,21 @@ class _ExecutionMixin(_BybitBase):
             self._mark_dispatch_failure(coid, exc)
             raise
         order_id = str(result.get('orderId') or '')
-        self._confirm_row(coid, order_id, {
-            'kind': entry_kind, 'order_type': intent.order_type.value,
-        })
+        self._confirm_row(coid, order_id, extras)
         if self.store_ctx is not None:
             self.store_ctx.log_event(
                 'entry_dispatched', client_order_id=coid,
                 exchange_order_id=order_id, intent_key=intent.intent_key,
             )
+        core_qty = self._core_qty(qty, anchor)
         return [ExchangeOrder(
             id=order_id,
             symbol=intent.symbol,
             side=intent.side,
             order_type=intent.order_type,
-            qty=float(qty),
+            qty=core_qty,
             filled_qty=0.0,
-            remaining_qty=float(qty),
+            remaining_qty=core_qty,
             price=float(price) if price is not None else None,
             stop_price=(float(round_price(intent.stop, market.tick_size_str))
                         if intent.order_type is OrderType.STOP
@@ -513,9 +757,15 @@ class _ExecutionMixin(_BybitBase):
         market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} exit id={intent.pine_id!r} "
                  f"from={intent.from_entry!r}")
-        qty = self._quantize_or_skip(
-            market, intent.qty, intent_key=intent.intent_key, label=label,
-        )
+        anchor: Decimal | None = None
+        if market.is_inverse:
+            qty, anchor = await self._inverse_reduce_contracts(
+                market, intent.qty, intent_key=intent.intent_key, label=label,
+            )
+        else:
+            qty = self._quantize_or_skip(
+                market, intent.qty, intent_key=intent.intent_key, label=label,
+            )
 
         legs: list[ExchangeOrder] = []
         try:
@@ -524,13 +774,73 @@ class _ExecutionMixin(_BybitBase):
                     envelope, intent, market, qty,
                     leg='tp',
                     price=round_price(intent.tp_price, market.tick_size_str),
+                    anchor=anchor,
                 ))
             if intent.sl_price is not None:
                 legs.append(await self._place_exit_leg(
                     envelope, intent, market, qty,
                     leg='sl',
                     price=round_price(intent.sl_price, market.tick_size_str),
+                    anchor=anchor,
                 ))
+        except ClientOrderIdSpentError as spent:
+            # A leg id was consumed by a now-dead order (a cancel+recreate
+            # bracket modify re-sent the pinned leg id the cancel just
+            # spent). This is NOT an unprotected-position emergency — the
+            # engine re-anchors and re-dispatches the whole bracket under
+            # fresh ids — but the re-dispatch re-places EVERY leg, so a
+            # sibling this attempt already placed must be rolled back
+            # first or the fresh bracket would double it. The spent error
+            # contract requires a VERIFIED cleanup before propagating: if
+            # the sibling's disposition cannot be pinned down (an
+            # ambiguous rollback cancel that a readback plus one retry
+            # could not resolve, or a sibling that already executed),
+            # letting any other error replace the spent signal would park
+            # the whole dispatch on the sibling's id — pending
+            # verification could then adopt that lone leg as the complete
+            # bracket, leaving the position without its stop. Escalate to
+            # the defensive-flatten path instead: it closes the exposure
+            # and its residual enumeration owns the still-live sibling
+            # row.
+            for placed in legs:
+                rolled_back, executed = await self._rollback_spent_sibling(
+                    market, placed.client_order_id)
+                if not rolled_back:
+                    # Size the defensive close to the confirmed residual:
+                    # a fill that raced the rollback already reduced the
+                    # position (booked by the event stream), and the core
+                    # forwards this qty verbatim into the synthesized
+                    # CloseIntent — on spot that order carries no
+                    # reduceOnly cap, so the pre-fill bracket size would
+                    # oversell the inventory (or reject the whole close
+                    # for insufficient balance). With the executed amount
+                    # unmeasurable (unreadable readback / unresolvable
+                    # cancel — the venue API is already failing in those
+                    # branches, a snapshot read would ride the same
+                    # broken transport) the full size stays the
+                    # conservative default and the venue-side backstops
+                    # bound the damage.
+                    residual = (qty if executed is None
+                                else max(qty - executed, Decimal(0)))
+                    raise BracketAttachAfterFillRejectedError(
+                        f"Bybit bracket rollback unresolved after a spent "
+                        f"leg id (exit={intent.pine_id!r}, "
+                        f"from_entry={intent.from_entry!r}): sibling "
+                        f"{placed.client_order_id} "
+                        + (f"executed {executed} of {qty}"
+                           if executed is not None
+                           else "disposition unknown"),
+                        position_coid=self._entry_coid_for(intent.from_entry)
+                        or f"__pyne_orphan__{intent.symbol}__{intent.from_entry}",
+                        symbol=intent.symbol,
+                        position_side='buy' if intent.side == 'sell' else 'sell',
+                        qty=self._core_qty(residual, anchor),
+                        from_entry=intent.from_entry,
+                        exit_id=intent.pine_id,
+                    ) from spent
+                if self.store_ctx is not None:
+                    self.store_ctx.close_order(placed.client_order_id)
+            raise
         except ExchangeOrderRejectedError as exc:
             # The parent entry has already filled by the time an exit
             # dispatches, so a definitive leg reject leaves the inventory
@@ -547,7 +857,7 @@ class _ExecutionMixin(_BybitBase):
                 or f"__pyne_orphan__{intent.symbol}__{intent.from_entry}",
                 symbol=intent.symbol,
                 position_side='buy' if intent.side == 'sell' else 'sell',
-                qty=float(qty),
+                qty=self._core_qty(qty, anchor),
                 from_entry=intent.from_entry,
                 exit_id=intent.pine_id,
             ) from exc
@@ -573,13 +883,15 @@ class _ExecutionMixin(_BybitBase):
     async def _place_exit_leg(
             self, envelope: DispatchEnvelope, intent: ExitIntent,
             market: InstrumentInfo, qty: Decimal, *,
-            leg: str, price: Decimal,
+            leg: str, price: Decimal, anchor: Decimal | None = None,
     ) -> ExchangeOrder:
         """Place one bracket leg: plain limit (TP) or conditional market (SL).
 
-        On linear both legs carry the native ``reduceOnly`` flag; the SL
-        is a plain trigger order (an exit stop triggers against the
-        position: a sell SL on a fall, a buy SL on a rise).
+        On the derivatives both legs carry the native ``reduceOnly``
+        flag; the SL is a plain trigger order (an exit stop triggers
+        against the position: a sell SL on a fall, a buy SL on a rise).
+        On inverse ``qty`` arrives in contracts with its reduce-side
+        conversion ``anchor``.
         """
         coid = envelope.client_order_id(KIND_EXIT_TP if leg == 'tp' else KIND_EXIT_SL)
         is_spot = market.category == CATEGORY_SPOT
@@ -612,7 +924,9 @@ class _ExecutionMixin(_BybitBase):
         self._record_identity(coid, pine_id=intent.pine_id,
                               from_entry=intent.from_entry, leg_type=leg_type,
                               qty=float(qty))
-        extras = {'kind': 'exit_leg', 'leg': leg, 'exit_id': intent.pine_id}
+        extras = self._record_anchor(coid, anchor, {
+            'kind': 'exit_leg', 'leg': leg, 'exit_id': intent.pine_id,
+        })
         self._persist_leg_row(
             coid, market=market, side=intent.side, qty=qty,
             intent_key=intent.intent_key, from_entry=intent.from_entry,
@@ -635,14 +949,15 @@ class _ExecutionMixin(_BybitBase):
                 exchange_order_id=order_id, intent_key=intent.intent_key,
                 payload={'leg': leg, 'price': float(price)},
             )
+        core_qty = self._core_qty(qty, anchor)
         return ExchangeOrder(
             id=order_id,
             symbol=intent.symbol,
             side=intent.side,
             order_type=OrderType.LIMIT if leg == 'tp' else OrderType.STOP,
-            qty=float(qty),
+            qty=core_qty,
             filled_qty=0.0,
-            remaining_qty=float(qty),
+            remaining_qty=core_qty,
             price=float(price) if leg == 'tp' else None,
             stop_price=float(price) if leg == 'sl' else None,
             average_fill_price=None,
@@ -669,9 +984,15 @@ class _ExecutionMixin(_BybitBase):
         market = await asyncio.to_thread(self._broker_market)
         coid = envelope.client_order_id(KIND_CLOSE)
         label = f"{market.symbol} close id={intent.pine_id!r}"
-        qty = self._quantize_or_skip(
-            market, intent.qty, intent_key=intent.intent_key, label=label,
-        )
+        anchor: Decimal | None = None
+        if market.is_inverse:
+            qty, anchor = await self._inverse_reduce_contracts(
+                market, intent.qty, intent_key=intent.intent_key, label=label,
+            )
+        else:
+            qty = self._quantize_or_skip(
+                market, intent.qty, intent_key=intent.intent_key, label=label,
+            )
         self._preflight_order(
             market, qty, is_market=True, price=None,
             intent_key=intent.intent_key, label=label,
@@ -692,7 +1013,9 @@ class _ExecutionMixin(_BybitBase):
         self._record_identity(coid, pine_id=None,
                               from_entry=intent.pine_id, leg_type=LegType.CLOSE,
                               qty=float(qty))
-        extras = {'kind': 'close', 'close_of_entry': intent.pine_id}
+        extras = self._record_anchor(coid, anchor, {
+            'kind': 'close', 'close_of_entry': intent.pine_id,
+        })
         self._persist_leg_row(
             coid, market=market, side=intent.side, qty=qty,
             intent_key=intent.intent_key, from_entry=intent.pine_id,
@@ -711,14 +1034,15 @@ class _ExecutionMixin(_BybitBase):
                 'close_dispatched', client_order_id=coid,
                 exchange_order_id=order_id, intent_key=intent.intent_key,
             )
+        core_qty = self._core_qty(qty, anchor)
         return ExchangeOrder(
             id=order_id,
             symbol=intent.symbol,
             side=intent.side,
             order_type=OrderType.MARKET,
-            qty=float(qty),
+            qty=core_qty,
             filled_qty=0.0,
-            remaining_qty=float(qty),
+            remaining_qty=core_qty,
             price=None,
             stop_price=None,
             average_fill_price=None,
@@ -815,6 +1139,80 @@ class _ExecutionMixin(_BybitBase):
             ) from e
         return True
 
+    async def _rollback_spent_sibling(
+            self, market: InstrumentInfo, coid: str,
+    ) -> tuple[bool, Decimal | None]:
+        """Roll back one already-placed bracket leg after a spent sibling id.
+
+        ``(True, 0)`` only when the leg is verifiably dead with nothing
+        executed — the state in which the engine may safely re-dispatch
+        the whole bracket under fresh ids. An ambiguous cancel is
+        resolved locally instead of leaking upward (which would replace
+        the spent signal and park the whole dispatch on this leg's id):
+        the order is read back by its deterministic ``orderLinkId`` and
+        the cancel is retried once. A NOMINAL cancel answer is no proof
+        by itself either: a fill can land right before the cancel (the
+        leg dies as ``PartiallyFilledCanceled`` with executed quantity)
+        and the benign "order not found" mapping may hide a fully
+        ``Filled`` leg — so every accepted cancel is followed by a
+        readback that must show the leg dead with zero fills. A leg
+        that executed — fully or partially — can never be rolled back
+        (its fills are already booked by the event stream), so it
+        reports ``(False, executed)`` and the caller escalates to the
+        defensive-flatten path rather than re-dispatching a doubled
+        exit — the executed WIRE quantity lets the caller size the
+        defensive close to the confirmed residual instead of the
+        pre-fill bracket size. The executed amount is ``None`` when it
+        could not be measured (unreadable readback or an unresolvable
+        cancel).
+        """
+        try:
+            await self._cancel_by_coid(market, coid)
+        except OrderDispositionUnknownError:
+            verdict, executed = await self._rollback_readback(coid)
+            if verdict is not None:
+                return verdict, executed
+            try:
+                await self._cancel_by_coid(market, coid)
+            except OrderDispositionUnknownError:
+                return False, None
+        verdict, executed = await self._rollback_readback(coid)
+        if verdict is None:
+            # A nominal cancel whose confirming readback stayed
+            # undecided (leg shows alive, or both lookup endpoints
+            # unreadable): the zero-fill invariant is unproven and any
+            # executed number seen would not be final — escalate with
+            # the fill state unknown.
+            return False, None
+        return verdict, executed
+
+    async def _rollback_readback(
+            self, coid: str) -> tuple[bool | None, Decimal | None]:
+        """Classify a rollback leg's disposition by readback.
+
+        Returns ``(verdict, executed)`` where ``executed`` is the leg's
+        cumulative executed WIRE quantity when it could be read (base
+        units on spot/linear, contracts on inverse), else ``None``.
+        Verdict ``True`` — the leg is dead with zero executed quantity
+        (the bracket may be re-dispatched under fresh ids); ``False`` —
+        the leg executed or its fill state is unparseable (never safe
+        to re-dispatch); ``None`` — undecided (still alive, or both
+        lookup endpoints unreadable), the caller may retry the cancel
+        once.
+        """
+        existing = await self._lookup_order_by_coid(coid)
+        if existing is None:
+            return None, None
+        try:
+            executed = Decimal(str(existing.get('cumExecQty') or '0'))
+        except (InvalidOperation, TypeError, ValueError):
+            return False, None
+        if executed > 0:
+            return False, executed
+        if str(existing.get('orderStatus') or '') in _DEAD_ORDER_STATUSES:
+            return True, Decimal(0)
+        return None, None
+
     @override
     async def execute_cancel_with_outcome(
             self, envelope: DispatchEnvelope,
@@ -872,8 +1270,7 @@ class _ExecutionMixin(_BybitBase):
             status = str((existing or {}).get('orderStatus') or '')
             if status == 'Filled':
                 return CancelDispositionOutcome.ALREADY_FILLED
-            if status in ('Cancelled', 'PartiallyFilledCanceled', 'Deactivated',
-                          'Rejected'):
+            if status in _DEAD_ORDER_STATUSES:
                 if self.store_ctx is not None:
                     self.store_ctx.close_order(coid)
                 return CancelDispositionOutcome.CANCEL_CONFIRMED
@@ -966,9 +1363,33 @@ class _ExecutionMixin(_BybitBase):
         market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} {intent.side.upper()} entry amend "
                  f"id={intent.pine_id!r}")
-        qty = self._quantize_or_skip(
-            market, intent.qty, intent_key=intent.intent_key, label=label,
-        )
+        anchor: Decimal | None = None
+        if market.is_inverse:
+            # The dispatched anchor is pinned for the coid's whole
+            # lifetime: a fill can land while the amend request is in
+            # flight and it converts at the recorded anchor, so
+            # installing a different anchor afterwards would mix two
+            # conversion rates in one cumulative accounting (fills,
+            # mirror and the order's total). Re-anchoring is only safe
+            # through cancel+recreate, which ends up on a fresh coid:
+            # Bybit refuses the recreate under the cancelled order's id
+            # (never allows client-id reuse), ``_order_post`` raises
+            # :class:`ClientOrderIdSpentError`, and the engine re-anchors
+            # the envelope and re-dispatches under a bumped ``retry_seq``.
+            anchor = self._inverse_anchor_for(old_coid)
+            if anchor is None:
+                # No recorded anchor (restart crash window) — resolve
+                # through the base cancel+recreate, which re-anchors
+                # the recreated dispatch cleanly.
+                return await super().modify_entry(old, new)
+            qty = self._inverse_entry_contracts(
+                market, intent.qty, anchor,
+                intent_key=intent.intent_key, label=label,
+            )
+        else:
+            qty = self._quantize_or_skip(
+                market, intent.qty, intent_key=intent.intent_key, label=label,
+            )
         body: dict = {
             'category': market.category,
             'symbol': market.symbol,
@@ -995,22 +1416,36 @@ class _ExecutionMixin(_BybitBase):
             # The working order is gone (filled / cancelled race) — the
             # base cancel+recreate resolves the disposition cleanly.
             return await super().modify_entry(old, new)
+        self._dispatch_qty[old_coid] = float(qty)
         if self.store_ctx is not None:
-            self.store_ctx.upsert_order(old_coid, qty=float(qty))
+            if anchor is not None:
+                row = self.store_ctx.get_order(old_coid)
+                self.store_ctx.upsert_order(
+                    old_coid, qty=float(qty),
+                    extras=self._record_anchor(
+                        old_coid, anchor,
+                        dict(row.extras or {}) if row is not None else {},
+                    ),
+                )
+            else:
+                self.store_ctx.upsert_order(old_coid, qty=float(qty))
             self.store_ctx.log_event(
                 'entry_amended', client_order_id=old_coid,
                 intent_key=intent.intent_key,
                 payload={'qty': float(qty),
                          'price': float(price) if price is not None else None},
             )
+        elif anchor is not None:
+            self._wire_anchor[old_coid] = anchor
+        core_qty = self._core_qty(qty, anchor)
         return [ExchangeOrder(
             id=str(result.get('orderId') or ''),
             symbol=intent.symbol,
             side=intent.side,
             order_type=intent.order_type,
-            qty=float(qty),
+            qty=core_qty,
             filled_qty=0.0,
-            remaining_qty=float(qty),
+            remaining_qty=core_qty,
             price=float(price) if price is not None else None,
             stop_price=(float(round_price(intent.stop, market.tick_size_str))
                         if intent.order_type is OrderType.STOP
@@ -1048,9 +1483,32 @@ class _ExecutionMixin(_BybitBase):
         market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} exit amend id={new_intent.pine_id!r} "
                  f"from={new_intent.from_entry!r}")
-        qty = self._quantize_or_skip(
-            market, new_intent.qty, intent_key=new_intent.intent_key, label=label,
-        )
+        anchor: Decimal | None = None
+        if market.is_inverse:
+            # Both legs share the dispatched anchor and it is pinned
+            # for their whole lifetime: a leg fill can land while an
+            # amend request is in flight (converting at the recorded
+            # anchor), so installing a different anchor afterwards
+            # would mix two conversion rates in one cumulative
+            # accounting. Re-anchoring is only safe through
+            # cancel+recreate, which mints fresh coids.
+            for kind in (KIND_EXIT_TP, KIND_EXIT_SL):
+                anchor = self._inverse_anchor_for(old.client_order_id(kind))
+                if anchor is not None:
+                    break
+            if anchor is None:
+                # No recorded anchor (restart crash window) — resolve
+                # through the base cancel+recreate.
+                return await super().modify_exit(old, new)
+            qty = self._inverse_entry_contracts(
+                market, new_intent.qty, anchor,
+                intent_key=new_intent.intent_key, label=label,
+            )
+        else:
+            qty = self._quantize_or_skip(
+                market, new_intent.qty, intent_key=new_intent.intent_key,
+                label=label,
+            )
         legs: list[ExchangeOrder] = []
         for leg, kind, level in (
                 ('tp', KIND_EXIT_TP, new_intent.tp_price),
@@ -1081,20 +1539,36 @@ class _ExecutionMixin(_BybitBase):
                 # Leg vanished mid-amend (fill/cancel race) — resolve the
                 # whole bracket through cancel+recreate.
                 return await super().modify_exit(old, new)
+            self._dispatch_qty[old_coid] = float(qty)
             if self.store_ctx is not None:
-                self.store_ctx.upsert_order(
-                    old_coid, qty=float(qty),
-                    tp_level=float(price) if leg == 'tp' else None,
-                    sl_level=float(price) if leg == 'sl' else None,
-                )
+                if anchor is not None:
+                    row = self.store_ctx.get_order(old_coid)
+                    self.store_ctx.upsert_order(
+                        old_coid, qty=float(qty),
+                        tp_level=float(price) if leg == 'tp' else None,
+                        sl_level=float(price) if leg == 'sl' else None,
+                        extras=self._record_anchor(
+                            old_coid, anchor,
+                            dict(row.extras or {}) if row is not None else {},
+                        ),
+                    )
+                else:
+                    self.store_ctx.upsert_order(
+                        old_coid, qty=float(qty),
+                        tp_level=float(price) if leg == 'tp' else None,
+                        sl_level=float(price) if leg == 'sl' else None,
+                    )
+            elif anchor is not None:
+                self._wire_anchor[old_coid] = anchor
+            core_qty = self._core_qty(qty, anchor)
             legs.append(ExchangeOrder(
                 id=str(result.get('orderId') or ''),
                 symbol=new_intent.symbol,
                 side=new_intent.side,
                 order_type=OrderType.LIMIT if leg == 'tp' else OrderType.STOP,
-                qty=float(qty),
+                qty=core_qty,
                 filled_qty=0.0,
-                remaining_qty=float(qty),
+                remaining_qty=core_qty,
                 price=float(price) if leg == 'tp' else None,
                 stop_price=float(price) if leg == 'sl' else None,
                 average_fill_price=None,

@@ -1,4 +1,5 @@
-"""Live order-event stream mix-in for the Bybit plugin (spot M2, linear M3).
+"""Live order-event stream mix-in for the Bybit plugin (spot M2, linear M3,
+inverse M4).
 
 Implements :meth:`watch_orders` (``watch_orders = NATIVE``) over the private
 WebSocket stream (``/v5/private``): the ``execution`` topic drives fills,
@@ -29,9 +30,17 @@ descendants) from the inventory manager's fail-closed paths.
 A per-category reconcile pass piggybacks on this loop at a fixed cadence,
 mirroring the cTrader plugin's reconcile piggyback pattern: spot runs the
 inventory reconcile (lease heartbeat + balance invariant + stream-gap
-catch-up), linear refreshes the venue position snapshot behind the
+catch-up), the derivatives refresh the venue position snapshot behind the
 entry-row flat sweep (the ``position`` WS topic keeps it fresh in
 between).
+
+Inverse execution pushes carry contract-denominated quantities: the
+partial-vs-filled bookkeeping stays in that wire domain (it compares
+exactly against the dispatched contracts), and the core-facing event
+quantities convert to base at the dispatch's recorded anchor price — so a
+full fill sums to exactly the base quantity the core dispatched. Each own
+fill also folds into the inverse net-position mirror behind the
+reduce-side conversions.
 """
 import asyncio
 import logging
@@ -56,7 +65,7 @@ from pynecore.core.plugin import override
 from ._base import _BybitBase
 from .exceptions import BybitError
 from .helpers import (
-    CATEGORY_LINEAR,
+    CATEGORY_SPOT,
     PRIVATE_WS_BACKOFF_S,
     PRIVATE_WS_TOPIC_POSITION,
     PRIVATE_WS_TOPICS,
@@ -105,7 +114,7 @@ class _EventStreamMixin(_BybitBase):
         """
         await self._ensure_broker_started()
         market = await asyncio.to_thread(self._broker_market)
-        is_linear = market.category == CATEGORY_LINEAR
+        is_deriv = market.category != CATEGORY_SPOT
         loop = asyncio.get_running_loop()
         next_reconcile = loop.time() + RECONCILE_CADENCE_S
         while True:
@@ -117,8 +126,8 @@ class _EventStreamMixin(_BybitBase):
             assert queue is not None
             now = loop.time()
             if now >= next_reconcile:
-                recovered = (await self._run_linear_reconcile(market)
-                             if is_linear
+                recovered = (await self._run_deriv_reconcile(market)
+                             if is_deriv
                              else await self._run_spot_reconcile(market))
                 for event in recovered:
                     yield event
@@ -180,7 +189,7 @@ class _EventStreamMixin(_BybitBase):
                 on_closed=_on_closed,
             )
             topics = list(PRIVATE_WS_TOPICS)
-            if market.category == CATEGORY_LINEAR:
+            if market.category != CATEGORY_SPOT:
                 # The position topic feeds the last-known-size cache the
                 # entry-row flat sweep keys off; spot has no position object.
                 topics.append(PRIVATE_WS_TOPIC_POSITION)
@@ -230,7 +239,7 @@ class _EventStreamMixin(_BybitBase):
     def _ingest_position_frame(
             self, frame: dict, market: 'InstrumentInfo',
     ) -> None:
-        """Fold one ``position`` push into the net-size cache (linear).
+        """Fold one ``position`` push into the net-size cache (derivatives).
 
         No OrderEvent is emitted — position accounting is driven by fills;
         the push only keeps the flat sweep's view fresh between reconcile
@@ -322,8 +331,8 @@ class _EventStreamMixin(_BybitBase):
         """
         if self.store_ctx is None:
             return
-        if market.category == CATEGORY_LINEAR:
-            if not self._linear_is_flat():
+        if market.category != CATEGORY_SPOT:
+            if not self._deriv_is_flat():
                 return
         else:
             manager = self._spot_manager
@@ -347,7 +356,16 @@ class _EventStreamMixin(_BybitBase):
             coid: str, pine_id: str | None, from_entry: str | None,
             leg_type: LegType,
     ) -> OrderEvent | None:
-        """Build the OrderEvent of one execution slice."""
+        """Build the OrderEvent of one execution slice.
+
+        Quantities compare in the wire domain (exact against the
+        dispatched value); on inverse the core-facing event converts to
+        base at the dispatch's recorded anchor (falling back to the
+        execution price when the anchor is unresolvable — a restart crash
+        window) and the slice folds into the net-position mirror. The
+        settle-coin fee normalizes to the quote currency at the execution
+        price — the core books the numeric fee in the quote P&L domain.
+        """
         try:
             exec_qty = float(entry.get('execQty') or 0.0)
             exec_price = float(entry.get('execPrice') or 0.0)
@@ -370,6 +388,23 @@ class _EventStreamMixin(_BybitBase):
                 cumulative = max(cumulative, row.filled_qty + exec_qty)
                 self.store_ctx.set_filled(coid, min(total_qty, cumulative))
         is_full = cumulative >= total_qty - _FILL_EPS
+        fill_qty = exec_qty
+        # Linear execution rows carry no ``feeCurrency`` — the fee is
+        # always the settle coin (empty for spot, where the row has it).
+        fee_currency = str(entry.get('feeCurrency') or '') or market.settle_coin
+        if market.is_inverse:
+            anchor = self._inverse_anchor_for(coid, fallback=exec_price)
+            assert anchor is not None  # exec_price > 0 guarantees a fallback
+            factor = float(anchor)
+            fill_qty = exec_qty / factor
+            total_qty = total_qty / factor
+            cumulative = cumulative / factor
+            self._apply_inverse_fill(side, exec_qty, fill_qty)
+            # Inverse fees are charged in the settle coin, but the core
+            # books the numeric fee in the quote-currency P&L domain —
+            # normalize at the execution price (the fee's own fill).
+            fee = fee * exec_price
+            fee_currency = market.quote_coin
         if self.store_ctx is not None and coid and is_full \
                 and leg_type is not LegType.ENTRY:
             # Exit / close rows are done once fully filled. ENTRY rows stay
@@ -397,9 +432,7 @@ class _EventStreamMixin(_BybitBase):
             status=OrderStatus.FILLED if is_full else OrderStatus.PARTIALLY_FILLED,
             timestamp=ts_ms / 1000.0 if ts_ms else epoch_time(),
             fee=fee,
-            # Linear execution rows carry no ``feeCurrency`` — the fee is
-            # always the settle coin (empty for spot, where the row has it).
-            fee_currency=str(entry.get('feeCurrency') or '') or market.settle_coin,
+            fee_currency=fee_currency,
             reduce_only=leg_type is not LegType.ENTRY,
             client_order_id=coid or None,
         )
@@ -407,7 +440,7 @@ class _EventStreamMixin(_BybitBase):
             order=order,
             event_type='filled' if is_full else 'partial',
             fill_price=exec_price,
-            fill_qty=exec_qty,
+            fill_qty=fill_qty,
             timestamp=order.timestamp,
             pine_id=pine_id,
             from_entry=from_entry,
@@ -440,6 +473,8 @@ class _EventStreamMixin(_BybitBase):
                     and self.store_ctx is not None and coid:
                 self.store_ctx.close_order(coid)
             order = parse_exchange_order(entry)
+            if market.is_inverse:
+                order = self._inverse_order_to_base(order)
             events.append(OrderEvent(
                 order=order,
                 event_type=event_type,
@@ -454,7 +489,7 @@ class _EventStreamMixin(_BybitBase):
 
     # --- reconcile passes ------------------------------------------------------
 
-    async def _run_linear_reconcile(
+    async def _run_deriv_reconcile(
             self, market: 'InstrumentInfo',
     ) -> list[OrderEvent]:
         """Refresh the venue position snapshot behind the flat sweep.
@@ -462,14 +497,14 @@ class _EventStreamMixin(_BybitBase):
         The REST read is the gap-fill backstop of the ``position`` push
         (a reconnect can drop pushes); transient failures are logged and
         swallowed — the stream must survive them, the next pass retries.
-        Emits no events: linear position accounting is fill-driven, the
-        stream-gap fill recovery itself is the robustness milestone.
+        Emits no events: derivative position accounting is fill-driven,
+        the stream-gap fill recovery itself is the robustness milestone.
         """
         try:
             rows = await self._fetch_position_rows(market)
         except Exception as exc:  # noqa: BLE001 - the reconcile pass must not kill the stream
             logger.warning(
-                "Bybit linear position reconcile pass failed (transient): %s",
+                "Bybit derivative position reconcile pass failed (transient): %s",
                 exc, exc_info=True,
             )
             return []

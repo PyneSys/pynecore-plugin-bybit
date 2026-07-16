@@ -155,9 +155,25 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # Dispatch quantity + cumulative fill per ``orderLinkId`` — the
     # in-memory partial-vs-filled discriminator behind the BrokerStore's
     # durable ``filled_qty`` cursor (and its stand-in when persistence
-    # is off).
+    # is off). WIRE units: base for spot/linear, whole USD contracts for
+    # inverse — the exec-push quantities compare exactly in this domain.
     _dispatch_qty: 'dict[str, float]'
     _filled_cum: 'dict[str, float]'
+    # Per-``orderLinkId`` base<->contract conversion anchor price (inverse
+    # only): fills convert back to the Pine base denomination at the SAME
+    # price the dispatch converted at, so a full fill sums exactly to the
+    # dispatched base quantity. Mirrored into the BrokerStore row extras
+    # (``anchor``) for restart resolution.
+    _wire_anchor: 'dict[str, Decimal]'
+    # Signed net-position mirror of the inverse one-way path:
+    # venue contracts and the base quantity reported to the core, folded
+    # from this strategy's own fills (seeded from the venue at startup).
+    # Their ratio is the position's effective conversion anchor — reduce
+    # dispatches (close / exit legs) convert through it so a core
+    # full-close lands exactly on the venue's contract count even after
+    # price drift between entries (reversal auto-flip included).
+    _inverse_net_contracts: float
+    _inverse_net_base: float
     # Account position mode of the linear category, detected once by
     # ``_ensure_broker_started`` (``positions.POSITION_MODE_*``). ``None``
     # before broker startup and on spot runs.
@@ -166,7 +182,7 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # fed by the private WS ``position`` topic and the reconcile snapshot.
     # ``None`` until the first snapshot — the entry-row flat sweep must
     # never fire on ignorance.
-    _linear_sizes: 'dict[int, float] | None'
+    _deriv_sizes: 'dict[int, float] | None'
 
     # ------------------------------------------------------------------
     # Bybit-private cross-mix-in method surface.
@@ -218,6 +234,8 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
 
     async def _fetch_wallet_coin(self, coin: str) -> dict: ...
 
+    def _inverse_order_to_base(self, order: 'ExchangeOrder') -> 'ExchangeOrder': ...
+
     # --- Linear position path (positions.py) ---
     async def _detect_position_mode(self, market: 'InstrumentInfo') -> str: ...
 
@@ -225,11 +243,15 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
 
     def _ingest_position_sizes(self, rows: list[dict]) -> None: ...
 
-    def _linear_is_flat(self) -> bool: ...
+    def _deriv_is_flat(self) -> bool: ...
 
-    async def _fetch_linear_position(
+    async def _fetch_deriv_position(
             self, market: 'InstrumentInfo',
     ) -> 'ExchangePosition | None': ...
+
+    def _inverse_seed_net(self, rows: list[dict]) -> None: ...
+
+    def _apply_inverse_fill(self, side: str, contracts: float, base: float) -> None: ...
 
     # PositionPort transport primitives (hedge-mode one-way emulation) —
     # declared on the base so ``position_port = self`` satisfies the core
@@ -275,6 +297,9 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
 
     async def _lookup_order_by_coid(self, coid: str) -> dict | None: ...
 
+    def _inverse_anchor_for(self, coid: str, *,
+                            fallback: 'float | None' = None) -> 'Decimal | None': ...
+
     def _quantize_or_skip(self, market: 'InstrumentInfo', qty: float, *,
                           intent_key: str, label: str) -> 'Decimal': ...
 
@@ -285,4 +310,5 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     async def _place_entry_order(
             self, envelope: 'DispatchEnvelope', intent: 'EntryIntent',
             market: 'InstrumentInfo', qty: 'Decimal',
+            anchor: 'Decimal | None' = None,
     ) -> 'list[ExchangeOrder]': ...

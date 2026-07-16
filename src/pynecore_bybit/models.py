@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from math import gcd
 
 from .exceptions import BybitSymbolError
-from .helpers import CATEGORY_SPOT
+from .helpers import CATEGORY_INVERSE, CATEGORY_LINEAR, CATEGORY_SPOT
 
 
 @dataclass(slots=True)
@@ -82,6 +82,12 @@ class InstrumentInfo:
         """Whether this is a perpetual contract (linear or inverse)."""
         return self.contract_type.endswith('Perpetual')
 
+    @property
+    def is_inverse(self) -> bool:
+        """Whether this is an inverse contract (qty in whole USD contracts,
+        PnL/margin settled in the base coin)."""
+        return self.category == CATEGORY_INVERSE
+
     def price_grid(self) -> tuple[int, int]:
         """Derive the exact ``(minmove, pricescale)`` pair from the tick string.
 
@@ -120,6 +126,16 @@ def parse_instrument(category: str, entry: dict) -> InstrumentInfo:
     :param entry: One element of ``result.list``.
     :return: The normalized :class:`InstrumentInfo`.
     """
+    # Bybit's derivative ``instruments-info`` ignores the category filter
+    # across the two derivative pools: a ``category=linear`` query for
+    # ``BTCUSD`` serves the INVERSE perpetual's row (measured live,
+    # 2026-07-16). The ``contractType`` is authoritative — trust it over
+    # the query category so the record never mislabels the instrument.
+    contract_type = str(entry.get('contractType') or '')
+    if contract_type.startswith('Inverse'):
+        category = CATEGORY_INVERSE
+    elif contract_type.startswith('Linear'):
+        category = CATEGORY_LINEAR
     price_filter = entry.get('priceFilter') or {}
     lot = entry.get('lotSizeFilter') or {}
     tick_str = str(price_filter.get('tickSize') or '')
@@ -155,7 +171,7 @@ def parse_instrument(category: str, entry: dict) -> InstrumentInfo:
         min_notional=min_notional,
         max_limit_order_qty=max_limit_qty,
         max_market_order_qty=max_market_qty,
-        contract_type=str(entry.get('contractType') or ''),
+        contract_type=contract_type,
         delivery_time=int(delivery_ms / 1000) if delivery_ms > 0 else None,
     )
 

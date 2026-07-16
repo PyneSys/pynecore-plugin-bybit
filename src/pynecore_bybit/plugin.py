@@ -8,12 +8,12 @@ SDK), composed from concern-scoped mix-ins on top of a shared
 
 The provider side serves historical OHLCV download, ``SymInfo`` synthesis
 and live WebSocket kline streaming for the ``spot``, ``linear`` and
-``inverse`` categories. The broker side covers spot (M2) and linear (M3)
-order execution — entries, SOFTWARE exit brackets, cancels, in-place
-amends, the private order/execution/position event stream, the core
-spot-inventory integration on spot and the venue position model (with
-hedge-mode one-way emulation) on linear; the inverse execution model
-lands in a later milestone.
+``inverse`` categories. The broker side covers spot (M2), linear (M3) and
+inverse (M4) order execution — entries, SOFTWARE exit brackets, cancels,
+in-place amends, the private order/execution/position event stream, the
+core spot-inventory integration on spot and the venue position model
+(with hedge-mode one-way emulation on linear) on the derivatives; inverse
+maps the Pine base denomination onto whole-USD contracts at dispatch.
 """
 import asyncio
 from pathlib import Path
@@ -57,11 +57,13 @@ class Bybit(
     over ``/v5/execution/list`` + ``/v5/account/wallet-balance`` and the
     core :class:`~pynecore.core.broker.spot_inventory.SpotInventoryManager`
     owns the fill ledger, the balance invariant and the position
-    synthesis. Linear execution reads the venue's native position object
-    (``/v5/position/list`` + the private ``position`` topic); a one-way
-    account runs the netting-native path, a hedge account opts into the
-    core one-way emulation through the plugin's ``PositionPort``. Order
-    idempotency is exchange-native via ``orderLinkId``.
+    synthesis. Derivative execution reads the venue's native position
+    object (``/v5/position/list`` + the private ``position`` topic); a
+    one-way account runs the netting-native path, a hedge account opts
+    into the core one-way emulation through the plugin's ``PositionPort``
+    on linear (inverse requires one-way mode). Inverse quantities are
+    Pine-base-denominated and map onto whole-USD contracts at dispatch.
+    Order idempotency is exchange-native via ``orderLinkId``.
     """
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
@@ -116,5 +118,8 @@ class Bybit(
         self._seen_exec_ids = set()
         self._dispatch_qty = {}
         self._filled_cum = {}
+        self._wire_anchor = {}
+        self._inverse_net_contracts = 0.0
+        self._inverse_net_base = 0.0
         self._position_mode = None
-        self._linear_sizes = None
+        self._deriv_sizes = None

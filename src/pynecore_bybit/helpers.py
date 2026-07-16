@@ -178,10 +178,53 @@ def quantize_qty(qty: float, step_str: str) -> Decimal:
     :param step_str: Raw grid string from ``instruments-info``.
     :return: The floored quantity as an exact :class:`~decimal.Decimal`.
     """
+    return _floor_to_step(Decimal(str(qty)), step_str)
+
+
+def base_to_contracts(qty: float | Decimal, price: float | Decimal,
+                      step_str: str) -> Decimal:
+    """Map a Pine base-denominated quantity onto the inverse contract grid.
+
+    Inverse order quantity is the USD notional in whole contracts
+    (1 contract == 1 USD on the perpetuals), so ``contracts = qty * price``.
+    Sizing at the reference price makes the venue's base-coin-settled PnL,
+    marked at the exit price, equal the Pine-side linear ``qty * Δprice``
+    accounting exactly: ``contracts*(1/entry - 1/exit)*exit ==
+    qty*(exit - entry)``. Floors onto ``qtyStep`` like :func:`quantize_qty`.
+
+    :param qty: Pine-side quantity (base units).
+    :param price: Reference price (limit / trigger / last trade / position
+        average — the caller picks the price the conversion must be exact at).
+    :param step_str: Raw ``qtyStep`` string (``"1"`` on Bybit inverse).
+    :return: The floored contract count as an exact :class:`~decimal.Decimal`.
+    """
+    qty_d = qty if isinstance(qty, Decimal) else Decimal(str(qty))
+    price_d = price if isinstance(price, Decimal) else Decimal(str(price))
+    return _floor_to_step(qty_d * price_d, step_str)
+
+
+def contracts_to_base(contracts: float | Decimal, price: float | Decimal) -> float:
+    """Value of an inverse-contract quantity in base coin at ``price``.
+
+    The inverse of :func:`base_to_contracts` — used to report venue
+    positions and fills back in the Pine base denomination
+    (``base = contracts / price``).
+
+    :param contracts: Contract count (USD notional).
+    :param price: The price the conversion is anchored at (position average
+        entry price for positions, execution price for fills).
+    """
+    contracts_d = contracts if isinstance(contracts, Decimal) else Decimal(str(contracts))
+    price_d = price if isinstance(price, Decimal) else Decimal(str(price))
+    return float(contracts_d / price_d)
+
+
+def _floor_to_step(value: Decimal, step_str: str) -> Decimal:
+    """Floor ``value`` onto the exact decimal grid of ``step_str``."""
     step = Decimal(step_str)
     if step <= 0:
-        return Decimal(str(qty))
-    return (Decimal(str(qty)) / step).to_integral_value(ROUND_DOWN) * step
+        return value
+    return (value / step).to_integral_value(ROUND_DOWN) * step
 
 
 def round_price(price: float, tick_str: str) -> Decimal:

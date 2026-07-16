@@ -154,6 +154,20 @@ def __test_bybit_parse_instrument__():
     assert not dated.is_perpetual
     assert dated.delivery_time == 1782518400
 
+    # Bybit serves the inverse contract's row under a linear query too
+    # (measured live) — the contractType corrects the category label.
+    mislabeled = parse_instrument('linear', {
+        'symbol': 'BTCUSD', 'baseCoin': 'BTC', 'quoteCoin': 'USD',
+        'settleCoin': 'BTC', 'status': 'Trading',
+        'contractType': 'InversePerpetual',
+        'priceFilter': {'tickSize': '0.10'},
+        'lotSizeFilter': {'qtyStep': '1', 'minOrderQty': '1',
+                          'minNotionalValue': '5'},
+        'deliveryTime': '0',
+    })
+    assert mislabeled.category == 'inverse'
+    assert mislabeled.is_inverse and mislabeled.is_perpetual
+
 
 def __test_bybit_interval_math__():
     """Fixed intervals advance arithmetically, months on calendar boundaries"""
@@ -207,17 +221,31 @@ def __test_bybit_update_symbol_info__():
         quote_coin='USD', settle_coin='BTC',
         tick_size_str='0.5', tick_size=0.5, qty_step_str='1', qty_step=1.0,
     )
+    # Inverse mincontract mirrors the linear sibling's lot (TV-measured);
+    # the sibling resolves through the instrument cache.
+    plugin._instruments[('linear', 'BTCUSDT')] = _instrument('linear', 'BTCUSDT')
     si = plugin.update_symbol_info()
-    assert si.type == 'swap'
+    # TV reports "crypto" for crypto perpetuals too (measured).
+    assert si.type == 'crypto'
     assert si.ticker == 'BTCUSD.P'
     assert si.currency == 'USD'
     # Inverse kline volume is quote-denominated (whole-USD contracts).
     assert si.volumetype == 'quote'
     assert si.mintick == 0.5
     assert (si.minmove, si.pricescale) == (1, 2)
-    assert si.mincontract == 1.0
+    assert si.mincontract == 0.001
     assert len(si.opening_hours) == 7
     assert len(si.session_starts) == 7
+
+    # Without a linear sibling the grid falls back to 0.0 (estimation).
+    plugin_nosib = _FakeRestBybit(symbol='XYZUSD.P', timeframe='1D',
+                                  responses=[{'list': []}])
+    plugin_nosib._market = _instrument(
+        'inverse', 'XYZUSD', contract_type='InversePerpetual',
+        base_coin='XYZ', quote_coin='USD', settle_coin='XYZ',
+        tick_size_str='0.5', tick_size=0.5, qty_step_str='1', qty_step=1.0,
+    )
+    assert plugin_nosib.update_symbol_info().mincontract == 0.0
 
     plugin._market = _instrument('spot', 'BTCUSDT', status='PreLaunch')
     with pytest.raises(BybitSymbolError):

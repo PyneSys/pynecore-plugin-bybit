@@ -1,10 +1,10 @@
-"""Broker state-query mix-in for the Bybit plugin (spot M2, linear M3).
+"""Broker state-query mix-in for the Bybit plugin (spot M2, linear M3,
+inverse M4).
 
 Implements the read side of :class:`~pynecore.core.plugin.broker.BrokerPlugin`
 plus the broker lifecycle glue:
 
-- :meth:`get_capabilities` — the per-category capability profile (inverse
-  arrives in M4; an inverse chart symbol is refused up front).
+- :meth:`get_capabilities` — the per-category capability profile.
 - :attr:`account_id` — lazily latched from ``GET /v5/user/query-api``.
   Bybit's whole data-provider path is public, so unlike Capital.com /
   cTrader there is no earlier authenticated moment on the warmup path;
@@ -13,14 +13,15 @@ plus the broker lifecycle glue:
 - :meth:`_ensure_broker_started` — the per-category one-shot startup
   (spot: fail-closed
   :class:`~pynecore.core.broker.spot_inventory.SpotInventoryManager`
-  startup; linear: position-mode detection + hedge-mode opt-in to the
-  core one-way emulation), awaited by every broker entry point so it
+  startup; derivatives: position-mode detection + hedge-mode opt-in to
+  the core one-way emulation), awaited by every broker entry point so it
   always precedes the engine's startup reconcile (whose first
   ``get_position`` read lands here).
 - :meth:`get_open_orders` / :meth:`get_position` / :meth:`get_balance`.
 """
 import asyncio
 import logging
+from dataclasses import replace
 
 from pynecore.core.broker.exceptions import (
     ExchangeCapabilityError,
@@ -45,7 +46,6 @@ from .exceptions import (
 )
 from .helpers import (
     ACCOUNT_TYPE_UNIFIED,
-    CATEGORY_LINEAR,
     CATEGORY_SPOT,
     OPEN_ORDERS_PAGE_LIMIT,
 )
@@ -164,22 +164,14 @@ class _StateMixin(_BybitBase):
         return market
 
     def _broker_market(self) -> InstrumentInfo:
-        """Return the chart instrument, refusing unimplemented categories.
+        """Return the chart instrument for the broker paths.
 
-        The broker surface covers spot (M2) and linear (M3) — inverse
-        lands in M4 (its settle-coin accounting model is open). Raising
-        :class:`ExchangeCapabilityError` makes the startup path perform a
-        graceful stop with a clear message instead of dispatching against
-        an unimplemented execution model.
+        The broker surface covers every category the resolver serves:
+        spot (M2), linear (M3) and inverse (M4). Kept as the semantic
+        chokepoint every broker entry point routes through, so a future
+        category gap has exactly one place to gate.
         """
-        market = self._get_market()
-        if market.category not in (CATEGORY_SPOT, CATEGORY_LINEAR):
-            raise ExchangeCapabilityError(
-                f"Bybit broker support covers spot and linear; "
-                f"{market.symbol!r} is a {market.category} instrument "
-                f"(inverse arrives in a later milestone)"
-            )
-        return market
+        return self._get_market()
 
     @override
     def get_capabilities(self) -> ExchangeCapabilities:
@@ -207,15 +199,18 @@ class _StateMixin(_BybitBase):
           long-only exposure (mutually exclusive with the inventory
           port by core contract).
 
-        **Linear** — the position-based profile: ``reduce_only`` /
-        ``fetch_position`` / ``short_selling`` NATIVE (explicit
-        ``reduceOnly`` flag, ``/v5/position/list``, shorting is natural).
-        The exit bracket stays the engine-driven SOFTWARE pair of
-        reduce-only order legs (the ``trading-stop`` position attach is
-        assessed on the demo before any raise, per the plan), so
+        **Linear / inverse** — the position-based profile:
+        ``reduce_only`` / ``fetch_position`` / ``short_selling`` NATIVE
+        (explicit ``reduceOnly`` flag, ``/v5/position/list``, shorting is
+        natural). The exit bracket stays the engine-driven SOFTWARE pair
+        of reduce-only order legs (the ``trading-stop`` position attach
+        is assessed on the demo before any raise, per the plan), so
         ``tp_sl_bracket`` / ``oca_cancel`` match spot. ``trailing_stop``
         UNSUPPORTED until the ``trading-stop`` trailing activation
         semantics are verified live — same no-false-promise rule as spot.
+        Inverse shares the linear profile: the venue primitives are the
+        same endpoints; only the qty denomination differs (whole USD
+        contracts — mapped in the execution/positions mix-ins).
         """
         market = self._broker_market()
         if market.category == CATEGORY_SPOT:
@@ -265,7 +260,8 @@ class _StateMixin(_BybitBase):
         one-shot paths) the manager stays ``None`` and the plugin serves
         venue state directly.
 
-        Linear detects the account's position mode once. A HEDGE account
+        The derivative categories detect the account's position mode
+        once. A HEDGE account
         opts into the core one-way emulation by publishing the
         :class:`~pynecore.core.plugin.broker.PositionPort` surface
         (``position_port = self``, the cTrader HEDGED precedent); a
@@ -279,15 +275,30 @@ class _StateMixin(_BybitBase):
             if self._broker_started:
                 return
             market = await asyncio.to_thread(self._broker_market)
-            if market.category == CATEGORY_LINEAR:
+            if market.category != CATEGORY_SPOT:
                 from .positions import POSITION_MODE_HEDGE
                 mode = await self._detect_position_mode(market)
                 self._position_mode = mode
                 if mode == POSITION_MODE_HEDGE:
+                    if market.is_inverse:
+                        # The PositionPort volume contract is price-blind
+                        # and cannot carry the inverse base->contract
+                        # conversion; the account setting is the user's.
+                        raise ExchangeCapabilityError(
+                            f"Bybit inverse trading requires one-way "
+                            f"position mode; the account holds "
+                            f"{market.symbol!r} legs in hedge mode. Switch "
+                            f"the contract to one-way mode on Bybit and "
+                            f"restart."
+                        )
                     self.position_port = self
+                if market.is_inverse:
+                    self._inverse_seed_net(
+                        await self._fetch_position_rows(market),
+                    )
                 logger.info(
-                    "Bybit linear broker ready: %s position mode%s",
-                    mode.replace('_', '-'),
+                    "Bybit %s broker ready: %s position mode%s",
+                    market.category, mode.replace('_', '-'),
                     " (core one-way emulation active)"
                     if mode == POSITION_MODE_HEDGE else "",
                 )
@@ -332,8 +343,10 @@ class _StateMixin(_BybitBase):
         """Fetch the account's open orders via ``GET /v5/order/realtime``.
 
         Cursor-paged; covers plain and conditional (trigger) orders — the
-        realtime endpoint returns both for spot and linear. ``symbol``
-        defaults to the chart instrument.
+        realtime endpoint returns both for every category. ``symbol``
+        defaults to the chart instrument. Inverse rows arrive
+        contract-denominated and convert to the core's base view at each
+        order's recorded anchor.
         """
         await self._ensure_broker_started()
         market = await asyncio.to_thread(self._broker_market)
@@ -359,16 +372,43 @@ class _StateMixin(_BybitBase):
             cursor = result.get('nextPageCursor') or None
             if not cursor:
                 break
+        if market.is_inverse:
+            out = [self._inverse_order_to_base(order) for order in out]
         return out
+
+    def _inverse_order_to_base(self, order: ExchangeOrder) -> ExchangeOrder:
+        """Convert one wire (contract-denominated) order row to base units.
+
+        The dispatch's recorded anchor when resolvable, else the order's
+        own price level (limit / trigger / average fill), else the last
+        trade — an order with no price context at all stays in the wire
+        view rather than being dropped.
+        """
+        fallback = (order.price or order.stop_price
+                    or order.average_fill_price or self._last_price)
+        anchor = self._inverse_anchor_for(
+            order.client_order_id or '', fallback=fallback,
+        )
+        if anchor is None or anchor <= 0:
+            return order
+        factor = float(anchor)
+        return replace(
+            order,
+            qty=order.qty / factor,
+            filled_qty=order.filled_qty / factor,
+            remaining_qty=order.remaining_qty / factor,
+        )
 
     @override
     async def get_position(self, symbol: str) -> ExchangePosition | None:
         """Return the chart symbol's position (category-specific source).
 
-        **Linear** reads the venue's native position object: a one-way
-        account serves the single ``/v5/position/list`` row directly; a
-        hedge account aggregates its raw legs through the core emulator's
-        netting view (the cTrader HEDGED pattern).
+        **Linear / inverse** reads the venue's native position object: a
+        one-way account serves the single ``/v5/position/list`` row
+        directly; a hedge account aggregates its raw legs through the
+        core emulator's netting view (the cTrader HEDGED pattern).
+        Inverse rows are contract-denominated and are reported back in
+        base units (see ``positions.py``).
 
         **Spot** synthesizes from the core inventory ledger.
         ``None`` is an authoritative flat by engine contract. Sub-grid
@@ -388,7 +428,7 @@ class _StateMixin(_BybitBase):
         """
         await self._ensure_broker_started()
         market = await asyncio.to_thread(self._broker_market)
-        if market.category == CATEGORY_LINEAR:
+        if market.category != CATEGORY_SPOT:
             from .positions import POSITION_MODE_HEDGE
             try:
                 if self._position_mode == POSITION_MODE_HEDGE:
@@ -396,7 +436,7 @@ class _StateMixin(_BybitBase):
                     return aggregate_positions(
                         symbol, await self.fetch_raw_positions(symbol),
                     )
-                return await self._fetch_linear_position(market)
+                return await self._fetch_deriv_position(market)
             except BybitError as e:
                 raise self._classify_read_error(e) from e
         manager = self._spot_manager
