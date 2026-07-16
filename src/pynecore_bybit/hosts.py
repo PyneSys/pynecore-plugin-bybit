@@ -1,4 +1,4 @@
-"""Static host resolution for the Bybit v5 spot plugin.
+"""Static host resolution for the Bybit v5 plugin.
 
 Bybit has two independent environment axes: a live/demo axis and a regional
 legal-entity axis (global, EU/MiCA, and several country domains). The

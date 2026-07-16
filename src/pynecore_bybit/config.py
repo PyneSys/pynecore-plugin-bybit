@@ -1,4 +1,4 @@
-"""Configuration dataclass for the Bybit v5 spot plugin.
+"""Configuration dataclass for the Bybit v5 plugin.
 
 One credential block (``api_key`` / ``api_secret``) serves both the
 data-ingest and the order-execution side. The live/demo axis and the
@@ -20,11 +20,12 @@ from pynecore.core.plugin import LiveProviderConfig
 
 @dataclass
 class BybitConfig(LiveProviderConfig):
-    """Bybit v5 spot plugin configuration.
+    """Bybit v5 plugin configuration.
 
-    Covers both the data-ingest and the order-execution side; one API key
-    pair serves both. ``symbol_map`` (TradingView key -> native Bybit symbol,
-    e.g. ``"BYBIT:BTCUSDT" = "BTCUSDT"``) is inherited from
+    Covers both the data-ingest and the order-execution side across the
+    spot, linear and inverse categories; one API key pair serves both.
+    ``symbol_map`` (TradingView key -> native Bybit symbol, e.g.
+    ``"BYBIT:BTCUSDT" = "BTCUSDT"``) is inherited from
     :class:`LiveProviderConfig`.
     """
 
