@@ -1654,12 +1654,14 @@ class _ExecutionMixin(_BybitBase):
                     f"Bybit amend server-side failure for {coid} "
                     f"(retCode={e.ret_code}); disposition unknown",
                     client_order_id=coid, cause=e,
+                    predecessor_cancel_ids=(),
                 ) from e
             raise
         except BybitError as e:
             raise OrderDispositionUnknownError(
                 f"Bybit amend transport failure for {coid}; disposition unknown",
                 client_order_id=coid, cause=e,
+                predecessor_cancel_ids=(),
             ) from e
 
     @override
