@@ -268,6 +268,15 @@ class _StateMixin(_BybitBase):
         one-way account keeps the cheaper netting-native ``execute_*``
         path. The engine reads ``position_port`` per dispatch, so setting
         it here — before the first dispatch — is race-free.
+
+        Persist-first crash recovery runs last in this one-shot sequence
+        (after the category startup, before ``_broker_started`` latches):
+        it resolves any dispatch row a crash left pending against the
+        venue's authoritative order view and retires startup orphans,
+        BEFORE the engine's startup reconcile adopts the net position.
+        Running it inside this gate makes it fire exactly once and always
+        ahead of the first ``get_position``; it reads the REST snapshots
+        directly, so it never re-enters this method.
         """
         if self._broker_started:
             return
@@ -302,9 +311,7 @@ class _StateMixin(_BybitBase):
                     " (core one-way emulation active)"
                     if mode == POSITION_MODE_HEDGE else "",
                 )
-                self._broker_started = True
-                return
-            if self.store_ctx is not None:
+            elif self.store_ctx is not None:
                 from pynecore.core.broker.spot_inventory import SpotInventoryManager
                 from .inventory import spot_port_for
                 port = spot_port_for(self, market)
@@ -334,6 +341,7 @@ class _StateMixin(_BybitBase):
                         result.fold.net_base, result.fold.fill_count,
                         result.recovered_fills, result.adopted_fills,
                     )
+            await self._recover_in_flight_submissions()
             self._broker_started = True
 
     # --- state queries ---------------------------------------------------------

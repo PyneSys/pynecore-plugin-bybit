@@ -149,6 +149,14 @@ _DEAD_ORDER_STATUSES = frozenset({
     'Cancelled', 'PartiallyFilledCanceled', 'Deactivated', 'Rejected',
 })
 
+#: Clock-skew margin (ms) applied to the duplicate-reject spent-original
+#: guard. Bybit rejects a signed request whose client timestamp drifts
+#: beyond its ``recv_window`` (~1 s), so client and server clocks are held
+#: closely aligned; the margin absorbs that residual skew so an in-process
+#: retry (whose original was created at ~the same instant as this
+#: instance's persist-first dispatch row) can never be misread as spent.
+_SPENT_COID_SKEW_MS = 5_000
+
 
 class _ExecutionMixin(_BybitBase):
     """Order execution mix-in: every ``execute_*`` and ``modify_*`` path."""
@@ -236,6 +244,14 @@ class _ExecutionMixin(_BybitBase):
                             f"the original order is terminal "
                             f"({status}); nothing is live under this id"
                         ) from e
+                    if self._duplicate_original_is_spent(coid, existing):
+                        raise ClientOrderIdSpentError(
+                            f"Bybit {context}: orderLinkId {coid} is spent — "
+                            f"the duplicate original was created "
+                            f"({existing.get('createdTime')!r}) before this "
+                            f"instance's dispatch, so it belongs to a prior "
+                            f"run; re-dispatching under a fresh id"
+                        ) from e
                     logger.info(
                         "Bybit %s: duplicate orderLinkId %s — adopting the "
                         "already-landed order %s (status %s)",
@@ -285,6 +301,38 @@ class _ExecutionMixin(_BybitBase):
             if entries:
                 return entries[0]
         return None
+
+    def _duplicate_original_is_spent(self, coid: str, existing: dict) -> bool:
+        """Whether a duplicate-reject original is a spent prior-instance order.
+
+        A duplicate ``orderLinkId`` reject normally means an in-process retry
+        of the SAME dispatch already landed — adopting the found order keeps
+        the retry idempotent. But a crashed prior instance can leave an
+        orphaned envelope whose replay rebuilds the SAME (spent) ``coid``; the
+        venue then returns the PREVIOUS instance's already-filled order, and
+        adopting it would report a phantom live order for a position that is
+        gone. This instance wrote its persist-first dispatch row moments
+        before the wire send, so the original is spent when its ``createdTime``
+        predates that row's creation by more than the client/server
+        clock-skew margin. An in-process retry cannot trip this: its original
+        was created at ~the same instant as the row.
+
+        Inert without persistence (no dispatch row to anchor on) and when the
+        original carries no parseable ``createdTime`` — both fall back to the
+        pre-existing adopt-the-original behaviour.
+        """
+        if self.store_ctx is None:
+            return False
+        row = self.store_ctx.get_order(coid)
+        if row is None:
+            return False
+        try:
+            created = int(existing.get('createdTime') or 0)
+        except (TypeError, ValueError):
+            return False
+        if created <= 0:
+            return False
+        return created < row.created_ts_ms - _SPENT_COID_SKEW_MS
 
     # --- sizing / pre-flight ----------------------------------------------------
 

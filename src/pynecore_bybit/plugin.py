@@ -26,6 +26,8 @@ from .hosts import resolve_hosts
 from .live_provider import _LiveProviderMixin
 from .positions import _PositionsMixin
 from .provider import _ProviderMixin
+from .reconcile import _ReconcileMixin
+from .recovery import _RecoveryMixin
 from .rest import _RestMixin
 from .state import _StateMixin
 
@@ -37,6 +39,8 @@ __all__ = [
 class Bybit(
     _EventStreamMixin,
     _ExecutionMixin,
+    _ReconcileMixin,
+    _RecoveryMixin,
     _PositionsMixin,
     _StateMixin,
     _LiveProviderMixin,
@@ -110,6 +114,7 @@ class Bybit(
         # Broker state (driven by the state/execution/events mix-ins).
         self._private_ws = None
         self._private_events = None
+        self._pre_adoption_frames = []
         self._spot_manager = None
         self._spot_port = None
         self._broker_started = False
@@ -123,3 +128,6 @@ class Bybit(
         self._inverse_net_base = 0.0
         self._position_mode = None
         self._deriv_sizes = None
+        self._last_own_fill_ms = 0
+        self._deriv_snapshot_ms = 0
+        self._disappearance = None

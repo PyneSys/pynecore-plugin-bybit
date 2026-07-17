@@ -33,11 +33,14 @@ if TYPE_CHECKING:
 
     import httpx
 
+    from pynecore.core.broker.disappearance import DisappearanceTracker
     from pynecore.core.broker.models import (
+        CancelDispositionOutcome,
         DispatchEnvelope,
         EntryIntent,
         ExchangeOrder,
         ExchangePosition,
+        OrderEvent,
         PositionLeg,
     )
     from pynecore.core.broker.spot_inventory import SpotInventoryManager
@@ -132,6 +135,17 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # produced by the WS callback, consumed by ``watch_orders``. ``None``
     # sentinel = the private transport died (reconnect needed).
     _private_events: 'asyncio.Queue[dict | None] | None'
+    # Private frames parked by ``watch_orders`` while the startup adoption
+    # baseline (F2) has not committed yet (derivatives with persistence
+    # only). ``run_event_stream`` is scheduled BEFORE the engine's startup
+    # reconcile, so a fill pushed during the baseline's venue reads would
+    # otherwise be BOTH folded into the adopted position snapshot (the
+    # stable-pass walks reach it) AND emitted as an OrderEvent the engine
+    # applies on the next drain — doubling the position. Parked frames are
+    # replayed through the normal translator once the baseline latches;
+    # the baseline-seeded ``execId`` frontier then drops every adopted
+    # slice and only genuinely post-adoption activity is emitted.
+    _pre_adoption_frames: 'list[dict]'
     # Core spot inventory manager, constructed on the first broker call
     # after ``store_ctx`` is available. ``None`` without persistence.
     _spot_manager: 'SpotInventoryManager | None'
@@ -143,6 +157,20 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # on the broker event loop.
     _broker_started: bool
     _broker_start_lock: asyncio.Lock
+    # One-shot guard for the startup adoption baseline (F2). The FIRST
+    # engine-facing derivative position snapshot after startup — the same
+    # ``get_position`` read the engine's startup reconcile adopts the net
+    # position from — silently seeds each live row's WIRE-domain fill cursor
+    # + execId de-dup from the venue's per-order execution history, so a
+    # post-restart execution backfill cannot re-apply a pre-restart fill
+    # slice on top of the already-adopted size. Latched only when the
+    # baseline COMMITS (stable snapshot, every read conclusive); until then
+    # each position read retries. Carries a class-level default because the
+    # runtime ``__init__`` does not assign it: the attribute must exist
+    # before that first read (and the persistence-off test paths that call
+    # the position methods without going through ``__init__``-driven broker
+    # startup).
+    _adoption_baselined: bool = False
     # In-memory Pine-identity index for dispatched orders, keyed by the
     # ``orderLinkId``: ``(pine_id, from_entry, leg_type)``. The BrokerStore
     # rows are the durable copy; this map serves the persistence-off test
@@ -183,6 +211,48 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # ``None`` until the first snapshot — the entry-row flat sweep must
     # never fire on ignorance.
     _deriv_sizes: 'dict[int, float] | None'
+    # Causal-freshness anchors for the entry-row flat sweep (derivatives).
+    # The sweep must never trust a flat position reading that predates this
+    # strategy's own most recent fill: the bot's opening ``execution`` push
+    # can be processed BEFORE the ``position`` push refreshes
+    # :attr:`_deriv_sizes`, so a stale-flat cache would close a freshly
+    # filled entry row while the venue position is open.
+    # ``_last_own_fill_ms`` is the max ``execTime`` of this strategy's own
+    # derivative fills; ``_deriv_snapshot_ms`` is the max ``updatedTime`` of
+    # the ingested position snapshots (WS push + reconcile REST).
+    # :meth:`_deriv_is_flat` trusts a flat reading only when the snapshot is
+    # at least as fresh as the last own fill. Class-level defaults because
+    # the runtime ``__init__`` may not have assigned them before the first
+    # position read (like :attr:`_adoption_baselined`).
+    _last_own_fill_ms: int = 0
+    _deriv_snapshot_ms: int = 0
+    # Lazily-built core disappearance tracker (reconcile.py); ``None`` until
+    # the first runtime reconcile pass wires it.
+    _disappearance: 'DisappearanceTracker | None'
+    # Durable derivative execution-backfill cursor (F4). Time watermark in
+    # epoch-ms up to which the reconnect / cadence fill-recovery has drained
+    # ``/v5/execution/list`` on the deriv categories; the seen-execId frontier
+    # is the shared :attr:`_seen_exec_ids`. ``None`` until the first backfill
+    # seeds it — at the venue clock on a fresh run, or the persisted value on
+    # restart. Advanced only when a window drains completely, mirroring the
+    # spot inventory cursor. Class-level defaults because the runtime
+    # ``__init__`` does not assign them (like :attr:`_adoption_baselined`).
+    _deriv_exec_watermark: int | None = None
+    # Last watermark value written to the audit log (persistence throttle
+    # anchor): the durable cursor is re-persisted only after advancing at
+    # least the read overlap, bounding the append-log write rate.
+    _deriv_exec_persisted_ms: int = 0
+    # Adoption floor for the execution backfill (epoch-ms, VENUE clock).
+    # Stamped when the F2 adoption baseline latches, with a server-time read
+    # taken BEFORE the adoption snapshot: every execution below it is
+    # pre-adoption history the baseline provably owns (live rows' fills are
+    # execId-seeded from per-order reads, everything else is folded into the
+    # adopted size), while a post-adoption fill's venue-clocked ``execTime``
+    # lands at or above it — the backfill must never re-emit a pre-adoption
+    # slice (a persisted watermark from the previous run necessarily
+    # predates it). Clamps both the resumed watermark and the overlapped
+    # window start.
+    _deriv_exec_floor_ms: int = 0
 
     # ------------------------------------------------------------------
     # Bybit-private cross-mix-in method surface.
@@ -233,6 +303,18 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     async def _ensure_broker_started(self) -> None: ...
 
     async def _fetch_wallet_coin(self, coin: str) -> dict: ...
+
+    # --- Restart recovery (recovery.py) ---
+    async def _recover_in_flight_submissions(self) -> None: ...
+
+    async def _recovery_open_order_ids(
+            self, market: 'InstrumentInfo',
+    ) -> 'tuple[set[str], bool]': ...
+
+    async def _recovery_fill_ids(
+            self, market: 'InstrumentInfo', order_id: str, from_ms: int,
+            until_ms: int | None = None,
+    ) -> 'tuple[set[str], float, bool]': ...
 
     def _inverse_order_to_base(self, order: 'ExchangeOrder') -> 'ExchangeOrder': ...
 
@@ -297,6 +379,15 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
 
     async def _lookup_order_by_coid(self, coid: str) -> dict | None: ...
 
+    # --- Runtime reconcile (reconcile.py) ---
+    async def _confirm_lookup(
+            self, market: 'InstrumentInfo', coid: str,
+    ) -> 'tuple[dict | None, bool]': ...
+
+    async def _cancel_outcome_for(
+            self, market: 'InstrumentInfo', coid: str,
+    ) -> 'CancelDispositionOutcome': ...
+
     def _inverse_anchor_for(self, coid: str, *,
                             fallback: 'float | None' = None) -> 'Decimal | None': ...
 
@@ -312,3 +403,8 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
             market: 'InstrumentInfo', qty: 'Decimal',
             anchor: 'Decimal | None' = None,
     ) -> 'list[ExchangeOrder]': ...
+
+    # --- Disappearance detection (reconcile.py) ---
+    async def _reconcile_disappearance(
+            self, market: 'InstrumentInfo', position_rows: list[dict] | None,
+    ) -> 'list[OrderEvent]': ...

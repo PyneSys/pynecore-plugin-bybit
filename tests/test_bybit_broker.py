@@ -3,6 +3,7 @@
 """
 import asyncio
 from decimal import Decimal
+from time import time as epoch_time
 
 import pytest
 
@@ -23,6 +24,9 @@ from pynecore.core.broker.models import (
     LegType,
     OrderType,
 )
+from pynecore.core.broker.run_identity import RunIdentity
+from pynecore.core.broker.storage import BrokerStore
+
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import BybitAPIError
 from pynecore_bybit.helpers import (
@@ -318,6 +322,51 @@ def __test_bybit_duplicate_coid_spent__():
         order_type=OrderType.LIMIT, limit=90000.0,
     )))
     assert orders[0].id == '889'
+
+
+def _attach_store(plugin, tmp_path, name: str) -> None:
+    store = BrokerStore(tmp_path / f"{name}.sqlite", plugin_name=plugin.plugin_name)
+    identity = RunIdentity(
+        strategy_id="dup", symbol=plugin._market.symbol, timeframe="1",
+        account_id=f"dup-{name}",
+    )
+    plugin.store_ctx = store.open_run(identity, script_source="// dup")
+
+
+def __test_bybit_duplicate_coid_prior_instance_spent__(tmp_path):
+    """A duplicate whose original predates this instance's dispatch is spent.
+
+    A crashed prior instance can leave an orphaned envelope whose replay
+    rebuilds a spent coid; the venue then returns the PREVIOUS run's already-
+    filled order. Adopting it would report a phantom live order for a gone
+    position, so the plugin raises ClientOrderIdSpentError (the engine
+    re-anchors under a fresh id). The guard anchors on this instance's
+    persist-first dispatch row: the original's ``createdTime`` predating it
+    by more than the skew margin proves the order is a prior-run artefact.
+    """
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("duplicate", ret_code=170141),
+        {'list': [{'orderId': '777', 'orderLinkId': 'whatever',
+                   'symbol': 'BTCUSDT', 'side': 'Buy', 'orderType': 'Market',
+                   'qty': '0.0015', 'cumExecQty': '0.0015',
+                   'orderStatus': 'Filled', 'createdTime': '1000000000000'}]},
+    ])
+    _attach_store(plugin, tmp_path, "prior")
+    with pytest.raises(ClientOrderIdSpentError):
+        asyncio.run(plugin.execute_entry(_entry_envelope()))
+
+    # A same-instant original (createdTime aligned with the dispatch row) is
+    # a genuine in-process retry and is still adopted.
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("duplicate", ret_code=170141),
+        {'list': [{'orderId': '778', 'orderLinkId': 'whatever',
+                   'symbol': 'BTCUSDT', 'side': 'Buy', 'orderType': 'Market',
+                   'qty': '0.0015', 'cumExecQty': '0.0015', 'orderStatus': 'Filled',
+                   'createdTime': str(int(epoch_time() * 1000) + 60_000)}]},
+    ])
+    _attach_store(plugin, tmp_path, "retry")
+    orders = asyncio.run(plugin.execute_entry(_entry_envelope()))
+    assert orders[0].id == '778'
 
 
 def __test_bybit_exit_leg_spent_rolls_back_sibling__():

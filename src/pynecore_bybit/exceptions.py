@@ -36,6 +36,22 @@ class BybitConnectionError(BybitError):
     retryable = True
 
 
+class BybitAdoptionBaselineError(BybitError):
+    """The startup adoption baseline could not be committed.
+
+    Raised from the engine-facing position read when the baseline's venue
+    reads fail or its position snapshot never stabilizes. Returning an
+    unbaselined snapshot instead would let the engine's ONE-SHOT startup
+    adoption run without the fill cursors seeded; a later baseline retry
+    would then seed any post-adoption fill's ``execId`` into the de-dup
+    frontier without the engine ever booking it — silently losing the
+    fill. Retryable: the read is idempotent, the engine parks the cycle
+    and retries (startup fails loud, exactly like a failed position read).
+    """
+
+    retryable = True
+
+
 class BybitAPIError(BybitError):
     """The API answered with a non-zero ``retCode``.
 

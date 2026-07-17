@@ -99,6 +99,14 @@ EXECUTION_PAGE_LIMIT: int = 100
 # ``execId``, so re-reading a short overlap is free and closes the race.
 EXECUTION_CURSOR_OVERLAP_MS: int = 60_000
 
+# Skew margin (ms) subtracted from a row's dispatch-start instant to open a
+# per-order ``/v5/execution/list`` seed window. Generous enough to absorb
+# clock skew + broker-clock vs local-clock offset + execution indexing lag;
+# from that anchor the seed walks contiguous 7-day windows (the endpoint's
+# span cap) up to the present, so even a GTC order that filled long after
+# its creation has every ``execId`` collected.
+EXECUTION_SINCE_SKEW_MS: int = 60_000
+
 # ``GET /v5/order/realtime`` page size (server maximum for one page).
 OPEN_ORDERS_PAGE_LIMIT: int = 50
 
