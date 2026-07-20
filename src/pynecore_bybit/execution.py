@@ -1363,6 +1363,13 @@ class _ExecutionMixin(_BybitBase):
         """Cancel every open order of the (single) instrument, natively."""
         await self._ensure_broker_started()
         market = await asyncio.to_thread(self._broker_market)
+        # Arm the engine's expected-cancel set BEFORE the venue round-trip so the
+        # follow-up ``CANCELLED`` pushes for the orders this endpoint removes are
+        # routed as the engine's own cancels rather than tripping the
+        # ``on_unexpected_cancel`` quarantine. The marker rides the engine event
+        # queue, FIFO-ordered ahead of those pushes.
+        if self.native_cancel_all_expected_sink is not None:
+            self.native_cancel_all_expected_sink(market.symbol)
         try:
             result = await self._call('/v5/order/cancel-all', method='post', body={
                 'category': market.category,

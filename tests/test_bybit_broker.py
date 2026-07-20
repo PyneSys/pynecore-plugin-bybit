@@ -584,6 +584,24 @@ def __test_bybit_execute_cancel__():
     assert asyncio.run(plugin.execute_cancel_all()) == 2
 
 
+def __test_bybit_cancel_all_arms_expected_before_venue_call__():
+    """Native cancel-all arms the engine's expected-cancel sink BEFORE the
+    venue ``/v5/order/cancel-all`` POST, passing the market symbol, so the
+    follow-up CANCELLED pushes are routed as the engine's own cancels."""
+    plugin = _FakeBrokerBybit(responses=[{'list': [{'orderId': '1'}]}])
+    armed: list[tuple[str | None, int]] = []
+    # Record the symbol AND how many REST calls had happened at sink time —
+    # zero proves the arm precedes the venue round-trip.
+    plugin.native_cancel_all_expected_sink = (
+        lambda symbol=None: armed.append((symbol, len(plugin.calls)))
+    )
+
+    assert asyncio.run(plugin.execute_cancel_all()) == 1
+
+    assert armed == [(plugin._market.symbol, 0)]
+    assert plugin.calls[-1][0] == '/v5/order/cancel-all'
+
+
 def __test_bybit_event_stream_translation__():
     """Private execution/order pushes -> OrderEvents with Pine identity"""
     plugin = _FakeBrokerBybit()
@@ -665,6 +683,94 @@ def __test_bybit_event_stream_translation__():
     assert events[0].pine_id == 'TP/SL'
     assert events[0].from_entry == 'Long'
     assert events[0].leg_type is LegType.TAKE_PROFIT
+
+
+def __test_bybit_amend_relabels_repeated_new_push__():
+    """A re-pushed ``New`` on a known order id becomes ``amended``, not ``created``.
+
+    Bybit echoes ``orderStatus='New'`` on the SAME order id after an in-place
+    amend (``POST /v5/order/amend``); the first push is the genuine creation,
+    every later one confirms an amend.
+    """
+    plugin = _FakeBrokerBybit()
+    market = plugin._market
+    assert market is not None
+    plugin._record_identity('coid-amend', pine_id='Long', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.001)
+
+    def _new_push():
+        return {
+            'topic': 'order',
+            'data': [{
+                'symbol': 'BTCUSDT', 'orderId': '501', 'orderLinkId': 'coid-amend',
+                'orderStatus': 'New', 'side': 'Sell', 'orderType': 'Limit',
+                'qty': '0.001', 'cumExecQty': '0', 'price': '65150.7',
+                'createdTime': '1752600000000',
+            }],
+        }
+
+    # First push: genuine creation.
+    events = plugin._translate_order_rows(_new_push(), market)
+    assert len(events) == 1
+    assert events[0].event_type == 'created'
+    assert events[0].pine_id == 'Long'
+
+    # Second push (post-amend echo, same order id): relabelled as amended.
+    events = plugin._translate_order_rows(_new_push(), market)
+    assert len(events) == 1
+    assert events[0].event_type == 'amended'
+    assert events[0].order.id == '501'
+    assert events[0].pine_id == 'Long'
+
+
+def __test_bybit_cancel_close_order_idempotent__(tmp_path):
+    """A venue cancel echo after the REST-ack close writes no duplicate audit.
+
+    The REST cancel ACK closes the store row synchronously; the private
+    ``order`` push then echoes the same terminal transition. Re-closing an
+    already-closed row would append a second ``order_closed`` audit event
+    for one logical cancel — the translator must skip the close when the
+    row is no longer live.
+    """
+    plugin = _FakeBrokerBybit()
+    market = plugin._market
+    assert market is not None
+    _attach_store(plugin, tmp_path, "close-dup")
+    coid = 'coid-limit'
+    plugin._record_identity(coid, pine_id='Long', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.001)
+    plugin.store_ctx.upsert_order(
+        coid, symbol='BTCUSDT', side='buy', qty=0.001, state='working',
+    )
+
+    push = {
+        'topic': 'order',
+        'data': [
+            {'symbol': 'BTCUSDT', 'orderId': '501', 'orderLinkId': coid,
+             'orderStatus': 'Cancelled', 'side': 'Buy', 'orderType': 'Limit',
+             'qty': '0.001', 'cumExecQty': '0', 'price': '90000',
+             'createdTime': '1752600000000'},
+        ],
+    }
+
+    # First push (mirrors the private-stream echo of a REST-ACK cancel) closes
+    # the row and writes exactly one terminal audit event.
+    events = plugin._translate_order_rows(push, market)
+    assert len(events) == 1 and events[0].event_type == 'cancelled'
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is not None
+
+    def _closed_count() -> int:
+        return sum(1 for _ in
+                   plugin.store_ctx.iter_events_by_kind_for_run_id('order_closed'))
+
+    assert _closed_count() == 1
+
+    # A duplicate push for the already-closed row emits the event but must not
+    # append a second ``order_closed`` audit row.
+    events = plugin._translate_order_rows(push, market)
+    assert len(events) == 1 and events[0].event_type == 'cancelled'
+    assert _closed_count() == 1
 
 
 def __test_bybit_spot_port_execution_mapping__():

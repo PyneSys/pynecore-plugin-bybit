@@ -138,11 +138,18 @@ class BybitWebSocket:
             )
 
     async def close(self) -> None:
-        """Cancel the loops and close the transport (idempotent)."""
+        """Cancel the loops and close the transport (idempotent).
+
+        The cancelled background tasks are awaited to completion before
+        returning so a subsequent event-loop shutdown finds nothing
+        pending — an un-awaited cancelled task is reported as
+        "Task was destroyed but it is pending" once the loop closes. The
+        task that happens to be running this ``close`` (the receive loop
+        can drive a reconnect that closes the old transport) is never
+        awaited on itself, which would deadlock.
+        """
         self._closing = True
-        for task in (self._ping_task, self._recv_task):
-            if task is not None:
-                task.cancel()
+        tasks = [t for t in (self._ping_task, self._recv_task) if t is not None]
         self._ping_task = None
         self._recv_task = None
         ws = self._ws
@@ -151,6 +158,16 @@ class BybitWebSocket:
             try:
                 await ws.close()
             except (OSError, WebSocketException):
+                pass
+        current = asyncio.current_task()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            if task is current:
+                continue
+            try:
+                await task
+            except (asyncio.CancelledError, OSError, WebSocketException):
                 pass
 
     # --- internals -----------------------------------------------------------

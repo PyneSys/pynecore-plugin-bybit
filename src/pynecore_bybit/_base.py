@@ -180,6 +180,14 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # the private execution stream (the ledger dedups durably; this saves
     # the store round-trip on the common echo).
     _seen_exec_ids: 'set[str]'
+    # Exchange order ids for which a ``created`` OrderEvent has already been
+    # emitted. Bybit re-pushes ``orderStatus='New'`` (or ``'Untriggered'``)
+    # after an in-place amend (``POST /v5/order/amend``) on the SAME order id;
+    # without this guard the ``order`` topic would translate that echo into a
+    # second ``created`` event, mislabelling the amend as a fresh order. A
+    # ``New`` / ``Untriggered`` push for a known id is emitted as ``amended``
+    # instead. In-memory only (a restart re-learns the first push as created).
+    _created_order_ids: 'set[str]'
     # Dispatch quantity + cumulative fill per ``orderLinkId`` — the
     # in-memory partial-vs-filled discriminator behind the BrokerStore's
     # durable ``filled_qty`` cursor (and its stand-in when persistence

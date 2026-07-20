@@ -563,18 +563,37 @@ class _EventStreamMixin(_BybitBase):
             if event_type is None:
                 continue
             coid = str(entry.get('orderLinkId') or '')
+            order_id = str(entry.get('orderId') or '')
             pine_id, from_entry, leg_type = self._resolve_identity(
-                coid or None, str(entry.get('orderId') or '') or None,
+                coid or None, order_id or None,
             )
             if leg_type is None:
                 continue
+            if event_type == 'created' and order_id:
+                # Bybit re-pushes ``New`` / ``Untriggered`` on the SAME order id
+                # after an in-place amend (``POST /v5/order/amend``). The first
+                # push is the genuine creation; every later one confirms an
+                # amend — relabel it so the lifecycle log reads ``amended``
+                # rather than a spurious second ``created``.
+                if order_id in self._created_order_ids:
+                    event_type = 'amended'
+                else:
+                    self._created_order_ids.add(order_id)
             if event_type in ('cancelled', 'rejected') \
                     and self.store_ctx is not None and coid:
                 # A parked (unknown-disposition) dispatch that resolved to a
                 # terminal cancel / reject is done — drop its engine park
                 # alongside the store row (``record_unpark`` is idempotent).
                 self.store_ctx.record_unpark(coid)
-                self.store_ctx.close_order(coid)
+                # The REST cancel ACK closes the row synchronously; the venue
+                # then echoes the same terminal transition on this private
+                # ``order`` push. ``close_order`` appends an ``order_closed``
+                # audit event every call, so re-closing an already-closed row
+                # would duplicate the terminal audit trail — only close a row
+                # that is still live.
+                row = self.store_ctx.get_order(coid)
+                if row is not None and row.closed_ts_ms is None:
+                    self.store_ctx.close_order(coid)
             order = parse_exchange_order(entry)
             if market.is_inverse:
                 order = self._inverse_order_to_base(order)

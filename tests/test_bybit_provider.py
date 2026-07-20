@@ -17,6 +17,7 @@ from pynecore_bybit.exceptions import (
 )
 from pynecore_bybit.helpers import KLINE_LIMIT, add_interval, bar_close_ts
 from pynecore_bybit.models import InstrumentInfo, parse_instrument
+from pynecore_bybit.ws import BybitWebSocket
 
 
 def main():
@@ -339,6 +340,43 @@ def __test_bybit_ws_dispatch__():
         await plugin._on_ws_closed()
         with pytest.raises(ConnectionError):
             await plugin.watch_ohlcv('BTCUSDT', '1')
+
+    asyncio.run(scenario())
+
+
+def __test_bybit_ws_close_awaits_tasks__():
+    """close() cancels AND awaits the loops so none are left pending"""
+
+    class _FakeConn:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    async def scenario():
+        ws = BybitWebSocket('wss://example/v5/private', on_message=lambda _d: None)
+        conn = _FakeConn()
+        ws._ws = conn
+
+        async def _idle():
+            await asyncio.Event().wait()
+
+        ws._recv_task = asyncio.create_task(_idle())
+        ws._ping_task = asyncio.create_task(_idle())
+        recv_task, ping_task = ws._recv_task, ws._ping_task
+
+        await ws.close()
+
+        # The transport was closed and both loops are settled (cancelled and
+        # awaited) rather than left pending for the loop teardown to destroy.
+        assert conn.closed
+        assert recv_task.done() and ping_task.done()
+        assert recv_task.cancelled() and ping_task.cancelled()
+        assert ws._recv_task is None and ws._ping_task is None
+
+        # Idempotent: a second close with nothing tracked is a no-op.
+        await ws.close()
 
     asyncio.run(scenario())
 
