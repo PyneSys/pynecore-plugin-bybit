@@ -558,6 +558,47 @@ def __test_bybit_exit_leg_spent_ambiguous_rollback__():
     assert len(cancels) == 1
 
 
+def __test_bybit_exit_leg_reduce_only_zero_position_is_proven_flat__():
+    """A reduce-only exit leg refused because the position is already flat
+    (retCode 110017 'current position is zero') is a proven-flat signal.
+
+    On a netting venue a bracket re-emission can race a close that already
+    flattened the shared net position: the venue then refuses the reduce-only
+    leg with 110017. This is NOT an unprotected-position emergency — surfacing
+    it as a full-size BracketAttachAfterFillRejectedError makes the engine
+    dispatch a defensive close that ITSELF rejects reduce-only against the flat
+    position and halts the run (the live-lab multi-entry-bracket failure). The
+    plugin signals proven-flat (``qty=0``) so the engine skips the defensive
+    close and runs only the OCA / residual cleanup cascade.
+    """
+    plugin = _linear_plugin(responses=[
+        BybitAPIError(
+            "Bybit API error on /v5/order/create: retCode=110017 "
+            "retMsg='current position is zero, cannot fix reduce-only "
+            "order qty'",
+            ret_code=110017,
+        ),
+    ])
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(plugin.execute_exit(_bracket_envelope()))
+    assert exc.value.qty == 0.0
+    assert exc.value.error_code == '110017'
+
+    # A DIFFERENT 110017 variant — reduce-only qty larger than a still-OPEN
+    # position — is NOT proven-flat: the position remains and a full-size
+    # defensive close must still fire.
+    plugin = _linear_plugin(responses=[
+        BybitAPIError(
+            "Bybit API error on /v5/order/create: retCode=110017 "
+            "retMsg='reduce-only order qty is larger than current position'",
+            ret_code=110017,
+        ),
+    ])
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(plugin.execute_exit(_bracket_envelope()))
+    assert exc.value.qty == pytest.approx(0.001)
+
+
 def __test_bybit_execute_cancel__():
     """Cancel by orderLinkId; order-not-found is a benign no-op"""
     plugin = _FakeBrokerBybit(responses=[{'orderId': '301'}])

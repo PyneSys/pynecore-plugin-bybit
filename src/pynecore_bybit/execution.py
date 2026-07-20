@@ -116,6 +116,7 @@ from .exceptions import (
     BybitError,
     DUPLICATE_COID_CODES,
     ORDER_NOT_FOUND_CODES,
+    is_reduce_only_zero_position_reject,
     map_broker_error,
     reject_error,
 )
@@ -897,6 +898,20 @@ class _ExecutionMixin(_BybitBase):
             # with a defensive market close instead of halting; the
             # already-placed sibling is enumerated by
             # :meth:`get_residual_orders_after_bracket_attach_reject`.
+            #
+            # Exception: the venue rejected the reduce-only leg because the
+            # position is ALREADY FLAT (retCode 110017 "current position is
+            # zero"). On a netting venue a bracket re-emission can race a
+            # close that already flattened the shared position — the exit is
+            # moot, not an unprotected-position emergency. Signal proven-flat
+            # (``qty=0``): the engine skips the defensive close (which would
+            # itself reject reduce-only against the flat position and halt)
+            # and runs only the OCA / residual cleanup.
+            cause = exc.__cause__
+            proven_flat = (
+                isinstance(cause, BybitAPIError)
+                and is_reduce_only_zero_position_reject(cause)
+            )
             raise BracketAttachAfterFillRejectedError(
                 f"Bybit exit leg rejected after entry fill "
                 f"(exit={intent.pine_id!r}, from_entry={intent.from_entry!r}): "
@@ -905,9 +920,11 @@ class _ExecutionMixin(_BybitBase):
                 or f"__pyne_orphan__{intent.symbol}__{intent.from_entry}",
                 symbol=intent.symbol,
                 position_side='buy' if intent.side == 'sell' else 'sell',
-                qty=self._core_qty(qty, anchor),
+                qty=0.0 if proven_flat else self._core_qty(qty, anchor),
                 from_entry=intent.from_entry,
                 exit_id=intent.pine_id,
+                error_code=(str(cause.ret_code)
+                            if isinstance(cause, BybitAPIError) else None),
             ) from exc
         return legs
 

@@ -146,6 +146,21 @@ def is_benign_trading_stop_reject(exc: BybitAPIError) -> bool:
     return exc.ret_code == 10001 and 'zero position' in str(exc)
 
 
+def is_reduce_only_zero_position_reject(exc: BybitAPIError) -> bool:
+    """Whether a reduce-only order-create reject proves the position is flat.
+
+    Measured live on the global demo (2026-07-20): a reduce-only exit /
+    close leg dispatched against an already-flat position rejects with
+    retCode 110017 and ``retMsg`` "current position is zero, cannot fix
+    reduce-only order qty". The code alone is not safe to treat as
+    proven-flat — 110017 also covers a reduce-only order whose quantity
+    merely EXCEEDS a still-open position, where the position is NOT flat and
+    a defensive close is still required — so the "position is zero" message
+    is matched too (mirrors :func:`is_benign_trading_stop_reject`).
+    """
+    return exc.ret_code == 110017 and 'position is zero' in str(exc)
+
+
 def map_broker_error(exc: BybitAPIError) -> BrokerError | None:
     """Translate a Bybit ``retCode`` reject into the core broker taxonomy.
 
