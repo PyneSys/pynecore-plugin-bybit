@@ -491,6 +491,27 @@ class _EventStreamMixin(_BybitBase):
         # Linear execution rows carry no ``feeCurrency`` — the fee is
         # always the settle coin (empty for spot, where the row has it).
         fee_currency = str(entry.get('feeCurrency') or '') or market.settle_coin
+        if market.category == CATEGORY_SPOT:
+            # Bybit charges the spot buy-side fee in the BASE coin, so the
+            # base actually RECEIVED on a buy (or SHED on a sell) differs
+            # from the gross executed quantity by that fee. The core
+            # inventory ledger books the fee-adjusted base delta and
+            # ``get_position`` synthesizes the resulting net inventory
+            # (see :mod:`pynecore.core.broker.spot_inventory` and
+            # :meth:`get_position`), so the engine position must track the
+            # SAME net quantity. Emitting the gross quantity would let a
+            # legitimate ``strategy.close`` size itself from a position the
+            # ledger never held and oversell it, driving the fold negative
+            # into a ``spot_ledger_negative_inventory`` quarantine. A
+            # quote-currency fee does not move the base inventory. The
+            # order-completion tracking above stays in the gross wire domain
+            # (``is_full`` / ``filled_qty`` compare against the dispatched
+            # quantity); only the position-moving ``fill_qty`` is netted.
+            spot_fee_ccy = str(entry.get('feeCurrency') or '') or (
+                market.base_coin if side == 'buy' else market.quote_coin
+            )
+            if spot_fee_ccy == market.base_coin:
+                fill_qty = exec_qty - fee if side == 'buy' else exec_qty + fee
         if market.is_inverse:
             anchor = self._inverse_anchor_for(coid, fallback=exec_price)
             assert anchor is not None  # exec_price > 0 guarantees a fallback

@@ -623,7 +623,10 @@ def __test_bybit_event_stream_translation__():
     assert len(events) == 1
     event = events[0]
     assert event.event_type == 'partial'
-    assert event.fill_qty == 0.001
+    # The spot buy fee (0.000001 BTC) is charged in the BASE coin, so the
+    # engine-facing position delta is the NET base received (0.001 - fee),
+    # matching the inventory ledger and get_position — not the gross qty.
+    assert event.fill_qty == pytest.approx(0.000999)
     assert event.fill_id == 'e-1'
     assert event.pine_id == 'Long'
     assert event.leg_type is LegType.ENTRY
@@ -820,6 +823,89 @@ def __test_bybit_spot_port_execution_mapping__():
     assert batch.executions == ()
     assert batch.next_cursor is not None
     assert not batch.has_more
+
+
+def __test_bybit_spot_base_fee_close_never_quarantines__(tmp_path):
+    """A base-coin buy fee must not turn a legitimate close into a
+    ``spot_ledger_negative_inventory`` quarantine.
+
+    Bybit charges the spot buy-side fee in the BASE coin, so the ledger
+    books the NET base received (``0.001 - fee``) and ``get_position``
+    synthesizes that net inventory. The engine-facing ``fill_qty`` must be
+    the SAME net amount — otherwise a full ``strategy.close`` sizes itself
+    from a gross position the ledger never held and oversells it, driving
+    the fold negative into a quarantine. This walks the exact reported
+    round trip (buy 0.001 with a base fee, then close) through the real
+    inventory manager and asserts the ledger returns exactly flat with no
+    quarantine.
+    """
+    from pynecore.core.broker.spot_inventory import SpotInventoryManager
+
+    plugin = _FakeBrokerBybit()
+    market = plugin._market
+    assert market is not None and market.category == 'spot'
+
+    store = BrokerStore(tmp_path / "spot_rt.sqlite", plugin_name=plugin.plugin_name)
+    identity = RunIdentity(
+        strategy_id="spot_rt", symbol="BTCUSDT", timeframe="1",
+        account_id="acct-spot",
+    )
+    plugin.store_ctx = store.open_run(identity, script_source="// spot rt")
+
+    port = spot_port_for(plugin, market)
+    quarantine_calls: list = []
+    manager = SpotInventoryManager(
+        plugin.store_ctx, port,
+        account_id="acct-spot", symbol="BTCUSDT",
+        request_quarantine=lambda msg, ctx: quarantine_calls.append((msg, ctx)),
+    )
+    # The adoption watermark is irrelevant to this fill-path regression;
+    # skip the full startup handshake and drive the live path directly.
+    manager._started = True
+    plugin._spot_manager = manager
+    plugin._spot_port = port
+
+    # Entry: buy 0.001 BTC, fee 0.000001 BTC (charged in the BASE coin).
+    plugin._record_identity('coid-buy', pine_id='L', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.001)
+    buy_events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'symbol': 'BTCUSDT', 'category': 'spot', 'execType': 'Trade',
+            'execId': 'rt-buy', 'orderId': '901', 'orderLinkId': 'coid-buy',
+            'side': 'Buy', 'execQty': '0.001', 'execPrice': '64345.6',
+            'execFee': '0.000001', 'feeCurrency': 'BTC',
+            'execTime': '1752600000000',
+        }],
+    }, market)
+    assert len(buy_events) == 1
+    # Ledger and engine agree on the NET base received (0.001 - fee).
+    assert manager.fold.net_base == Decimal('0.000999')
+    assert buy_events[0].fill_qty == pytest.approx(0.000999)
+    assert not quarantine_calls
+
+    # Close: the engine sizes it from the net position, so it sells exactly
+    # the 0.000999 the ledger holds (sell fee charged in the quote coin).
+    plugin._record_identity('coid-sell', pine_id=None, from_entry='L',
+                            leg_type=LegType.CLOSE, qty=0.000999)
+    sell_events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'symbol': 'BTCUSDT', 'category': 'spot', 'execType': 'Trade',
+            'execId': 'rt-sell', 'orderId': '902', 'orderLinkId': 'coid-sell',
+            'side': 'Sell', 'execQty': '0.000999', 'execPrice': '64341.2',
+            'execFee': '0.0643', 'feeCurrency': 'USDT',
+            'execTime': '1752600000500',
+        }],
+    }, market)
+    assert len(sell_events) == 1
+    assert sell_events[0].fill_qty == pytest.approx(0.000999)
+    # The round trip is exactly flat: no oversell, no negative inventory.
+    assert manager.fold.net_base == Decimal('0')
+    assert manager.fold.violation is None
+    assert not manager.quarantined
+    assert not quarantine_calls
+    store.close()
 
 
 def _linear_plugin(responses=None, *, started=True) -> '_FakeBrokerBybit':
