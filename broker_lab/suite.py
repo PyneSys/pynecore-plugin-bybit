@@ -1,9 +1,10 @@
 """Opt-in offline conformance scenarios for the Bybit broker plugin."""
 
+from dataclasses import replace
+import logging
 from typing import Any
 
-from dataclasses import replace
-
+from pynecore.core.broker.exceptions import OrderSkippedByPlugin
 from pynecore.core.broker.models import LegType, OrderStatus
 from pynecore.testing.broker_lab import Scenario, Step, pairwise_cases
 from pynecore.testing.broker_lab.reference import (
@@ -13,6 +14,18 @@ from pynecore.testing.broker_lab.reference import (
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.models import InstrumentInfo
 from pynecore_bybit.positions import POSITION_MODE_ONE_WAY
+
+
+class _WarningCollector(logging.Handler):
+    """Collect broker warnings without changing their normal output path."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno >= logging.WARNING:
+            self.messages.append(record.getMessage())
 
 
 def _linear_instrument() -> InstrumentInfo:
@@ -190,11 +203,30 @@ class OfflineBybit(Bybit):
                 "timeNano": "1700000000000000000",
             }
         if endpoint == "/v5/execution/list":
-            return {"list": [], "nextPageCursor": ""}
+            order_id = str((params or {}).get("orderId") or "")
+            return {
+                "list": [
+                    execution
+                    for execution in self.profile.raw_executions
+                    if not order_id or execution["orderId"] == order_id
+                ],
+                "nextPageCursor": "",
+            }
         raise AssertionError(f"unexpected offline Bybit REST call: {endpoint} {params}")
 
     async def execute_entry(self, envelope):
-        orders = await super().execute_entry(envelope)
+        self.profile.entry_attempts.append(envelope.intent.intent_key)
+        try:
+            orders = await super().execute_entry(envelope)
+        except OrderSkippedByPlugin as exc:
+            self.profile.structured_skips.append(
+                {
+                    "intent_key": exc.intent_key,
+                    "reason": exc.reason,
+                    "context": dict(exc.context),
+                }
+            )
+            raise
         for order in orders:
             self.profile.state.orders[order.id] = VenueOrder(
                 order=order,
@@ -274,6 +306,56 @@ class OfflineBybit(Bybit):
         return result
 
 
+class AliasingOfflineBybit(OfflineBybit):
+    """Broken transport control that aliases a second bracket onto the first."""
+
+    def __call__(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        *,
+        method: str = "get",
+        body: dict[str, Any] | None = None,
+        auth: bool = False,
+    ) -> dict[str, Any]:
+        payload = dict(body or {})
+        if (
+            endpoint == "/v5/order/create"
+            and payload.get("reduceOnly") is True
+            and (
+                payload.get("orderType") != "Market"
+                or bool(payload.get("triggerPrice"))
+            )
+        ):
+            aliased = next(
+                (
+                    order
+                    for order in self.profile.raw_orders.values()
+                    if order.get("reduceOnly") is True
+                    and order["side"] == payload["side"]
+                    and order["orderType"] == payload["orderType"]
+                    and order.get("price", "") == payload.get("price", "")
+                    and order.get("triggerPrice", "")
+                    == payload.get("triggerPrice", "")
+                ),
+                None,
+            )
+            if aliased is not None:
+                self.rest_calls.append((endpoint, payload))
+                self.profile.transport_calls.append((endpoint, payload))
+                return {
+                    "orderId": aliased["orderId"],
+                    "orderLinkId": payload.get("orderLinkId"),
+                }
+        return super().__call__(
+            endpoint,
+            params,
+            method=method,
+            body=body,
+            auth=auth,
+        )
+
+
 class BybitProfile(ReferenceVenueProfile):
     """One-way linear venue semantics around the real Bybit plugin."""
 
@@ -286,6 +368,11 @@ class BybitProfile(ReferenceVenueProfile):
         self.market = _linear_instrument()
         self.transport_calls: list[tuple[str, dict[str, Any]]] = []
         self.raw_orders: dict[str, dict[str, Any]] = {}
+        self.raw_executions: list[dict[str, Any]] = []
+        self.entry_attempts: list[str] = []
+        self.structured_skips: list[dict[str, Any]] = []
+        self.warning_collector = _WarningCollector()
+        logging.getLogger("pyne_core_logger").addHandler(self.warning_collector)
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineBybit:
         return OfflineBybit(self, run_name, store_ctx)
@@ -331,6 +418,41 @@ class BybitProfile(ReferenceVenueProfile):
             expected = int(step.values["count"])
             if actual != expected:
                 raise AssertionError(f"expected {expected} Bybit creates, got {actual}")
+            return True
+        if step.kind == "expect_bybit_below_grid_skip":
+            if len(self.entry_attempts) != 1:
+                raise AssertionError(
+                    f"expected one Bybit entry attempt, got {self.entry_attempts}"
+                )
+            if len(self.structured_skips) != 1:
+                raise AssertionError(
+                    f"expected one structured Bybit skip, got {self.structured_skips}"
+                )
+            skip = self.structured_skips[0]
+            expected = {
+                "intent_key": "tiny",
+                "reason": "below_min_size",
+                "context": {
+                    "symbol": "BTCUSDT",
+                    "qty": 0.0005,
+                    "qty_step": "0.001",
+                },
+            }
+            for key, value in expected.items():
+                if skip.get(key) != value:
+                    raise AssertionError(
+                        f"expected structured skip {key}={value!r}, got {skip!r}"
+                    )
+            skip_warnings = [
+                message
+                for message in self.warning_collector.messages
+                if "size 0.0005 quantizes to zero" in message
+            ]
+            if len(skip_warnings) != 1 or not skip_warnings[0].startswith("[BROKER]"):
+                raise AssertionError(
+                    "expected one operator-visible [BROKER] below-grid warning, "
+                    f"got {skip_warnings}"
+                )
             return True
         if step.kind == "expect_bybit_endpoint_count":
             endpoint = str(step.values["endpoint"])
@@ -482,24 +604,24 @@ class BybitProfile(ReferenceVenueProfile):
                 },
                 runtime.broker._market,
             )
+            execution = {
+                "category": "linear",
+                "symbol": self.symbol,
+                "execType": "Trade",
+                "execId": f"exec-{record.order.id}",
+                "orderLinkId": raw["orderLinkId"],
+                "orderId": record.order.id,
+                "side": raw["side"],
+                "execQty": raw["qty"],
+                "execPrice": raw["avgPrice"],
+                "execFee": "0",
+                "execTime": "1700000001000",
+            }
+            self.raw_executions.append(execution)
             events = runtime.broker._translate_private_frame(
                 {
                     "topic": "execution",
-                    "data": [
-                        {
-                            "category": "linear",
-                            "symbol": self.symbol,
-                            "execType": "Trade",
-                            "execId": f"exec-{record.order.id}",
-                            "orderLinkId": raw["orderLinkId"],
-                            "orderId": record.order.id,
-                            "side": raw["side"],
-                            "execQty": raw["qty"],
-                            "execPrice": raw["avgPrice"],
-                            "execFee": "0",
-                            "execTime": "1700000001000",
-                        }
-                    ],
+                    "data": [execution],
                 },
                 runtime.broker._market,
             )
@@ -512,20 +634,26 @@ class BybitProfile(ReferenceVenueProfile):
             self.state.position = sum(self.state.position_owners.values())
             self.state.pending_events.append((step.run, events[0]))
             return True
-        if step.kind == "fill_bybit_entry":
+        if step.kind in ("fill_bybit_entry", "fill_bybit_close"):
             pine_id = str(step.values["id"])
+            leg_type = (
+                LegType.ENTRY
+                if step.kind == "fill_bybit_entry"
+                else LegType.CLOSE
+            )
             candidates = [
                 record
                 for record in self.state.orders.values()
                 if record.run_name == step.run
                 and record.pine_id == pine_id
-                and record.leg_type is LegType.ENTRY
+                and record.leg_type is leg_type
                 and record.order.status
                 in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
             ]
             if len(candidates) != 1:
                 raise AssertionError(
-                    f"expected one open Bybit entry {pine_id!r}, got {candidates}"
+                    f"expected one open Bybit {leg_type.value} {pine_id!r}, "
+                    f"got {candidates}"
                 )
             record = candidates[0]
             raw = self.raw_orders[record.order.id]
@@ -539,34 +667,34 @@ class BybitProfile(ReferenceVenueProfile):
                 else "PartiallyFilled"
             )
             runtime = runner.runs[step.run]
+            execution = {
+                "category": runtime.broker._market.category,
+                "symbol": self.symbol,
+                "execType": "Trade",
+                "execId": str(
+                    step.values.get(
+                        "fill_id", f"exec-{record.order.id}-{cumulative}"
+                    )
+                ),
+                "orderLinkId": raw["orderLinkId"],
+                "orderId": record.order.id,
+                "side": raw["side"],
+                "execQty": str(fill_qty),
+                "execPrice": raw["avgPrice"],
+                "execFee": "0",
+                "execTime": "1700000001000",
+            }
+            self.raw_executions.append(execution)
             events = runtime.broker._translate_private_frame(
                 {
                     "topic": "execution",
-                    "data": [
-                        {
-                            "category": runtime.broker._market.category,
-                            "symbol": self.symbol,
-                            "execType": "Trade",
-                            "execId": str(
-                                step.values.get(
-                                    "fill_id", f"exec-{pine_id}-{cumulative}"
-                                )
-                            ),
-                            "orderLinkId": raw["orderLinkId"],
-                            "orderId": record.order.id,
-                            "side": raw["side"],
-                            "execQty": str(fill_qty),
-                            "execPrice": raw["avgPrice"],
-                            "execFee": "0",
-                            "execTime": "1700000001000",
-                        }
-                    ],
+                    "data": [execution],
                 },
                 runtime.broker._market,
             )
             if len(events) != 1:
                 raise AssertionError(
-                    f"Bybit private WS did not emit one entry fill: {events}"
+                    f"Bybit private WS did not emit one {leg_type.value} fill: {events}"
                 )
             record.order = events[0].order
             signed = (
@@ -581,6 +709,17 @@ class BybitProfile(ReferenceVenueProfile):
             self.state.pending_events.append((step.run, events[0]))
             return True
         return super().handle_step(runner, step)
+
+    def close(self) -> None:
+        logging.getLogger("pyne_core_logger").removeHandler(self.warning_collector)
+        super().close()
+
+
+class AliasingBybitProfile(BybitProfile):
+    """Deliberately broken physical-order identity model for oracle testing."""
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> OfflineBybit:
+        return AliasingOfflineBybit(self, run_name, store_ctx)
 
 
 class SpotBybitProfile(BybitProfile):
@@ -769,6 +908,9 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             steps=(
                 Step("entry", values={"id": "tiny", "side": "buy", "qty": 0.0005}),
                 Step("sync", values={"last_price": 100.0}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("expect_bybit_below_grid_skip"),
                 Step("expect_bybit_create_count", values={"count": 0}),
             ),
         ),
@@ -789,11 +931,19 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             steps=(
                 Step("entry", values={"id": "A", "side": "buy", "qty": 0.01}),
                 Step("sync", values={"last_price": 100.0}),
-                Step("fill", check_invariants=False),
+                Step(
+                    "fill_bybit_entry",
+                    values={"id": "A", "qty": 0.01},
+                    check_invariants=False,
+                ),
                 Step("deliver"),
                 Step("entry", values={"id": "B", "side": "buy", "qty": 0.01}),
                 Step("sync", values={"last_price": 100.0}),
-                Step("fill", check_invariants=False),
+                Step(
+                    "fill_bybit_entry",
+                    values={"id": "B", "qty": 0.01},
+                    check_invariants=False,
+                ),
                 Step("deliver"),
                 Step(
                     "exit",
@@ -820,6 +970,53 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("sync", values={"last_price": 100.0}),
                 Step("expect_bybit_create_count", values={"count": 6}),
                 Step("expect_bybit_bracket_coverage", values={"qty": 0.01}),
+            ),
+        ),
+        Scenario(
+            name="control-bybit-aliased-global-bracket-is-detected",
+            profile_factory=AliasingBybitProfile,
+            seed=seed,
+            expected_violation="take-profit protection coverage shortfall",
+            steps=(
+                Step("entry", values={"id": "A", "side": "buy", "qty": 0.01}),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "fill_bybit_entry",
+                    values={"id": "A", "qty": 0.01},
+                    check_invariants=False,
+                ),
+                Step("deliver"),
+                Step("entry", values={"id": "B", "side": "buy", "qty": 0.01}),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "fill_bybit_entry",
+                    values={"id": "B", "qty": 0.01},
+                    check_invariants=False,
+                ),
+                Step("deliver"),
+                Step(
+                    "exit",
+                    values={
+                        "id": "X",
+                        "from_entry": "A",
+                        "side": "sell",
+                        "qty": 0.01,
+                        "limit": 110.0,
+                        "stop": 90.0,
+                    },
+                ),
+                Step(
+                    "exit",
+                    values={
+                        "id": "X",
+                        "from_entry": "B",
+                        "side": "sell",
+                        "qty": 0.01,
+                        "limit": 110.0,
+                        "stop": 90.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
             ),
         ),
         Scenario(
@@ -931,7 +1128,11 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             steps=(
                 Step("entry", values={"id": "L", "side": "buy", "qty": 0.1}),
                 Step("sync", values={"last_price": 100.0}),
-                Step("fill", check_invariants=False),
+                Step(
+                    "fill_bybit_entry",
+                    values={"id": "L", "qty": 0.1},
+                    check_invariants=False,
+                ),
                 Step("deliver"),
                 Step(
                     "exit",
@@ -979,7 +1180,11 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             steps=(
                 Step("entry", values={"id": "L", "side": "buy", "qty": 0.1}),
                 Step("sync", values={"last_price": 100.0}),
-                Step("fill", check_invariants=False),
+                Step(
+                    "fill_bybit_entry",
+                    values={"id": "L", "qty": 0.1},
+                    check_invariants=False,
+                ),
                 Step("deliver"),
                 Step(
                     "exit",
@@ -1019,7 +1224,12 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             steps=(
                 Step("entry", run="A", values={"id": "A", "side": "buy", "qty": 0.1}),
                 Step("sync", run="A", values={"last_price": 100.0}),
-                Step("fill", run="A", check_invariants=False),
+                Step(
+                    "fill_bybit_entry",
+                    run="A",
+                    values={"id": "A", "qty": 0.1},
+                    check_invariants=False,
+                ),
                 Step("deliver", run="A"),
                 Step("restart", run="B", check_invariants=False),
                 Step(
@@ -1027,7 +1237,12 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 ),
                 Step("entry", run="B", values={"id": "B", "side": "buy", "qty": 0.1}),
                 Step("sync", run="B", values={"last_price": 100.0}),
-                Step("fill", run="B", check_invariants=False),
+                Step(
+                    "fill_bybit_entry",
+                    run="B",
+                    values={"id": "B", "qty": 0.1},
+                    check_invariants=False,
+                ),
                 Step("deliver", run="B"),
                 Step("restart", run="A", check_invariants=False),
                 Step(
@@ -1046,7 +1261,12 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                     "close", run="A", values={"id": "A", "from_entry": "A", "qty": 0.1}
                 ),
                 Step("sync", run="A", values={"last_price": 100.0}),
-                Step("fill", run="A", check_invariants=False),
+                Step(
+                    "fill_bybit_close",
+                    run="A",
+                    values={"id": "A", "qty": 0.1},
+                    check_invariants=False,
+                ),
                 Step("deliver", run="A"),
                 Step(
                     "expect",
