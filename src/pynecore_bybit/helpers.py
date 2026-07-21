@@ -228,11 +228,22 @@ def contracts_to_base(contracts: float | Decimal, price: float | Decimal) -> flo
 
 
 def _floor_to_step(value: Decimal, step_str: str) -> Decimal:
-    """Floor ``value`` onto the exact decimal grid of ``step_str``."""
+    """Floor ``value`` onto the exact decimal grid of ``step_str``.
+
+    The float-noise guard: a quantity that IEEE-754 arithmetic left a hair
+    below a whole grid multiple — e.g. ``0.03 - 0.01 ==
+    0.019999999999999997`` on a ``0.01`` grid, ratio ``1.9999999999999997``
+    — must floor onto that multiple, not a full step below it. Snapping the
+    ratio to nine decimals with ``ROUND_HALF_UP`` absorbs the representation
+    error (tolerance ``5e-10`` of a step, far below any exchange grain)
+    before the flooring ``ROUND_DOWN``, so a genuine sub-step remainder
+    still floors down.
+    """
     step = Decimal(step_str)
     if step <= 0:
         return value
-    return (value / step).to_integral_value(ROUND_DOWN) * step
+    ratio = (value / step).quantize(Decimal('1e-9'), rounding=ROUND_HALF_UP)
+    return ratio.to_integral_value(ROUND_DOWN) * step
 
 
 def round_price(price: float, tick_str: str) -> Decimal:

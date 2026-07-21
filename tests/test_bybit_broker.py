@@ -155,6 +155,13 @@ def __test_bybit_quantize_helpers__():
     """Exact decimal grid helpers: floor qty, snap price, wire format"""
     assert quantize_qty(0.0015678, '0.000001') == Decimal('0.001567')
     assert quantize_qty(0.0009, '0.001') == Decimal('0')
+    # Float-noise guard: a reversal close of ``0.03 - 0.01`` lands at
+    # ``0.019999999999999997`` (ratio ``1.9999999999999997`` on a ``0.01``
+    # grid). It must snap to the whole ``0.02`` step, not floor a full step
+    # down to ``0.01`` (which under-closed a reversed ETHUSDT position).
+    assert quantize_qty(0.03 - 0.01, '0.01') == Decimal('0.02')
+    # A genuine sub-step remainder still floors down.
+    assert quantize_qty(0.025, '0.01') == Decimal('0.02')
     assert round_price(102345.678, '0.01') == Decimal('102345.68')
     assert round_price(102345.674, '0.01') == Decimal('102345.67')
     assert format_decimal(Decimal('0.001500')) == '0.0015'
