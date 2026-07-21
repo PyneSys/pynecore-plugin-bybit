@@ -227,6 +227,87 @@ def __test_bybit_execute_entry__():
     assert exc.value.reason == 'below_min_notional'
 
 
+def __test_bybit_both_set_stop_limit_stays_dormant__():
+    """A both-set stop-limit whose limit is marketable rests behind the stop.
+
+    Regression: a Pine ``strategy.entry(stop=, limit=)`` reaches the plugin as
+    a LIMIT entry that still carries the stop. When the limit is on the
+    marketable side (a buy limit at/above the market, a sell limit at/below
+    it), a plain resting limit would fill instantly — before the stop is ever
+    crossed. It must instead be placed as a native conditional (trigger) order
+    at the stop level so it stays dormant until the trigger fires.
+    """
+    # Spot BUY stop-limit: stop 2030.5, limit 2032.43, market 1933.8. The
+    # limit is above the market (marketable) -> conditional StopOrder.
+    plugin = _FakeBrokerBybit(responses=[{'orderId': '701'}])
+    plugin._last_price = 1933.8
+    orders = asyncio.run(plugin.execute_entry(_entry_envelope(
+        side='buy', qty=0.01, order_type=OrderType.LIMIT,
+        stop=2030.5, limit=2032.43,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['orderType'] == 'Limit'
+    assert body['price'] == '2032.43'
+    assert body['triggerPrice'] == '2030.5'
+    assert body['orderFilter'] == 'StopOrder'  # spot conditional
+    assert orders[0].id == '701'
+
+    # Linear BUY stop-limit: trigger direction follows the side (rise).
+    plugin = _linear_plugin(responses=[{'orderId': '702'}])
+    plugin._last_price = 1933.8
+    asyncio.run(plugin.execute_entry(_entry_envelope(
+        side='buy', qty=0.01, order_type=OrderType.LIMIT,
+        stop=2030.5, limit=2032.4,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['triggerPrice'] == '2030.5'
+    assert body['triggerDirection'] == 1  # buy triggers on a rise
+    assert 'orderFilter' not in body
+
+    # Linear SELL stop-limit: stop below the market, limit at/below it ->
+    # marketable -> conditional, triggers on a fall.
+    plugin = _linear_plugin(responses=[{'orderId': '703'}])
+    plugin._last_price = 2100.0
+    asyncio.run(plugin.execute_entry(_entry_envelope(
+        side='sell', qty=0.01, order_type=OrderType.LIMIT,
+        stop=2000.0, limit=1999.0,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['triggerPrice'] == '2000'
+    assert body['triggerDirection'] == 2  # sell triggers on a fall
+
+    # Non-marketable OCO pullback leg (buy limit below the market) stays a
+    # plain resting limit — no trigger is attached.
+    plugin = _linear_plugin(responses=[{'orderId': '704'}])
+    plugin._last_price = 2100.0
+    asyncio.run(plugin.execute_entry(_entry_envelope(
+        side='buy', qty=0.01, order_type=OrderType.LIMIT,
+        stop=2200.0, limit=2000.0,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert 'triggerPrice' not in body
+    assert 'triggerDirection' not in body
+
+
+def __test_bybit_both_set_stop_limit_amend_keeps_trigger__():
+    """Amending a dormant stop-limit keeps its trigger in step with the stop."""
+    plugin = _linear_plugin(responses=[{'orderId': '801'}])
+    plugin._last_price = 1933.8
+    old = _entry_envelope(
+        side='buy', qty=0.01, order_type=OrderType.LIMIT,
+        stop=2030.5, limit=2032.4,
+    )
+    new = _entry_envelope(
+        side='buy', qty=0.01, order_type=OrderType.LIMIT,
+        stop=2070.0, limit=2072.0,
+    )
+    asyncio.run(plugin.modify_entry(old, new))
+    endpoint, _, body = plugin.calls[-1]
+    assert endpoint == '/v5/order/amend'
+    assert body['price'] == '2072'
+    assert body['triggerPrice'] == '2070'
+
+
 def __test_bybit_execute_exit_and_close__():
     """SOFTWARE bracket legs and the market close"""
     plugin = _FakeBrokerBybit(responses=[

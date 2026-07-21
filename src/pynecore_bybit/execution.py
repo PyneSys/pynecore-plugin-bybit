@@ -649,6 +649,37 @@ class _ExecutionMixin(_BybitBase):
             return round_price(intent.stop, market.tick_size_str)
         return None
 
+    def _stop_limit_dormancy_trigger(
+            self, intent: EntryIntent, market: InstrumentInfo,
+    ) -> Decimal | None:
+        """Trigger price that keeps a both-set stop-limit entry dormant.
+
+        A Pine ``strategy.entry(limit=, stop=)`` reaches this plugin as a
+        ``LIMIT`` entry that still carries the ``stop`` price; the engine arms
+        a software price-watch on the stop side. The native LIMIT leg is only
+        a safe resting order while it is *non-marketable* (the OCO pullback
+        leg: a buy limit below the market, a sell limit above it). When the
+        limit is on the marketable side — a genuine stop-limit whose limit
+        sits at or beyond the current price — a plain resting limit would fill
+        immediately, before the stop is ever crossed, opening the position at
+        the wrong time.
+
+        Return the rounded stop level so the caller can place the limit as a
+        native conditional (trigger) order that stays dormant until the stop
+        is crossed. Return ``None`` when the limit rests safely on its own (or
+        the current price is unknown), leaving the plain-limit path untouched.
+        """
+        if intent.stop is None or intent.limit is None:
+            return None
+        last = self._last_price
+        if last is None or last <= 0:
+            return None
+        limit = float(intent.limit)
+        marketable = limit >= last if intent.side == 'buy' else limit <= last
+        if not marketable:
+            return None
+        return round_price(intent.stop, market.tick_size_str)
+
     async def _place_entry_order(
             self, envelope: DispatchEnvelope, intent: EntryIntent,
             market: InstrumentInfo, qty: Decimal,
@@ -701,6 +732,24 @@ class _ExecutionMixin(_BybitBase):
             body['price'] = format_decimal(limit_price)
             body['timeInForce'] = 'GTC'
             price = limit_price
+            # Both-set stop-limit dormancy: a marketable limit would fill
+            # instantly as a plain resting order, before the stop trigger.
+            # Gate it behind a native conditional trigger at the stop level so
+            # it cannot execute until the stop is crossed. The engine's
+            # software STOP watch still owns the OCA cascade; its cancel
+            # disposition gate arbitrates the cross exactly as for a plain
+            # resting limit, so no double-fill race is introduced.
+            dormancy_trigger = self._stop_limit_dormancy_trigger(intent, market)
+            if dormancy_trigger is not None:
+                body['triggerPrice'] = format_decimal(dormancy_trigger)
+                if is_spot:
+                    body['orderFilter'] = 'StopOrder'
+                else:
+                    # A buy stop-limit triggers on a rise to the stop, a sell
+                    # stop-limit on a fall to it.
+                    body['triggerDirection'] = (TRIGGER_DIRECTION_RISE
+                                                if intent.side == 'buy'
+                                                else TRIGGER_DIRECTION_FALL)
         else:  # STOP — conditional market entry
             if intent.stop is None:
                 raise ExchangeOrderRejectedError(
@@ -1473,6 +1522,14 @@ class _ExecutionMixin(_BybitBase):
             limit_price = round_price(intent.limit, market.tick_size_str)
             body['price'] = format_decimal(limit_price)
             price = limit_price
+            # Keep a both-set stop-limit's dormancy trigger in step with the
+            # amended stop. If the order flipped between conditional and plain
+            # (e.g. the limit is no longer marketable), the amend endpoint
+            # rejects the mismatched field and ``_amend_or_none`` falls back to
+            # cancel+recreate, which re-evaluates dormancy cleanly.
+            dormancy_trigger = self._stop_limit_dormancy_trigger(intent, market)
+            if dormancy_trigger is not None:
+                body['triggerPrice'] = format_decimal(dormancy_trigger)
         elif intent.order_type is OrderType.STOP and intent.stop is not None:
             body['triggerPrice'] = format_decimal(
                 round_price(intent.stop, market.tick_size_str),
