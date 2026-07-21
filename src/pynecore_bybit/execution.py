@@ -668,6 +668,15 @@ class _ExecutionMixin(_BybitBase):
         native conditional (trigger) order that stays dormant until the stop
         is crossed. Return ``None`` when the limit rests safely on its own (or
         the current price is unknown), leaving the plain-limit path untouched.
+
+        Also return ``None`` when the stop is ALREADY crossed at submission —
+        a buy stop whose trigger sits at or below the current price, a sell
+        stop at or above it. Bybit refuses such a native trigger outright
+        (retCode 110092: "expect Rising, but trigger_price <= current"), which
+        would otherwise loop as a per-tick reject storm. An already-satisfied
+        stop is equivalent to its activated child: drop the trigger and let the
+        plain (marketable) limit go live immediately, exactly as the venue
+        would after activating the child order.
         """
         if intent.stop is None or intent.limit is None:
             return None
@@ -677,6 +686,13 @@ class _ExecutionMixin(_BybitBase):
         limit = float(intent.limit)
         marketable = limit >= last if intent.side == 'buy' else limit <= last
         if not marketable:
+            return None
+        stop = float(intent.stop)
+        # A buy trigger rises to the stop, a sell trigger falls to it; the
+        # condition is already met when the current price has reached the
+        # level, so no native trigger can rest — activate the limit now.
+        already_crossed = last >= stop if intent.side == 'buy' else last <= stop
+        if already_crossed:
             return None
         return round_price(intent.stop, market.tick_size_str)
 

@@ -289,6 +289,56 @@ def __test_bybit_both_set_stop_limit_stays_dormant__():
     assert 'triggerDirection' not in body
 
 
+def __test_bybit_already_crossed_stop_limit_activates_now__():
+    """An already-crossed stop-limit drops the trigger and goes live at once.
+
+    Regression: a Pine ``strategy.entry(stop=, limit=)`` whose stop is already
+    satisfied at submission (a buy stop at/below the current price, a sell stop
+    at/above it) cannot rest behind a native rising/falling trigger — Bybit
+    rejects it with retCode 110092 ("expect Rising, but trigger_price <=
+    current"), which used to loop as a per-tick reject storm. The activated
+    child is the plain marketable limit, so the trigger must be dropped and the
+    limit sent live immediately.
+    """
+    # Linear BUY: stop 1939.78 BELOW the market 1941.72 -> already crossed.
+    plugin = _linear_plugin(responses=[{'orderId': '751'}])
+    plugin._last_price = 1941.72
+    orders = asyncio.run(plugin.execute_entry(_entry_envelope(
+        side='buy', qty=0.01, order_type=OrderType.LIMIT,
+        stop=1939.78, limit=1943.68,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['orderType'] == 'Limit'
+    assert body['price'] == '1943.7'  # snapped to the 0.10 linear grid
+    assert 'triggerPrice' not in body
+    assert 'triggerDirection' not in body
+    assert orders[0].id == '751'
+
+    # Linear SELL: stop 2100 ABOVE the market 2099 -> already crossed.
+    plugin = _linear_plugin(responses=[{'orderId': '752'}])
+    plugin._last_price = 2099.0
+    asyncio.run(plugin.execute_entry(_entry_envelope(
+        side='sell', qty=0.01, order_type=OrderType.LIMIT,
+        stop=2100.0, limit=2095.0,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['orderType'] == 'Limit'
+    assert 'triggerPrice' not in body
+    assert 'triggerDirection' not in body
+
+    # Spot BUY already crossed: plain limit, no StopOrder filter.
+    plugin = _FakeBrokerBybit(responses=[{'orderId': '753'}])
+    plugin._last_price = 1941.72
+    asyncio.run(plugin.execute_entry(_entry_envelope(
+        side='buy', qty=0.01, order_type=OrderType.LIMIT,
+        stop=1939.78, limit=1943.68,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['orderType'] == 'Limit'
+    assert 'triggerPrice' not in body
+    assert 'orderFilter' not in body
+
+
 def __test_bybit_both_set_stop_limit_amend_keeps_trigger__():
     """Amending a dormant stop-limit keeps its trigger in step with the stop."""
     plugin = _linear_plugin(responses=[{'orderId': '801'}])
