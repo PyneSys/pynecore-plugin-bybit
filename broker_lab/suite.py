@@ -2,7 +2,9 @@
 
 from typing import Any
 
-from pynecore.core.broker.models import LegType
+from dataclasses import replace
+
+from pynecore.core.broker.models import LegType, OrderStatus
 from pynecore.testing.broker_lab import Scenario, Step, pairwise_cases
 from pynecore.testing.broker_lab.reference import (
     ReferenceVenueProfile,
@@ -35,6 +37,50 @@ def _linear_instrument() -> InstrumentInfo:
     )
 
 
+def _spot_instrument() -> InstrumentInfo:
+    return InstrumentInfo(
+        category="spot",
+        symbol="BTCUSDT",
+        base_coin="BTC",
+        quote_coin="USDT",
+        settle_coin="",
+        status="Trading",
+        tick_size_str="0.01",
+        tick_size=0.01,
+        qty_step_str="0.000001",
+        qty_step=0.000001,
+        min_order_qty=0.0,
+        min_order_amt=5.0,
+        min_notional=0.0,
+        max_limit_order_qty=100.0,
+        max_market_order_qty=50.0,
+        contract_type="",
+        delivery_time=None,
+    )
+
+
+def _inverse_instrument() -> InstrumentInfo:
+    return InstrumentInfo(
+        category="inverse",
+        symbol="BTCUSD",
+        base_coin="BTC",
+        quote_coin="USD",
+        settle_coin="BTC",
+        status="Trading",
+        tick_size_str="0.10",
+        tick_size=0.1,
+        qty_step_str="1",
+        qty_step=1.0,
+        min_order_qty=1.0,
+        min_order_amt=0.0,
+        min_notional=5.0,
+        max_limit_order_qty=1_000_000.0,
+        max_market_order_qty=1_000_000.0,
+        contract_type="InversePerpetual",
+        delivery_time=None,
+    )
+
+
 class OfflineBybit(Bybit):
     """Real Bybit execution code with an in-memory REST transport."""
 
@@ -47,7 +93,7 @@ class OfflineBybit(Bybit):
         self.profile = profile
         self.run_name = run_name
         self.store_ctx = store_ctx
-        self._market = _linear_instrument()
+        self._market = profile.market
         self._broker_started = True
         self._position_mode = POSITION_MODE_ONE_WAY
         self.rest_calls: list[tuple[str, dict[str, Any]]] = []
@@ -83,10 +129,45 @@ class OfflineBybit(Bybit):
                 "createdTime": "1700000000000",
             }
             return {"orderId": order_id, "orderLinkId": payload.get("orderLinkId")}
+        if endpoint == "/v5/order/amend":
+            coid = payload["orderLinkId"]
+            raw = next(
+                order
+                for order in self.profile.raw_orders.values()
+                if order["orderLinkId"] == coid
+            )
+            raw["qty"] = payload.get("qty", raw["qty"])
+            raw["price"] = payload.get("price", raw["price"])
+            raw["triggerPrice"] = payload.get("triggerPrice", raw["triggerPrice"])
+            return {"orderId": raw["orderId"], "orderLinkId": coid}
+        if endpoint == "/v5/order/cancel":
+            coid = payload.get("orderLinkId")
+            order_id = payload.get("orderId")
+            raw = next(
+                order
+                for order in self.profile.raw_orders.values()
+                if (coid is not None and order["orderLinkId"] == coid)
+                or (order_id is not None and order["orderId"] == order_id)
+            )
+            if raw["orderStatus"] != "Filled":
+                raw["orderStatus"] = "Cancelled"
+            return {"orderId": raw["orderId"], "orderLinkId": raw["orderLinkId"]}
         if endpoint == "/v5/order/realtime":
-            return {"list": list(self.profile.raw_orders.values()), "nextPageCursor": ""}
+            return {
+                "list": [
+                    order
+                    for order in self.profile.raw_orders.values()
+                    if order["orderStatus"] not in ("Cancelled", "Filled")
+                ],
+                "nextPageCursor": "",
+            }
+        if endpoint == "/v5/order/history":
+            return {
+                "list": list(self.profile.raw_orders.values()),
+                "nextPageCursor": "",
+            }
         if endpoint == "/v5/position/list":
-            size = self.profile.state.positions.get(self.run_name, 0.0)
+            size = self.profile.state.position
             return {
                 "list": [
                     {
@@ -121,23 +202,76 @@ class OfflineBybit(Bybit):
                 pine_id=envelope.intent.pine_id,
                 leg_type=LegType.ENTRY,
                 intent_key=envelope.intent.intent_key,
+                from_entry=None,
             )
-        self.profile.state.calls.append((self.run_name, "entry", envelope.intent.intent_key))
+        self.profile.state.calls.append(
+            (self.run_name, "entry", envelope.intent.intent_key)
+        )
         return orders
 
     async def execute_exit(self, envelope):
         orders = await super().execute_exit(envelope)
+        self._mirror_exit_orders(envelope, orders)
+        self.profile.state.calls.append(
+            (self.run_name, "exit", envelope.intent.intent_key)
+        )
+        return orders
+
+    def _mirror_exit_orders(self, envelope, orders):
         for order in orders:
-            leg_type = LegType.STOP_LOSS if order.stop_price is not None else LegType.TAKE_PROFIT
+            leg_type = (
+                LegType.STOP_LOSS
+                if order.stop_price is not None
+                else LegType.TAKE_PROFIT
+            )
             self.profile.state.orders[order.id] = VenueOrder(
                 order=order,
                 run_name=self.run_name,
                 pine_id=envelope.intent.pine_id,
                 leg_type=leg_type,
                 intent_key=envelope.intent.intent_key,
+                from_entry=envelope.intent.from_entry,
             )
-        self.profile.state.calls.append((self.run_name, "exit", envelope.intent.intent_key))
+
+    async def modify_exit(self, old, new):
+        orders = await super().modify_exit(old, new)
+        self._mirror_exit_orders(new, orders)
         return orders
+
+    async def execute_close(self, envelope):
+        order = await super().execute_close(envelope)
+        self.profile.state.orders[order.id] = VenueOrder(
+            order=order,
+            run_name=self.run_name,
+            pine_id=envelope.intent.pine_id,
+            leg_type=LegType.CLOSE,
+            intent_key=envelope.intent.intent_key,
+            from_entry=envelope.intent.pine_id,
+        )
+        self.profile.state.calls.append(
+            (self.run_name, "close", envelope.intent.intent_key)
+        )
+        return order
+
+    async def execute_cancel(self, envelope):
+        result = await super().execute_cancel(envelope)
+        intent = envelope.intent
+        for record in self.profile.state.orders.values():
+            if (
+                record.run_name == self.run_name
+                and record.pine_id == intent.pine_id
+                and (
+                    intent.from_entry is None or record.from_entry == intent.from_entry
+                )
+                and record.order.status
+                in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+            ):
+                record.order = replace(
+                    record.order,
+                    status=OrderStatus.CANCELLED,
+                    remaining_qty=0.0,
+                )
+        return result
 
 
 class BybitProfile(ReferenceVenueProfile):
@@ -149,6 +283,7 @@ class BybitProfile(ReferenceVenueProfile):
 
     def __init__(self) -> None:
         super().__init__()
+        self.market = _linear_instrument()
         self.transport_calls: list[tuple[str, dict[str, Any]]] = []
         self.raw_orders: dict[str, dict[str, Any]] = {}
 
@@ -156,22 +291,317 @@ class BybitProfile(ReferenceVenueProfile):
         return OfflineBybit(self, run_name, store_ctx)
 
     def handle_step(self, runner: Any, step: Step) -> bool:
+        if step.kind == "set_bybit_last_price":
+            runner.runs[step.run].broker._last_price = float(step.values["price"])
+            return True
         if step.kind == "expect_bybit_request":
-            requests = [body for endpoint, body in self.transport_calls if endpoint == "/v5/order/create"]
+            requests = [
+                body
+                for endpoint, body in self.transport_calls
+                if endpoint == "/v5/order/create"
+            ]
             if not requests:
                 raise AssertionError("Bybit did not issue an order request")
             body = requests[-1]
             for key, value in step.values.items():
                 if body.get(key) != value:
-                    raise AssertionError(f"expected Bybit request {key}={value!r}, got {body.get(key)!r}")
+                    raise AssertionError(
+                        f"expected Bybit request {key}={value!r}, got {body.get(key)!r}"
+                    )
+            return True
+        if step.kind == "expect_bybit_request_absent":
+            requests = [
+                body
+                for endpoint, body in self.transport_calls
+                if endpoint == "/v5/order/create"
+            ]
+            if not requests:
+                raise AssertionError("Bybit did not issue an order request")
+            body = requests[-1]
+            unexpected = [key for key in step.values["keys"] if key in body]
+            if unexpected:
+                raise AssertionError(
+                    f"expected Bybit request to omit {unexpected}, got {body}"
+                )
             return True
         if step.kind == "expect_bybit_create_count":
-            actual = sum(endpoint == "/v5/order/create" for endpoint, _ in self.transport_calls)
+            actual = sum(
+                endpoint == "/v5/order/create" for endpoint, _ in self.transport_calls
+            )
             expected = int(step.values["count"])
             if actual != expected:
                 raise AssertionError(f"expected {expected} Bybit creates, got {actual}")
             return True
+        if step.kind == "expect_bybit_endpoint_count":
+            endpoint = str(step.values["endpoint"])
+            actual = sum(
+                call_endpoint == endpoint for call_endpoint, _ in self.transport_calls
+            )
+            expected = int(step.values["count"])
+            if actual != expected:
+                raise AssertionError(
+                    f"expected {expected} Bybit {endpoint} calls, got {actual}"
+                )
+            return True
+        if step.kind == "expect_bybit_order_state":
+            pine_id = str(step.values["id"])
+            matching = [
+                raw
+                for raw in self.raw_orders.values()
+                if any(
+                    record.order.id == raw["orderId"] and record.pine_id == pine_id
+                    for record in self.state.orders.values()
+                )
+            ]
+            if len(matching) != 1:
+                raise AssertionError(
+                    f"expected one Bybit order for {pine_id!r}, got {matching}"
+                )
+            raw = matching[0]
+            for key, value in step.values.items():
+                if key == "id":
+                    continue
+                if raw.get(key) != value:
+                    raise AssertionError(
+                        f"expected Bybit {pine_id!r} {key}={value!r}, got {raw.get(key)!r}"
+                    )
+            return True
+        if step.kind == "expect_bybit_bracket_outcome_swept":
+            bracket = [
+                order
+                for order in self.raw_orders.values()
+                if order.get("reduceOnly") is True
+            ]
+            statuses = sorted(order["orderStatus"] for order in bracket)
+            if statuses != ["Cancelled", "Filled"]:
+                raise AssertionError(
+                    f"expected one filled Bybit leg and one cancelled sibling, got {statuses}"
+                )
+            return True
+        if step.kind == "expect_bybit_active_bracket":
+            expected_tp = float(step.values["tp"])
+            expected_sl = float(step.values["sl"])
+            records = [
+                record
+                for record in self.state.orders.values()
+                if record.from_entry == step.values["from_entry"]
+                and record.order.status is OrderStatus.OPEN
+                and record.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS)
+            ]
+            tp = [
+                record for record in records if record.leg_type is LegType.TAKE_PROFIT
+            ]
+            sl = [record for record in records if record.leg_type is LegType.STOP_LOSS]
+            if len(tp) != 1 or len(sl) != 1:
+                raise AssertionError(f"expected one active TP and SL, got {records}")
+            if (
+                tp[0].order.price != expected_tp
+                or sl[0].order.stop_price != expected_sl
+            ):
+                raise AssertionError(
+                    f"expected Bybit bracket TP={expected_tp} SL={expected_sl}, "
+                    f"got TP={tp[0].order.price} SL={sl[0].order.stop_price}"
+                )
+            return True
+        if step.kind == "expect_bybit_bracket_coverage":
+            expected_qty = float(step.values["qty"])
+            records = [
+                record
+                for record in self.state.orders.values()
+                if record.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS)
+            ]
+            if len(records) != 4:
+                raise AssertionError(
+                    f"expected four physical Bybit bracket legs, got {len(records)}"
+                )
+            if len({record.order.id for record in records}) != 4:
+                raise AssertionError(
+                    "Bybit bracket legs do not have distinct physical identities"
+                )
+            if len({record.order.client_order_id for record in records}) != 4:
+                raise AssertionError(
+                    "Bybit bracket legs do not have distinct client order ids"
+                )
+            for from_entry in ("A", "B"):
+                parent = [
+                    record for record in records if record.from_entry == from_entry
+                ]
+                if {record.leg_type for record in parent} != {
+                    LegType.TAKE_PROFIT,
+                    LegType.STOP_LOSS,
+                }:
+                    raise AssertionError(
+                        f"Bybit parent {from_entry!r} does not have distinct TP and SL legs"
+                    )
+                for outcome in (LegType.TAKE_PROFIT, LegType.STOP_LOSS):
+                    coverage = sum(
+                        record.order.remaining_qty
+                        for record in parent
+                        if record.leg_type is outcome
+                    )
+                    if abs(coverage - expected_qty) > 1e-9:
+                        raise AssertionError(
+                            f"Bybit {outcome.value} coverage for {from_entry!r} "
+                            f"is {coverage}, expected {expected_qty}"
+                        )
+            return True
+        if step.kind == "fill_bybit_bracket_leg":
+            leg_type = (
+                LegType.TAKE_PROFIT if step.values["leg"] == "tp" else LegType.STOP_LOSS
+            )
+            candidates = [
+                record
+                for record in self.state.orders.values()
+                if record.run_name == step.run
+                and record.leg_type is leg_type
+                and record.order.status is OrderStatus.OPEN
+            ]
+            if len(candidates) != 1:
+                raise AssertionError(
+                    f"expected one open Bybit {step.values['leg']} leg, got {candidates}"
+                )
+            record = candidates[0]
+            raw = self.raw_orders[record.order.id]
+            raw["orderStatus"] = "Filled"
+            raw["cumExecQty"] = raw["qty"]
+            raw["avgPrice"] = str(step.values.get("price", 110.0))
+            runtime = runner.runs[step.run]
+            runtime.broker._translate_private_frame(
+                {
+                    "topic": "position",
+                    "data": [
+                        {
+                            "category": "linear",
+                            "symbol": self.symbol,
+                            "positionIdx": 0,
+                            "size": "0",
+                            "side": "",
+                            "updatedTime": "1700000002000",
+                        }
+                    ],
+                },
+                runtime.broker._market,
+            )
+            events = runtime.broker._translate_private_frame(
+                {
+                    "topic": "execution",
+                    "data": [
+                        {
+                            "category": "linear",
+                            "symbol": self.symbol,
+                            "execType": "Trade",
+                            "execId": f"exec-{record.order.id}",
+                            "orderLinkId": raw["orderLinkId"],
+                            "orderId": record.order.id,
+                            "side": raw["side"],
+                            "execQty": raw["qty"],
+                            "execPrice": raw["avgPrice"],
+                            "execFee": "0",
+                            "execTime": "1700000001000",
+                        }
+                    ],
+                },
+                runtime.broker._market,
+            )
+            if len(events) != 1:
+                raise AssertionError(
+                    f"Bybit private WS did not emit one fill: {events}"
+                )
+            record.order = events[0].order
+            self.state.position_owners[step.run] = 0.0
+            self.state.position = sum(self.state.position_owners.values())
+            self.state.pending_events.append((step.run, events[0]))
+            return True
+        if step.kind == "fill_bybit_entry":
+            pine_id = str(step.values["id"])
+            candidates = [
+                record
+                for record in self.state.orders.values()
+                if record.run_name == step.run
+                and record.pine_id == pine_id
+                and record.leg_type is LegType.ENTRY
+                and record.order.status
+                in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+            ]
+            if len(candidates) != 1:
+                raise AssertionError(
+                    f"expected one open Bybit entry {pine_id!r}, got {candidates}"
+                )
+            record = candidates[0]
+            raw = self.raw_orders[record.order.id]
+            fill_qty = float(step.values.get("qty", record.order.remaining_qty))
+            cumulative = float(raw["cumExecQty"]) + fill_qty
+            raw["cumExecQty"] = str(cumulative)
+            raw["avgPrice"] = str(step.values.get("price", 100.0))
+            raw["orderStatus"] = (
+                "Filled"
+                if cumulative >= float(raw["qty"]) - 1e-12
+                else "PartiallyFilled"
+            )
+            runtime = runner.runs[step.run]
+            events = runtime.broker._translate_private_frame(
+                {
+                    "topic": "execution",
+                    "data": [
+                        {
+                            "category": runtime.broker._market.category,
+                            "symbol": self.symbol,
+                            "execType": "Trade",
+                            "execId": str(
+                                step.values.get(
+                                    "fill_id", f"exec-{pine_id}-{cumulative}"
+                                )
+                            ),
+                            "orderLinkId": raw["orderLinkId"],
+                            "orderId": record.order.id,
+                            "side": raw["side"],
+                            "execQty": str(fill_qty),
+                            "execPrice": raw["avgPrice"],
+                            "execFee": "0",
+                            "execTime": "1700000001000",
+                        }
+                    ],
+                },
+                runtime.broker._market,
+            )
+            if len(events) != 1:
+                raise AssertionError(
+                    f"Bybit private WS did not emit one entry fill: {events}"
+                )
+            record.order = events[0].order
+            signed = (
+                events[0].fill_qty
+                if record.order.side == "buy"
+                else -events[0].fill_qty
+            )
+            self.state.position_owners[step.run] = (
+                self.state.position_owners.get(step.run, 0.0) + signed
+            )
+            self.state.position = sum(self.state.position_owners.values())
+            self.state.pending_events.append((step.run, events[0]))
+            return True
         return super().handle_step(runner, step)
+
+
+class SpotBybitProfile(BybitProfile):
+    """Spot request-denomination profile using the real execution mapper."""
+
+    quantity_step = 0.000001
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.market = _spot_instrument()
+
+
+class InverseBybitProfile(BybitProfile):
+    """Inverse-contract profile using a deterministic conversion anchor."""
+
+    symbol = "BTCUSD"
+    quantity_step = 0.00001
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.market = _inverse_instrument()
 
 
 def smoke_scenarios(seed: int = 0) -> list[Scenario]:
@@ -187,6 +617,126 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                     "expect_bybit_request",
                     values={"orderType": "Market", "side": "Buy", "qty": "0.1"},
                 ),
+            ),
+        ),
+        Scenario(
+            name="bybit-spot-market-entry-uses-base-coin-denomination",
+            profile_factory=SpotBybitProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "S", "side": "buy", "qty": 0.0015}),
+                Step("sync", values={"last_price": 100_000.0}),
+                Step(
+                    "expect_bybit_request",
+                    values={
+                        "category": "spot",
+                        "symbol": "BTCUSDT",
+                        "qty": "0.0015",
+                        "marketUnit": "baseCoin",
+                        "isLeverage": 0,
+                    },
+                ),
+            ),
+        ),
+        Scenario(
+            name="bybit-inverse-market-entry-uses-contract-denomination-and-anchor",
+            profile_factory=InverseBybitProfile,
+            seed=seed,
+            steps=(
+                Step("set_bybit_last_price", values={"price": 100_000.0}),
+                Step("entry", values={"id": "I", "side": "buy", "qty": 0.0015}),
+                Step("sync", values={"last_price": 100_000.0}),
+                Step(
+                    "expect_bybit_request",
+                    values={"category": "inverse", "symbol": "BTCUSD", "qty": "150"},
+                ),
+                Step(
+                    "expect_bybit_request_absent",
+                    values={"keys": ["marketUnit", "isLeverage"]},
+                ),
+            ),
+        ),
+        Scenario(
+            name="bybit-strategy-order-oca-cancel-sweeps-sibling-once",
+            profile_factory=BybitProfile,
+            seed=seed,
+            steps=(
+                Step(
+                    "entry",
+                    values={
+                        "id": "A",
+                        "qty": 0.1,
+                        "limit": 90.0,
+                        "oca_name": "pair",
+                        "oca_type": "cancel",
+                    },
+                ),
+                Step(
+                    "entry",
+                    values={
+                        "id": "B",
+                        "qty": 0.1,
+                        "limit": 89.0,
+                        "oca_name": "pair",
+                        "oca_type": "cancel",
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step("fill_bybit_entry", values={"id": "A", "qty": 0.1}),
+                Step("deliver"),
+                Step(
+                    "expect_bybit_endpoint_count",
+                    values={
+                        "endpoint": "/v5/order/cancel",
+                        "count": 1,
+                    },
+                ),
+                Step(
+                    "expect_bybit_order_state",
+                    values={
+                        "id": "B",
+                        "orderStatus": "Cancelled",
+                    },
+                ),
+            ),
+        ),
+        Scenario(
+            name="bybit-strategy-order-oca-reduce-amends-sibling-once",
+            profile_factory=BybitProfile,
+            seed=seed,
+            steps=(
+                Step(
+                    "entry",
+                    values={
+                        "id": "A",
+                        "qty": 0.1,
+                        "limit": 90.0,
+                        "oca_name": "pair",
+                        "oca_type": "reduce",
+                    },
+                ),
+                Step(
+                    "entry",
+                    values={
+                        "id": "B",
+                        "qty": 0.1,
+                        "limit": 89.0,
+                        "oca_name": "pair",
+                        "oca_type": "reduce",
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step("fill_bybit_entry", values={"id": "A", "qty": 0.04}),
+                Step("duplicate_event", check_invariants=False),
+                Step("deliver"),
+                Step(
+                    "expect_bybit_endpoint_count",
+                    values={
+                        "endpoint": "/v5/order/amend",
+                        "count": 1,
+                    },
+                ),
+                Step("expect_bybit_order_state", values={"id": "B", "qty": "0.06"}),
             ),
         ),
         Scenario(
@@ -233,7 +783,149 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             ),
         ),
         Scenario(
-            name="bybit-global-bracket-creates-two-physical-legs",
+            name="bybit-two-entry-global-bracket-creates-four-physical-legs",
+            profile_factory=BybitProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "A", "side": "buy", "qty": 0.01}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("fill", check_invariants=False),
+                Step("deliver"),
+                Step("entry", values={"id": "B", "side": "buy", "qty": 0.01}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("fill", check_invariants=False),
+                Step("deliver"),
+                Step(
+                    "exit",
+                    values={
+                        "id": "X",
+                        "from_entry": "A",
+                        "side": "sell",
+                        "qty": 0.01,
+                        "limit": 110.0,
+                        "stop": 90.0,
+                    },
+                ),
+                Step(
+                    "exit",
+                    values={
+                        "id": "X",
+                        "from_entry": "B",
+                        "side": "sell",
+                        "qty": 0.01,
+                        "limit": 110.0,
+                        "stop": 90.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step("expect_bybit_create_count", values={"count": 6}),
+                Step("expect_bybit_bracket_coverage", values={"qty": 0.01}),
+            ),
+        ),
+        Scenario(
+            name="bybit-buy-stop-limit-stays-dormant-until-rising-trigger",
+            profile_factory=BybitProfile,
+            seed=seed,
+            steps=(
+                Step("set_bybit_last_price", values={"price": 100.0}),
+                Step(
+                    "entry",
+                    values={
+                        "id": "BSL",
+                        "side": "buy",
+                        "qty": 0.1,
+                        "limit": 110.0,
+                        "stop": 105.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "expect_bybit_request",
+                    values={
+                        "orderType": "Limit",
+                        "price": "110",
+                        "triggerPrice": "105",
+                        "triggerDirection": 1,
+                    },
+                ),
+            ),
+        ),
+        Scenario(
+            name="bybit-sell-stop-limit-stays-dormant-until-falling-trigger",
+            profile_factory=BybitProfile,
+            seed=seed,
+            steps=(
+                Step("set_bybit_last_price", values={"price": 100.0}),
+                Step(
+                    "entry",
+                    values={
+                        "id": "SSL",
+                        "side": "sell",
+                        "qty": 0.1,
+                        "limit": 90.0,
+                        "stop": 95.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "expect_bybit_request",
+                    values={
+                        "orderType": "Limit",
+                        "price": "90",
+                        "triggerPrice": "95",
+                        "triggerDirection": 2,
+                    },
+                ),
+            ),
+        ),
+        Scenario(
+            name="bybit-already-crossed-buy-stop-limit-drops-trigger",
+            profile_factory=BybitProfile,
+            seed=seed,
+            steps=(
+                Step("set_bybit_last_price", values={"price": 100.0}),
+                Step(
+                    "entry",
+                    values={
+                        "id": "BC",
+                        "side": "buy",
+                        "qty": 0.1,
+                        "limit": 105.0,
+                        "stop": 95.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "expect_bybit_request_absent",
+                    values={"keys": ["triggerPrice", "triggerDirection"]},
+                ),
+            ),
+        ),
+        Scenario(
+            name="bybit-already-crossed-sell-stop-limit-drops-trigger",
+            profile_factory=BybitProfile,
+            seed=seed,
+            steps=(
+                Step("set_bybit_last_price", values={"price": 100.0}),
+                Step(
+                    "entry",
+                    values={
+                        "id": "SC",
+                        "side": "sell",
+                        "qty": 0.1,
+                        "limit": 95.0,
+                        "stop": 105.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "expect_bybit_request_absent",
+                    values={"keys": ["triggerPrice", "triggerDirection"]},
+                ),
+            ),
+        ),
+        Scenario(
+            name="bybit-bracket-amend-and-cancel-retains-no-orphan-leg",
             profile_factory=BybitProfile,
             seed=seed,
             steps=(
@@ -253,7 +945,121 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                     },
                 ),
                 Step("sync", values={"last_price": 100.0}),
-                Step("expect_bybit_create_count", values={"count": 3}),
+                Step(
+                    "amend_exit",
+                    values={
+                        "id": "X",
+                        "from_entry": "L",
+                        "limit": 111.0,
+                        "stop": 89.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "expect_bybit_endpoint_count",
+                    values={"endpoint": "/v5/order/amend", "count": 2},
+                ),
+                Step(
+                    "expect_bybit_active_bracket",
+                    values={"from_entry": "L", "tp": 111.0, "sl": 89.0},
+                ),
+                Step("cancel", values={"id": "X"}),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "expect_bybit_endpoint_count",
+                    values={"endpoint": "/v5/order/cancel", "count": 2},
+                ),
+                Step("expect", values={"open_orders": 0}),
+            ),
+        ),
+        Scenario(
+            name="bybit-filled-bracket-leg-cancels-reduce-only-sibling",
+            profile_factory=BybitProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "L", "side": "buy", "qty": 0.1}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("fill", check_invariants=False),
+                Step("deliver"),
+                Step(
+                    "exit",
+                    values={
+                        "id": "X",
+                        "from_entry": "L",
+                        "side": "sell",
+                        "qty": 0.1,
+                        "limit": 110.0,
+                        "stop": 90.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "fill_bybit_bracket_leg",
+                    values={"leg": "tp", "price": 110.0},
+                    check_invariants=False,
+                ),
+                Step("deliver", check_invariants=False),
+                Step("sync", values={"last_price": 110.0}),
+                Step(
+                    "expect_bybit_endpoint_count",
+                    values={"endpoint": "/v5/order/cancel", "count": 2},
+                ),
+                Step("expect_bybit_bracket_outcome_swept"),
+                Step(
+                    "expect",
+                    values={"position": 0.0, "engine_position": 0.0, "open_orders": 0},
+                ),
+            ),
+        ),
+        Scenario(
+            name="bybit-concurrent-runs-restart-and-close-only-owned-exposure",
+            profile_factory=BybitProfile,
+            runs=("A", "B"),
+            seed=seed,
+            steps=(
+                Step("entry", run="A", values={"id": "A", "side": "buy", "qty": 0.1}),
+                Step("sync", run="A", values={"last_price": 100.0}),
+                Step("fill", run="A", check_invariants=False),
+                Step("deliver", run="A"),
+                Step("restart", run="B", check_invariants=False),
+                Step(
+                    "expect", run="B", values={"position": 0.0, "engine_position": 0.0}
+                ),
+                Step("entry", run="B", values={"id": "B", "side": "buy", "qty": 0.1}),
+                Step("sync", run="B", values={"last_price": 100.0}),
+                Step("fill", run="B", check_invariants=False),
+                Step("deliver", run="B"),
+                Step("restart", run="A", check_invariants=False),
+                Step(
+                    "expect",
+                    run="A",
+                    values={
+                        "position": 0.1,
+                        "engine_position": 0.1,
+                        "account_position": 0.2,
+                    },
+                ),
+                Step(
+                    "expect", run="B", values={"position": 0.1, "engine_position": 0.1}
+                ),
+                Step(
+                    "close", run="A", values={"id": "A", "from_entry": "A", "qty": 0.1}
+                ),
+                Step("sync", run="A", values={"last_price": 100.0}),
+                Step("fill", run="A", check_invariants=False),
+                Step("deliver", run="A"),
+                Step(
+                    "expect",
+                    run="A",
+                    values={
+                        "position": 0.0,
+                        "engine_position": 0.0,
+                        "account_position": 0.1,
+                    },
+                ),
+                Step(
+                    "expect", run="B", values={"position": 0.1, "engine_position": 0.1}
+                ),
             ),
         ),
     ]
@@ -272,7 +1078,10 @@ def extended_scenarios(seed: int = 0) -> list[Scenario]:
             values["limit"] = 90.0 if case["side"] == "buy" else 110.0
         elif case["order"] == "stop":
             values["stop"] = 110.0 if case["side"] == "buy" else 90.0
-        steps = [Step("entry", values=values), Step("sync", values={"last_price": 100.0})]
+        steps = [
+            Step("entry", values=values),
+            Step("sync", values={"last_price": 100.0}),
+        ]
         if case["restart"]:
             steps.extend(
                 (
