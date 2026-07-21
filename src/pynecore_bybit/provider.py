@@ -230,7 +230,6 @@ class _ProviderMixin(_BybitBase):
         All Bybit categories trade 24/7 (dated futures too — crypto has no
         exchange sessions), so the schedule is the flat 24/7 template.
         """
-        assert self.timeframe is not None, "Bybit.timeframe must be set before update_symbol_info"
         market = self._get_market()
         if market.status != 'Trading':
             raise BybitSymbolError(
@@ -267,7 +266,7 @@ class _ProviderMixin(_BybitBase):
             ticker=ticker,
             currency=market.quote_coin,
             basecurrency=market.base_coin or None,
-            period=self.timeframe,
+            period=self.timeframe or "1D",
             type=_syminfo_type_for(market),
             # Kline volume is base-denominated for spot and linear, but
             # QUOTE-denominated (whole-USD contracts) for inverse contracts
