@@ -74,6 +74,7 @@ from .helpers import (
     PRIVATE_WS_TOPICS,
     RECONCILE_CADENCE_S,
 )
+from .positions import POSITION_MODE_HEDGE
 from .state import parse_exchange_order
 from .ws import BybitWebSocket
 
@@ -439,6 +440,53 @@ class _EventStreamMixin(_BybitBase):
                 if row.intent_key:
                     self.store_ctx.record_complete(row.intent_key)
 
+    def _reduce_hedge_entry_ownership(self, side: str, qty: float) -> None:
+        """Apply one filled hedge close to this run's durable entry rows.
+
+        Hedge-mode ownership cannot be reconstructed from Bybit's two
+        account-wide aggregate legs. Entry rows therefore carry the run-owned
+        slice across restart. A reversal is non-flat after its residual opens,
+        so the ordinary flat sweep cannot retire the entry rows consumed by
+        its close leg; leaving them live would cancel the new opposite entry
+        out of the durable signed sum on the next restart.
+
+        Consume the opposite-side entry rows FIFO. A partial reduction shrinks
+        the row to its residual owned quantity; a full reduction retires only
+        that physical row. It deliberately does not complete the shared intent
+        key because a same-ID reversal may already own a fresh residual entry
+        envelope under that key.
+        """
+        if (self.store_ctx is None
+                or self._position_mode != POSITION_MODE_HEDGE
+                or qty <= 0.0):
+            return
+        entry_side = 'buy' if side == 'sell' else 'sell'
+        remaining = qty
+        rows = sorted(
+            (
+                row for row in self.store_ctx.iter_live_orders()
+                if row.side == entry_side
+                and (row.extras or {}).get('kind')
+                in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)
+                and row.filled_qty > _FILL_EPS
+            ),
+            key=lambda row: row.created_ts_ms,
+        )
+        for row in rows:
+            if remaining <= _FILL_EPS:
+                break
+            consumed = min(remaining, row.filled_qty)
+            residual = row.filled_qty - consumed
+            if residual <= _FILL_EPS:
+                self.store_ctx.close_order(row.client_order_id)
+            else:
+                self.store_ctx.upsert_order(
+                    row.client_order_id,
+                    qty=residual,
+                    filled_qty=residual,
+                )
+            remaining -= consumed
+
     def _fill_event(
             self, entry: dict, market: 'InstrumentInfo', *,
             coid: str, pine_id: str | None, from_entry: str | None,
@@ -536,6 +584,8 @@ class _EventStreamMixin(_BybitBase):
             # :meth:`_close_entry_rows_when_flat` closes them once the
             # ledger position is gone.
             self.store_ctx.close_order(coid)
+        if leg_type is LegType.CLOSE:
+            self._reduce_hedge_entry_ownership(side, exec_qty)
         order = ExchangeOrder(
             id=order_id,
             symbol=self.symbol or market.symbol,

@@ -56,6 +56,7 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_WORKING,
     PENDING_DISPATCH_STATES,
 )
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from ._base import _BybitBase
 from .exceptions import (
@@ -188,9 +189,64 @@ class _PositionsMixin(_BybitBase):
         sizes = self._deriv_sizes
         if sizes is None:
             return False
+        if self._position_mode == POSITION_MODE_HEDGE and self.store_ctx is not None:
+            return (
+                abs(self._run_owned_hedge_signed_size()) <= _FILL_EPS
+                and self._deriv_snapshot_ms >= self._last_own_fill_ms
+            )
         if not all(size <= 0.0 for size in sizes.values()):
             return False
         return self._deriv_snapshot_ms >= self._last_own_fill_ms
+
+    def _run_owned_hedge_signed_size(self) -> float:
+        """Return this run's signed hedge exposure from its durable fills.
+
+        Bybit exposes one aggregate Buy row and one aggregate Sell row for the
+        whole account. Those rows can include positions opened by another bot
+        run or manually, so they are not an ownership boundary. The run's
+        persisted fill cursors are the only attributable source: entry fills
+        add exposure and filled close rows subtract it. Startup-adopted foreign
+        rows are deliberately excluded.
+        """
+        if self.store_ctx is None:
+            return 0.0
+        owned = 0.0
+        for row in self.store_ctx.iter_live_orders():
+            if (row.extras or {}).get(ADOPTED_STARTUP_EXTRA_KEY):
+                continue
+            filled = float(row.filled_qty)
+            if filled <= 0.0:
+                continue
+            owned += filled if row.side == 'buy' else -filled
+        return owned
+
+    def _scope_hedge_rows_to_run(self, rows: list[dict]) -> list[dict]:
+        """Project account hedge rows onto the exposure owned by this run.
+
+        A fresh run must see no tradable leg even when the account already
+        carries a foreign hedge position. A restarted run sees only its own
+        signed slice, bounded by the matching physical Bybit leg so stale
+        journal state can never authorize an oversized reduction. Store-less
+        unit paths retain the raw account view because they have no ownership
+        ledger to consult.
+        """
+        if self.store_ctx is None:
+            return rows
+        owned = self._run_owned_hedge_signed_size()
+        if abs(owned) <= _FILL_EPS:
+            return []
+        wanted_idx = HEDGE_IDX_BUY if owned > 0.0 else HEDGE_IDX_SELL
+        for row in rows:
+            if int(row.get('positionIdx') or 0) != wanted_idx:
+                continue
+            physical = self._position_row_size(row)
+            scoped = min(abs(owned), physical)
+            if scoped <= _FILL_EPS:
+                return []
+            projected = dict(row)
+            projected['size'] = format_decimal(Decimal(str(scoped)))
+            return [projected]
+        return []
 
     async def _fetch_deriv_position(
             self, market: InstrumentInfo,
@@ -616,6 +672,7 @@ class _PositionsMixin(_BybitBase):
         rows = await self._fetch_position_rows(market)
         self._ingest_position_sizes(rows)
         rows = await self._apply_adoption_baseline(market, rows)
+        rows = self._scope_hedge_rows_to_run(rows)
         legs: list[PositionLeg] = []
         for row in rows:
             size = self._position_row_size(row)

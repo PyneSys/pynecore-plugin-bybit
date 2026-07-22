@@ -14,7 +14,12 @@ from pynecore.testing.broker_lab.reference import (
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import BybitAPIError, BybitConnectionError
 from pynecore_bybit.models import InstrumentInfo
-from pynecore_bybit.positions import POSITION_MODE_ONE_WAY
+from pynecore_bybit.positions import (
+    HEDGE_IDX_BUY,
+    HEDGE_IDX_SELL,
+    POSITION_MODE_HEDGE,
+    POSITION_MODE_ONE_WAY,
+)
 
 
 class _WarningCollector(logging.Handler):
@@ -907,8 +912,397 @@ class InverseBybitProfile(BybitProfile):
         self.market = _inverse_instrument()
 
 
+class OfflineHedgeBybit(OfflineBybit):
+    """Real hedge-mode position port over an in-memory Bybit transport."""
+
+    def __init__(self, profile: "HedgeBybitProfile", run_name: str, store_ctx: Any) -> None:
+        super().__init__(profile, run_name, store_ctx)
+        self._position_mode = POSITION_MODE_HEDGE
+        self.position_port = self
+
+    def __call__(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        *,
+        method: str = "get",
+        body: dict[str, Any] | None = None,
+        auth: bool = False,
+    ) -> dict[str, Any]:
+        if endpoint == "/v5/position/list":
+            self.rest_calls.append((endpoint, {}))
+            self.profile.transport_calls.append((endpoint, {}))
+            return {"list": self.profile.position_rows()}
+        if endpoint == "/v5/order/create":
+            payload = dict(body or {})
+            coid = str(payload.get("orderLinkId") or "")
+            duplicate = next(
+                (
+                    raw
+                    for raw in self.profile.raw_orders.values()
+                    if raw.get("orderLinkId") == coid
+                ),
+                None,
+            )
+            if duplicate is not None:
+                self.rest_calls.append((endpoint, payload))
+                self.profile.transport_calls.append((endpoint, payload))
+                return {
+                    "orderId": duplicate["orderId"],
+                    "orderLinkId": duplicate["orderLinkId"],
+                }
+        result = super().__call__(
+            endpoint,
+            params,
+            method=method,
+            body=body,
+            auth=auth,
+        )
+        if endpoint == "/v5/order/create":
+            order_id = str(result["orderId"])
+            payload = dict(body or {})
+            self.profile.raw_orders[order_id]["positionIdx"] = int(
+                payload.get("positionIdx") or 0
+            )
+        return result
+
+
+class HedgeBybitProfile(BybitProfile):
+    """USDT perpetual hedge account with run-owned and foreign leg attribution."""
+
+    venue_mode = "hedged"
+    foreign_sell_qty = 0.001
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.owned_legs: dict[str, dict[int, float]] = {}
+        self.foreign_legs = {
+            HEDGE_IDX_BUY: 0.0,
+            HEDGE_IDX_SELL: self.foreign_sell_qty,
+        }
+        self.initial_foreign_legs = dict(self.foreign_legs)
+        self.hedge_fill_sequence: list[dict[str, Any]] = []
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> OfflineHedgeBybit:
+        self.owned_legs.setdefault(
+            run_name,
+            {HEDGE_IDX_BUY: 0.0, HEDGE_IDX_SELL: 0.0},
+        )
+        return OfflineHedgeBybit(self, run_name, store_ctx)
+
+    def position_rows(self) -> list[dict[str, Any]]:
+        totals = {
+            idx: self.foreign_legs[idx]
+            + sum(legs[idx] for legs in self.owned_legs.values())
+            for idx in (HEDGE_IDX_BUY, HEDGE_IDX_SELL)
+        }
+        return [
+            {
+                "symbol": self.symbol,
+                "positionIdx": idx,
+                "size": str(totals[idx]),
+                "side": "Buy" if idx == HEDGE_IDX_BUY else "Sell",
+                "avgPrice": "100",
+                "unrealisedPnl": "0",
+                "liqPrice": "",
+                "leverage": "1",
+                "tradeMode": 0,
+                "createdTime": "1700000000000",
+                "updatedTime": "1700000002000",
+            }
+            for idx in (HEDGE_IDX_BUY, HEDGE_IDX_SELL)
+        ]
+
+    def _apply_hedge_fill(self, run_name: str, raw: dict[str, Any]) -> None:
+        idx = int(raw["positionIdx"])
+        qty = float(raw["qty"])
+        owned = self.owned_legs[run_name]
+        if raw.get("reduceOnly") is True:
+            reduced = min(owned[idx], qty)
+            owned[idx] -= reduced
+            remainder = qty - reduced
+            if remainder > 1e-12:
+                self.foreign_legs[idx] = max(
+                    0.0, self.foreign_legs[idx] - remainder
+                )
+        else:
+            owned[idx] += qty
+
+    def handle_step(self, runner: Any, step: Step) -> bool:
+        if step.kind == "fill_bybit_hedge_orders":
+            runtime = runner.runs[step.run]
+            pending = [
+                raw
+                for raw in self.raw_orders.values()
+                if raw["orderStatus"] in ("New", "PartiallyFilled")
+            ]
+            if not pending:
+                raise AssertionError("expected at least one open hedge order")
+            for raw in pending:
+                self._apply_hedge_fill(step.run, raw)
+                raw["cumExecQty"] = raw["qty"]
+                raw["avgPrice"] = str(step.values.get("price", 100.0))
+                raw["orderStatus"] = "Filled"
+                execution = {
+                    "category": "linear",
+                    "symbol": self.symbol,
+                    "execType": "Trade",
+                    "execId": f"exec-{raw['orderId']}",
+                    "orderLinkId": raw["orderLinkId"],
+                    "orderId": raw["orderId"],
+                    "side": raw["side"],
+                    "execQty": raw["qty"],
+                    "execPrice": raw["avgPrice"],
+                    "execFee": "0",
+                    "execTime": "1700000003000",
+                }
+                self.raw_executions.append(execution)
+                events = runtime.broker._translate_private_frame(
+                    {"topic": "execution", "data": [execution]},
+                    runtime.broker._market,
+                )
+                if len(events) != 1:
+                    raise AssertionError(
+                        f"Bybit hedge execution did not emit one fill: {events}"
+                    )
+                signed = events[0].fill_qty if raw["side"] == "Buy" else -events[0].fill_qty
+                self.state.position_owners[step.run] = (
+                    self.state.position_owners.get(step.run, 0.0) + signed
+                )
+                self.state.pending_events.append((step.run, events[0]))
+                self.hedge_fill_sequence.append(
+                    {
+                        "reduceOnly": bool(raw.get("reduceOnly")),
+                        "positionIdx": int(raw["positionIdx"]),
+                        "side": raw["side"],
+                        "qty": float(raw["qty"]),
+                    }
+                )
+            self.state.position = sum(self.state.position_owners.values())
+            return True
+        if step.kind == "expect_bybit_hedge_sequence":
+            expected = list(step.values["sequence"])
+            actual = self.hedge_fill_sequence[-len(expected):]
+            if actual != expected:
+                raise AssertionError(
+                    f"expected Bybit hedge order sequence {expected}, got {actual}"
+                )
+            return True
+        if step.kind == "expect_bybit_hedge_ownership":
+            expected = float(step.values["position"])
+            actual = self.state.position_owners.get(step.run, 0.0)
+            if abs(actual - expected) > 1e-9:
+                raise AssertionError(
+                    f"expected run-owned hedge position {expected}, got {actual}"
+                )
+            engine = runner.runs[step.run].position.size
+            if abs(engine - expected) > 1e-9:
+                raise AssertionError(
+                    f"expected engine hedge position {expected}, got {engine}"
+                )
+            return True
+        return super().handle_step(runner, step)
+
+    def check_invariants(self, runner: Any):
+        violations: list[str] = []
+        if self.foreign_legs != self.initial_foreign_legs:
+            violations.append(
+                "Bybit external hedge leg changed: "
+                f"expected={self.initial_foreign_legs} actual={self.foreign_legs}"
+            )
+        if not self.state.pending_events:
+            for run_name, runtime in runner.runs.items():
+                owned = self.owned_legs[run_name]
+                nonzero = [idx for idx, qty in owned.items() if qty > 1e-9]
+                if len(nonzero) > 1:
+                    violations.append(
+                        f"Bybit run {run_name} owns opposing hedge legs: {owned}"
+                    )
+                signed = owned[HEDGE_IDX_BUY] - owned[HEDGE_IDX_SELL]
+                journal = self.state.position_owners.get(run_name, 0.0)
+                if abs(signed - journal) > 1e-9:
+                    violations.append(
+                        f"Bybit hedge ownership mismatch for {run_name}: "
+                        f"legs={signed} journal={journal}"
+                    )
+                if abs(runtime.position.size - journal) > 1e-9:
+                    violations.append(
+                        f"Bybit hedge engine mismatch for {run_name}: "
+                        f"engine={runtime.position.size} journal={journal}"
+                    )
+        return violations
+
+
+class ForeignMutationHedgeBybitProfile(HedgeBybitProfile):
+    """Negative control: lowest transport applies an entry to the foreign leg."""
+
+    def _apply_hedge_fill(self, run_name: str, raw: dict[str, Any]) -> None:
+        if raw.get("reduceOnly") is not True and raw["side"] == "Buy":
+            leaked = min(self.foreign_legs[HEDGE_IDX_SELL], float(raw["qty"]))
+            self.foreign_legs[HEDGE_IDX_SELL] -= leaked
+        super()._apply_hedge_fill(run_name, raw)
+
+
+class CoidAliasOfflineHedgeBybit(OfflineHedgeBybit):
+    """Negative control that aliases the reversal residual to the spent entry."""
+
+    def __call__(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        *,
+        method: str = "get",
+        body: dict[str, Any] | None = None,
+        auth: bool = False,
+    ) -> dict[str, Any]:
+        payload = dict(body or {})
+        if (
+            endpoint == "/v5/order/create"
+            and payload.get("side") == "Sell"
+            and payload.get("reduceOnly") is not True
+        ):
+            prior = next(
+                (
+                    raw
+                    for raw in self.profile.raw_orders.values()
+                    if raw.get("side") == "Buy" and raw.get("reduceOnly") is not True
+                ),
+                None,
+            )
+            if prior is not None:
+                payload["orderLinkId"] = prior["orderLinkId"]
+                body = payload
+        return super().__call__(
+            endpoint,
+            params,
+            method=method,
+            body=body,
+            auth=auth,
+        )
+
+
+class CoidAliasHedgeBybitProfile(HedgeBybitProfile):
+    """Hedge profile whose transport deliberately reuses a spent entry ID."""
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> CoidAliasOfflineHedgeBybit:
+        self.owned_legs.setdefault(
+            run_name,
+            {HEDGE_IDX_BUY: 0.0, HEDGE_IDX_SELL: 0.0},
+        )
+        return CoidAliasOfflineHedgeBybit(self, run_name, store_ctx)
+
+
 def smoke_scenarios(seed: int = 0) -> list[Scenario]:
     return [
+        Scenario(
+            name="bybit-usdt-hedge-run-ownership-reversal-restart",
+            profile_factory=HedgeBybitProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "R", "side": "buy", "qty": 0.002}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("fill_bybit_hedge_orders", check_invariants=False),
+                Step("deliver"),
+                Step(
+                    "expect_bybit_hedge_sequence",
+                    values={
+                        "sequence": [
+                            {
+                                "reduceOnly": False,
+                                "positionIdx": HEDGE_IDX_BUY,
+                                "side": "Buy",
+                                "qty": 0.002,
+                            }
+                        ]
+                    },
+                ),
+                Step("expect_bybit_hedge_ownership", values={"position": 0.002}),
+                Step("restart", check_invariants=False),
+                Step("expect_bybit_hedge_ownership", values={"position": 0.002}),
+                Step("entry", values={"id": "R", "side": "sell", "qty": 0.002}),
+                Step("sync", values={"last_price": 100.0, "advance_ms": 0}),
+                Step("fill_bybit_hedge_orders", check_invariants=False),
+                Step("deliver"),
+                Step(
+                    "expect_bybit_hedge_sequence",
+                    values={
+                        "sequence": [
+                            {
+                                "reduceOnly": True,
+                                "positionIdx": HEDGE_IDX_BUY,
+                                "side": "Sell",
+                                "qty": 0.002,
+                            },
+                            {
+                                "reduceOnly": False,
+                                "positionIdx": HEDGE_IDX_SELL,
+                                "side": "Sell",
+                                "qty": 0.002,
+                            },
+                        ]
+                    },
+                ),
+                Step("expect_bybit_hedge_ownership", values={"position": -0.002}),
+                Step("restart", check_invariants=False),
+                Step("expect_bybit_hedge_ownership", values={"position": -0.002}),
+                Step(
+                    "close",
+                    values={"id": "R", "side": "buy", "qty": 0.002},
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step("fill_bybit_hedge_orders", check_invariants=False),
+                Step("deliver"),
+                Step("expect_bybit_hedge_ownership", values={"position": 0.0}),
+            ),
+        ),
+        Scenario(
+            name="bybit-usdt-hedge-external-leg-invariant-negative-control",
+            profile_factory=ForeignMutationHedgeBybitProfile,
+            seed=seed,
+            expected_violation="Bybit external hedge leg changed",
+            steps=(
+                Step("entry", values={"id": "L", "side": "buy", "qty": 0.002}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("fill_bybit_hedge_orders", check_invariants=False),
+                Step("deliver"),
+            ),
+        ),
+        Scenario(
+            name="bybit-usdt-hedge-same-bar-coid-invariant-negative-control",
+            profile_factory=CoidAliasHedgeBybitProfile,
+            seed=seed,
+            expected_violation="expected Bybit hedge order sequence",
+            steps=(
+                Step("entry", values={"id": "R", "side": "buy", "qty": 0.002}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("fill_bybit_hedge_orders", check_invariants=False),
+                Step("deliver"),
+                Step("restart", check_invariants=False),
+                Step("entry", values={"id": "R", "side": "sell", "qty": 0.002}),
+                Step("sync", values={"last_price": 100.0, "advance_ms": 0}),
+                Step("fill_bybit_hedge_orders", check_invariants=False),
+                Step("deliver"),
+                Step(
+                    "expect_bybit_hedge_sequence",
+                    values={
+                        "sequence": [
+                            {
+                                "reduceOnly": True,
+                                "positionIdx": HEDGE_IDX_BUY,
+                                "side": "Sell",
+                                "qty": 0.002,
+                            },
+                            {
+                                "reduceOnly": False,
+                                "positionIdx": HEDGE_IDX_SELL,
+                                "side": "Sell",
+                                "qty": 0.002,
+                            },
+                        ]
+                    },
+                ),
+            ),
+        ),
         Scenario(
             name="bybit-post-write-lost-create-ack-adopts-exactly-once",
             profile_factory=BybitProfile,
