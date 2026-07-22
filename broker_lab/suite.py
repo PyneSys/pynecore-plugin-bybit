@@ -50,6 +50,28 @@ def _linear_instrument() -> InstrumentInfo:
     )
 
 
+def _usdc_linear_instrument() -> InstrumentInfo:
+    return InstrumentInfo(
+        category="linear",
+        symbol="ETHPERP",
+        base_coin="ETH",
+        quote_coin="USDC",
+        settle_coin="USDC",
+        status="Trading",
+        tick_size_str="0.01",
+        tick_size=0.01,
+        qty_step_str="0.01",
+        qty_step=0.01,
+        min_order_qty=0.01,
+        min_order_amt=0.0,
+        min_notional=5.0,
+        max_limit_order_qty=2500.0,
+        max_market_order_qty=500.0,
+        contract_type="LinearPerpetual",
+        delivery_time=None,
+    )
+
+
 def _spot_instrument() -> InstrumentInfo:
     return InstrumentInfo(
         category="spot",
@@ -419,6 +441,21 @@ class BybitProfile(ReferenceVenueProfile):
             if actual != expected:
                 raise AssertionError(f"expected {expected} Bybit creates, got {actual}")
             return True
+        if step.kind == "expect_bybit_raw_open_count":
+            actual = sum(
+                order["orderStatus"] not in ("Cancelled", "Filled")
+                for order in self.raw_orders.values()
+            )
+            expected = int(step.values["count"])
+            if actual != expected:
+                live = [
+                    order for order in self.raw_orders.values()
+                    if order["orderStatus"] not in ("Cancelled", "Filled")
+                ]
+                raise AssertionError(
+                    f"expected {expected} raw Bybit open orders, got {live}"
+                )
+            return True
         if step.kind == "expect_bybit_below_grid_skip":
             if len(self.entry_attempts) != 1:
                 raise AssertionError(
@@ -732,6 +769,17 @@ class SpotBybitProfile(BybitProfile):
         self.market = _spot_instrument()
 
 
+class UsdcLinearBybitProfile(BybitProfile):
+    """USDC-settled linear profile using discovered ETHPERP venue rules."""
+
+    symbol = "ETHPERP"
+    quantity_step = 0.01
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.market = _usdc_linear_instrument()
+
+
 class InverseBybitProfile(BybitProfile):
     """Inverse-contract profile using a deterministic conversion anchor."""
 
@@ -756,6 +804,78 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                     "expect_bybit_request",
                     values={"orderType": "Market", "side": "Buy", "qty": "0.1"},
                 ),
+            ),
+        ),
+        Scenario(
+            name="bybit-usdc-perpetual-uses-linear-transport-and-discovered-grid",
+            profile_factory=UsdcLinearBybitProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "U", "side": "buy", "qty": 0.01}),
+                Step("sync", values={"last_price": 2_000.0}),
+                Step(
+                    "expect_bybit_request",
+                    values={
+                        "category": "linear",
+                        "symbol": "ETHPERP",
+                        "orderType": "Market",
+                        "side": "Buy",
+                        "qty": "0.01",
+                    },
+                ),
+                Step(
+                    "expect_bybit_request_absent",
+                    values={"keys": ["marketUnit", "isLeverage"]},
+                ),
+            ),
+        ),
+        Scenario(
+            name="bybit-usdc-restart-partial-then-full-close-leaves-no-bracket",
+            profile_factory=UsdcLinearBybitProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "U", "side": "buy", "qty": 0.02}),
+                Step("sync", values={"last_price": 2_000.0}),
+                Step(
+                    "fill_bybit_entry",
+                    values={"id": "U", "qty": 0.02, "price": 2_000.0},
+                    check_invariants=False,
+                ),
+                Step("deliver"),
+                Step(
+                    "exit",
+                    values={
+                        "id": "X",
+                        "from_entry": "U",
+                        "side": "sell",
+                        "qty": 0.02,
+                        "limit": 3_000.0,
+                        "stop": 1_000.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 2_000.0}),
+                Step("restart", check_invariants=False),
+                Step("sync", values={"last_price": 2_000.0}),
+                Step("expect_bybit_raw_open_count", values={"count": 2}),
+                Step("close", values={"id": "U", "qty": 0.01}),
+                Step("sync", values={"last_price": 2_000.0}),
+                Step(
+                    "fill_bybit_close",
+                    values={"id": "U", "qty": 0.01, "price": 2_000.0},
+                    check_invariants=False,
+                ),
+                Step("deliver", check_invariants=False),
+                Step("expect_bybit_raw_open_count", values={"count": 2}),
+                Step("close", values={"id": "U", "qty": 0.01}),
+                Step("sync", values={"last_price": 2_000.0}, check_invariants=False),
+                Step(
+                    "fill_bybit_close",
+                    values={"id": "U", "qty": 0.01, "price": 2_000.0},
+                    check_invariants=False,
+                ),
+                Step("deliver", check_invariants=False),
+                Step("sync", values={"last_price": 2_000.0}, check_invariants=False),
+                Step("expect_bybit_raw_open_count", values={"count": 0}),
             ),
         ),
         Scenario(
