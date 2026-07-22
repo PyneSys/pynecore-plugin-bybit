@@ -1,6 +1,7 @@
 """Opt-in offline conformance scenarios for the Bybit broker plugin."""
 
 from dataclasses import replace
+from decimal import Decimal, ROUND_DOWN
 import logging
 from typing import Any
 
@@ -95,6 +96,28 @@ def _spot_instrument() -> InstrumentInfo:
         min_notional=0.0,
         max_limit_order_qty=100.0,
         max_market_order_qty=50.0,
+        contract_type="",
+        delivery_time=None,
+    )
+
+
+def _usdc_spot_instrument() -> InstrumentInfo:
+    return InstrumentInfo(
+        category="spot",
+        symbol="ETHUSDC",
+        base_coin="ETH",
+        quote_coin="USDC",
+        settle_coin="",
+        status="Trading",
+        tick_size_str="0.01",
+        tick_size=0.01,
+        qty_step_str="0.00001",
+        qty_step=0.00001,
+        min_order_qty=0.00001,
+        min_order_amt=5.0,
+        min_notional=0.0,
+        max_limit_order_qty=1500.0,
+        max_market_order_qty=730.0,
         contract_type="",
         delivery_time=None,
     )
@@ -890,6 +913,230 @@ class SpotBybitProfile(BybitProfile):
         self.market = _spot_instrument()
 
 
+class OfflineSpotInventoryBybit(OfflineBybit):
+    """Real spot inventory path over deterministic wallet/execution reads."""
+
+    def __init__(
+        self, profile: "UsdcSpotInventoryBybitProfile", run_name: str, store_ctx: Any
+    ) -> None:
+        super().__init__(profile, run_name, store_ctx)
+        self._broker_started = False
+        self._account_id = profile.account_id
+
+    def __call__(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        *,
+        method: str = "get",
+        body: dict[str, Any] | None = None,
+        auth: bool = False,
+    ) -> dict[str, Any]:
+        del method, auth
+        if endpoint == "/v5/account/wallet-balance":
+            payload = dict(params or {})
+            self.rest_calls.append((endpoint, payload))
+            self.profile.transport_calls.append((endpoint, payload))
+            requested = str(payload.get("coin") or "")
+            coins = [
+                {"coin": coin, "walletBalance": str(balance)}
+                for coin, balance in self.profile.wallet.items()
+                if not requested or coin == requested
+            ]
+            return {"list": [{"accountType": "UNIFIED", "coin": coins}]}
+        if endpoint == "/v5/execution/list":
+            payload = dict(params or {})
+            self.rest_calls.append((endpoint, payload))
+            self.profile.transport_calls.append((endpoint, payload))
+            start = int(payload.get("startTime") or 0)
+            end = int(payload.get("endTime") or 2**63 - 1)
+            rows = [
+                execution
+                for execution in self.profile.raw_executions
+                if start <= int(execution["execTime"]) <= end
+            ]
+            return {"list": rows, "nextPageCursor": ""}
+        return super().__call__(endpoint, params, body=body)
+
+
+class UsdcSpotInventoryBybitProfile(BybitProfile):
+    """ETHUSDC wallet, fee and sellable-residual lifecycle model."""
+
+    symbol = "ETHUSDC"
+    quantity_step = 0.00001
+    foreign_base = Decimal("1")
+    initial_quote = Decimal("1000")
+    fee_rate = Decimal("0.0005")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.market = _usdc_spot_instrument()
+        self.wallet = {
+            self.market.base_coin: self.foreign_base,
+            self.market.quote_coin: self.initial_quote,
+        }
+        self.fill_sequence: list[dict[str, str]] = []
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> OfflineSpotInventoryBybit:
+        return OfflineSpotInventoryBybit(self, run_name, store_ctx)
+
+    def _reported_fee_currency(self, side: str) -> str:
+        return self.market.base_coin if side == "buy" else self.market.quote_coin
+
+    def handle_step(self, runner: Any, step: Step) -> bool:
+        if step.kind == "fill_bybit_usdc_spot":
+            runtime = runner.runs[step.run]
+            side = str(step.values["side"])
+            pending = [
+                raw
+                for raw in self.raw_orders.values()
+                if raw["orderStatus"] in ("New", "PartiallyFilled")
+                and raw["side"].lower() == side
+            ]
+            if len(pending) != 1:
+                raise AssertionError(f"expected one pending ETHUSDC {side}, got {pending}")
+            raw = pending[0]
+            qty = Decimal(str(raw["qty"]))
+            price = Decimal(str(step.values.get("price", "2000")))
+            value = qty * price
+            if side == "buy":
+                fee = qty * self.fee_rate
+                self.wallet[self.market.base_coin] += qty - fee
+                self.wallet[self.market.quote_coin] -= value
+            else:
+                fee = value * self.fee_rate
+                self.wallet[self.market.base_coin] -= qty
+                self.wallet[self.market.quote_coin] += value - fee
+            fee_currency = self._reported_fee_currency(side)
+            raw["cumExecQty"] = raw["qty"]
+            raw["avgPrice"] = str(price)
+            raw["orderStatus"] = "Filled"
+            execution = {
+                "category": "spot",
+                "symbol": self.symbol,
+                "execType": "Trade",
+                "execId": f"spot-{side}-{len(self.raw_executions) + 1}",
+                "orderLinkId": raw["orderLinkId"],
+                "orderId": raw["orderId"],
+                "side": raw["side"],
+                "execQty": str(qty),
+                "execPrice": str(price),
+                "execValue": str(value),
+                "execFee": str(fee),
+                "feeCurrency": fee_currency,
+                "execTime": str(runner.now_ms),
+                "seq": str(len(self.raw_executions) + 1),
+            }
+            self.raw_executions.append(execution)
+            events = runtime.broker._translate_private_frame(
+                {"topic": "execution", "data": [execution]},
+                runtime.broker._market,
+            )
+            if len(events) != 1:
+                raise AssertionError(f"ETHUSDC execution did not emit one fill: {events}")
+            event = events[0]
+            signed = event.fill_qty if side == "buy" else -event.fill_qty
+            self.state.position_owners[step.run] = (
+                self.state.position_owners.get(step.run, 0.0) + signed
+            )
+            self.state.position = sum(self.state.position_owners.values())
+            self.state.pending_events.append((step.run, event))
+            self.fill_sequence.append(
+                {
+                    "side": side,
+                    "qty": str(qty),
+                    "fee": str(fee),
+                    "fee_currency": fee_currency,
+                }
+            )
+            return True
+        if step.kind == "expect_bybit_usdc_spot_inventory":
+            runtime = runner.runs[step.run]
+            manager = runtime.broker._spot_manager
+            if manager is None:
+                raise AssertionError("ETHUSDC spot inventory manager was not started")
+            rows = runtime.store_ctx.iter_spot_executions(
+                runtime.broker.account_id, self.market.symbol
+            )
+            ledger_base = sum((Decimal(row.base_delta) for row in rows), Decimal(0))
+            ledger_quote = sum((Decimal(row.quote_delta) for row in rows), Decimal(0))
+            expected_base = Decimal(str(step.values["base_delta"]))
+            expected_quote = Decimal(str(step.values["quote_delta"]))
+            if ledger_base != expected_base or ledger_quote != expected_quote:
+                raise AssertionError(
+                    "expected ETHUSDC ledger deltas "
+                    f"base={expected_base} quote={expected_quote}, got "
+                    f"base={ledger_base} quote={ledger_quote}"
+                )
+            expected_fee_currencies = list(step.values["fee_currencies"])
+            actual_fee_currencies = [row.fee_currency for row in rows]
+            if actual_fee_currencies != expected_fee_currencies:
+                raise AssertionError(
+                    f"expected ETHUSDC fee currencies {expected_fee_currencies}, "
+                    f"got {actual_fee_currencies}"
+                )
+            sellable = ledger_base.quantize(
+                Decimal(self.market.qty_step_str), rounding=ROUND_DOWN
+            )
+            expected_sellable = Decimal(str(step.values["sellable"]))
+            if sellable != expected_sellable:
+                raise AssertionError(
+                    f"expected ETHUSDC sellable inventory {expected_sellable}, got {sellable}"
+                )
+            engine = Decimal(str(runtime.position.size))
+            expected_engine = Decimal(str(step.values["engine_position"]))
+            if abs(engine - expected_engine) > Decimal("1e-12"):
+                raise AssertionError(
+                    f"expected ETHUSDC engine position {expected_engine}, got {engine}"
+                )
+            if expected_engine == 0 and 0 < manager.fold.net_base < Decimal(
+                self.market.qty_step_str
+            ):
+                # VenueState models the engine-visible tradable position. The
+                # exact sub-grid residue remains independently asserted in the
+                # durable inventory ledger and wallet invariant above.
+                self.state.position_owners[step.run] = 0.0
+                self.state.position = sum(self.state.position_owners.values())
+            return True
+        if step.kind == "expect_no_bybit_spot_external_close_warning":
+            false_external_close = [
+                message
+                for message in self.warning_collector.messages
+                if "external close detected" in message
+            ]
+            if false_external_close:
+                raise AssertionError(
+                    "own ETHUSDC sub-grid dust was misclassified as external close: "
+                    f"{false_external_close}"
+                )
+            return True
+        return super().handle_step(runner, step)
+
+    def check_invariants(self, runner: Any):
+        violations = list(super().check_invariants(runner))
+        for runtime in runner.runs.values():
+            manager = runtime.broker._spot_manager
+            if manager is None:
+                continue
+            expected_total = self.foreign_base + manager.fold.net_base
+            actual_total = self.wallet[self.market.base_coin]
+            if expected_total != actual_total:
+                violations.append(
+                    "Bybit spot inventory balance mismatch: "
+                    f"expected={expected_total} actual={actual_total}"
+                )
+        return violations
+
+
+class WrongBuyFeeCurrencyBybitProfile(UsdcSpotInventoryBybitProfile):
+    """Negative control: the execution lies about a base-charged buy fee."""
+
+    def _reported_fee_currency(self, side: str) -> str:
+        if side == "buy":
+            return self.market.quote_coin
+        return super()._reported_fee_currency(side)
+
+
 class UsdcLinearBybitProfile(BybitProfile):
     """USDC-settled linear profile using discovered ETHPERP venue rules."""
 
@@ -1452,6 +1699,101 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                         "isLeverage": 0,
                     },
                 ),
+            ),
+        ),
+        Scenario(
+            name="bybit-usdc-spot-inventory-fee-residual-roundtrip",
+            profile_factory=UsdcSpotInventoryBybitProfile,
+            seed=seed,
+            steps=(
+                Step("sync", values={"last_price": 2_000.0}),
+                Step("entry", values={"id": "S", "side": "buy", "qty": 0.006}),
+                Step("sync", values={"last_price": 2_000.0}),
+                Step(
+                    "expect_bybit_request",
+                    values={
+                        "category": "spot",
+                        "symbol": "ETHUSDC",
+                        "qty": "0.006",
+                        "marketUnit": "baseCoin",
+                        "isLeverage": 0,
+                    },
+                ),
+                Step(
+                    "fill_bybit_usdc_spot",
+                    values={"side": "buy", "price": "2000"},
+                    check_invariants=False,
+                ),
+                Step("deliver"),
+                Step(
+                    "expect_bybit_usdc_spot_inventory",
+                    values={
+                        "base_delta": "0.005997",
+                        "quote_delta": "-12",
+                        "fee_currencies": ["ETH"],
+                        "sellable": "0.00599",
+                        "engine_position": "0.005997",
+                    },
+                ),
+                Step("restart", check_invariants=False),
+                Step(
+                    "expect",
+                    values={"position": 0.005997, "engine_position": 0.005997},
+                ),
+                Step("close", values={"id": "S"}),
+                Step("sync", values={"last_price": 2_000.0}),
+                Step("expect_bybit_request", values={"qty": "0.00599"}),
+                Step(
+                    "fill_bybit_usdc_spot",
+                    values={"side": "sell", "price": "2000"},
+                    check_invariants=False,
+                ),
+                Step("deliver", check_invariants=False),
+                Step(
+                    "sync",
+                    values={"last_price": 2_000.0, "advance_ms": 60_000},
+                    check_invariants=False,
+                ),
+                Step(
+                    "expect_bybit_usdc_spot_inventory",
+                    values={
+                        "base_delta": "0.000007",
+                        "quote_delta": "-0.02599000",
+                        "fee_currencies": ["ETH", "USDC"],
+                        "sellable": "0.00000",
+                        "engine_position": "0",
+                    },
+                ),
+                Step("expect_no_bybit_spot_external_close_warning"),
+                Step("restart", check_invariants=False),
+                Step(
+                    "expect_bybit_usdc_spot_inventory",
+                    values={
+                        "base_delta": "0.000007",
+                        "quote_delta": "-0.02599000",
+                        "fee_currencies": ["ETH", "USDC"],
+                        "sellable": "0.00000",
+                        "engine_position": "0",
+                    },
+                ),
+                Step("expect_bybit_raw_open_count", values={"count": 0}),
+            ),
+        ),
+        Scenario(
+            name="bybit-usdc-spot-wrong-buy-fee-currency-negative-control",
+            profile_factory=WrongBuyFeeCurrencyBybitProfile,
+            seed=seed,
+            expected_violation="Bybit spot inventory balance mismatch",
+            steps=(
+                Step("sync", values={"last_price": 2_000.0}),
+                Step("entry", values={"id": "S", "side": "buy", "qty": 0.006}),
+                Step("sync", values={"last_price": 2_000.0}),
+                Step(
+                    "fill_bybit_usdc_spot",
+                    values={"side": "buy", "price": "2000"},
+                    check_invariants=False,
+                ),
+                Step("deliver"),
             ),
         ),
         Scenario(

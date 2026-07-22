@@ -75,6 +75,7 @@ class _BybitSpotPort:
         self.product_id = market.symbol
         self.base_asset = market.base_coin
         self.quote_asset = market.quote_coin
+        self.position_dust_threshold = Decimal(market.qty_step_str)
 
     # --- SpotInventoryPort surface -----------------------------------------
 
