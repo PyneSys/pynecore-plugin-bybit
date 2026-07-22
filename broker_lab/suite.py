@@ -1,8 +1,10 @@
 """Opt-in offline conformance scenarios for the Bybit broker plugin."""
 
+import asyncio
 from dataclasses import replace
 from decimal import Decimal, ROUND_DOWN
 import logging
+from time import time as epoch_time
 from typing import Any
 
 from pynecore.core.broker.exceptions import OrderSkippedByPlugin
@@ -903,6 +905,155 @@ class AliasingBybitProfile(BybitProfile):
         return AliasingOfflineBybit(self, run_name, store_ctx)
 
 
+class FragmentedFillBybitProfile(BybitProfile):
+    """Fragmented derivative fill with a private-stream gap and REST recovery."""
+
+    inject_corrupt_duplicate = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovered_counts: list[int] = []
+        self.fragment_coid: str | None = None
+
+    def handle_step(self, runner: Any, step: Step) -> bool:
+        if step.kind == "fragment_bybit_entry_with_ws_gap":
+            runtime = runner.runs[step.run]
+            if not runtime.broker._adoption_baselined:
+                raise AssertionError("Bybit adoption baseline was not committed")
+            pine_id = str(step.values["id"])
+            candidates = [
+                record
+                for record in self.state.orders.values()
+                if record.run_name == step.run
+                and record.pine_id == pine_id
+                and record.leg_type is LegType.ENTRY
+                and record.order.status is OrderStatus.OPEN
+            ]
+            if len(candidates) != 1:
+                raise AssertionError(
+                    f"expected one open fragmented Bybit entry {pine_id!r}, "
+                    f"got {candidates}"
+                )
+            record = candidates[0]
+            raw = self.raw_orders[record.order.id]
+            coid = str(raw["orderLinkId"])
+            self.fragment_coid = coid
+            now_ms = int(epoch_time() * 1000)
+            slices = (
+                ("frag-1", "0.02", now_ms - 3_000),
+                ("frag-3", "0.025", now_ms - 1_000),
+                ("frag-2", "0.015", now_ms - 2_000),
+            )
+            executions: list[dict[str, Any]] = []
+            for exec_id, qty, ts_ms in slices:
+                executions.append(
+                    {
+                        "category": "linear",
+                        "symbol": self.symbol,
+                        "execType": "Trade",
+                        "execId": exec_id,
+                        "orderLinkId": coid,
+                        "orderId": raw["orderId"],
+                        "side": raw["side"],
+                        "execQty": qty,
+                        "execPrice": "90",
+                        "execFee": "0",
+                        "execTime": str(ts_ms),
+                    }
+                )
+            # The REST endpoint is newest-first rather than chronological;
+            # repeat one execId as an overlap/page duplicate as well.
+            self.raw_executions.extend(
+                (executions[0], executions[1], executions[2], dict(executions[2]))
+            )
+            if self.inject_corrupt_duplicate:
+                corrupt = dict(executions[2])
+                corrupt["execId"] = "frag-2-corrupt-copy"
+                self.raw_executions.append(corrupt)
+            raw["cumExecQty"] = "0.06"
+            raw["avgPrice"] = "90"
+            raw["orderStatus"] = "PartiallyFilled"
+
+            pushed = runtime.broker._translate_private_frame(
+                {"topic": "execution", "data": [executions[0]]},
+                runtime.broker._market,
+            )
+            if len(pushed) != 1 or pushed[0].fill_id != "frag-1":
+                raise AssertionError(
+                    f"expected only frag-1 on the private stream, got {pushed}"
+                )
+            record.order = pushed[0].order
+            self.state.position_owners[step.run] = 0.06
+            self.state.position = sum(self.state.position_owners.values())
+            self.state.pending_events.append((step.run, pushed[0]))
+
+            runtime.broker._deriv_exec_floor_ms = now_ms - 10_000
+            runtime.broker._deriv_exec_watermark = now_ms - 10_000
+            return True
+        if step.kind == "run_bybit_deriv_reconcile":
+            runtime = runner.runs[step.run]
+            events = asyncio.run(
+                runtime.broker._run_deriv_reconcile(runtime.broker._market)
+            )
+            self.recovered_counts.append(len(events))
+            for event in events:
+                matching = [
+                    record
+                    for record in self.state.orders.values()
+                    if record.run_name == step.run
+                    and record.order.id == event.order.id
+                ]
+                if len(matching) == 1:
+                    matching[0].order = event.order
+                self.state.pending_events.append((step.run, event))
+            return True
+        if step.kind == "expect_bybit_fragment_recovery":
+            runtime = runner.runs[step.run]
+            if self.fragment_coid is None:
+                raise AssertionError("fragmented Bybit entry was not recorded")
+            row = runtime.store_ctx.get_order(self.fragment_coid)
+            if row is None:
+                raise AssertionError("fragmented Bybit store row is absent")
+            expected_position = float(step.values["position"])
+            expected_filled = float(step.values["filled"])
+            if abs(runtime.position.size - expected_position) > 1e-12:
+                raise AssertionError(
+                    f"expected recovered position {expected_position}, "
+                    f"got {runtime.position.size}"
+                )
+            if abs(row.filled_qty - expected_filled) > 1e-12:
+                raise AssertionError(
+                    f"expected durable filled cursor {expected_filled}, "
+                    f"got {row.filled_qty}"
+                )
+            expected_counts = list(step.values["recovered_counts"])
+            if self.recovered_counts != expected_counts:
+                raise AssertionError(
+                    f"expected reconcile recovery counts {expected_counts}, "
+                    f"got {self.recovered_counts}"
+                )
+            if [row["execId"] for row in self.raw_executions[:3]] != [
+                "frag-1", "frag-3", "frag-2"
+            ]:
+                raise AssertionError("fragmented REST rows were not out of order")
+            if sum(row["execId"] == "frag-2" for row in self.raw_executions) != 2:
+                raise AssertionError("fragmented REST overlap duplicate is absent")
+            if not {"frag-1", "frag-2", "frag-3"}.issubset(
+                runtime.broker._seen_exec_ids
+            ):
+                raise AssertionError(
+                    "fragmented execution IDs did not enter the dedup frontier"
+                )
+            return True
+        return super().handle_step(runner, step)
+
+
+class CorruptDuplicateFragmentBybitProfile(FragmentedFillBybitProfile):
+    """Broken control: one economic slice is exposed under a second execId."""
+
+    inject_corrupt_duplicate = True
+
+
 class SpotBybitProfile(BybitProfile):
     """Spot request-denomination profile using the real execution mapper."""
 
@@ -1580,6 +1731,73 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                     "expect",
                     values={"position": 0.0, "engine_position": 0.0, "open_orders": 0},
                 ),
+            ),
+        ),
+        Scenario(
+            name="bybit-fragmented-partial-fill-ws-gap-rest-recovery",
+            profile_factory=FragmentedFillBybitProfile,
+            seed=seed,
+            steps=(
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "entry",
+                    values={"id": "F", "side": "buy", "qty": 0.1, "limit": 90.0},
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "fragment_bybit_entry_with_ws_gap",
+                    values={"id": "F"},
+                    check_invariants=False,
+                ),
+                Step("deliver", check_invariants=False),
+                Step("run_bybit_deriv_reconcile", check_invariants=False),
+                Step("deliver"),
+                Step("run_bybit_deriv_reconcile"),
+                Step(
+                    "expect_bybit_fragment_recovery",
+                    values={
+                        "position": 0.06,
+                        "filled": 0.06,
+                        "recovered_counts": [2, 0],
+                    },
+                ),
+                Step("restart"),
+                Step("expect", values={"position": 0.06, "engine_position": 0.06}),
+                Step("close", values={"id": "F"}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("expect_bybit_request", values={"qty": "0.06"}),
+                Step(
+                    "fill_bybit_close",
+                    values={"id": "F", "qty": 0.06, "fill_id": "frag-close"},
+                    check_invariants=False,
+                ),
+                Step("deliver"),
+                Step(
+                    "expect",
+                    values={"position": 0.0, "engine_position": 0.0, "open_orders": 0},
+                ),
+            ),
+        ),
+        Scenario(
+            name="control-bybit-distinct-id-duplicate-fragment-is-detected",
+            profile_factory=CorruptDuplicateFragmentBybitProfile,
+            seed=seed,
+            expected_violation="economic account position mismatch",
+            steps=(
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "entry",
+                    values={"id": "F", "side": "buy", "qty": 0.1, "limit": 90.0},
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step(
+                    "fragment_bybit_entry_with_ws_gap",
+                    values={"id": "F"},
+                    check_invariants=False,
+                ),
+                Step("deliver", check_invariants=False),
+                Step("run_bybit_deriv_reconcile", check_invariants=False),
+                Step("deliver"),
             ),
         ),
         Scenario(
