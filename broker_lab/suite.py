@@ -12,6 +12,7 @@ from pynecore.testing.broker_lab.reference import (
     VenueOrder,
 )
 from pynecore_bybit import Bybit, BybitConfig
+from pynecore_bybit.exceptions import BybitAPIError, BybitConnectionError
 from pynecore_bybit.models import InstrumentInfo
 from pynecore_bybit.positions import POSITION_MODE_ONE_WAY
 
@@ -148,6 +149,7 @@ class OfflineBybit(Bybit):
         self.profile.transport_calls.append((endpoint, payload))
         if endpoint == "/v5/order/create":
             order_id = self.profile.state.new_id()
+            coid = str(payload.get("orderLinkId") or "")
             self.profile.raw_orders[order_id] = {
                 "orderId": order_id,
                 "symbol": payload["symbol"],
@@ -163,6 +165,14 @@ class OfflineBybit(Bybit):
                 "orderLinkId": payload.get("orderLinkId", ""),
                 "createdTime": "1700000000000",
             }
+            self.profile.transport_barriers.append(("write_emitted", coid))
+            if self.profile.drop_create_ack:
+                self.profile.drop_create_ack = False
+                self.profile.transport_barriers.append(("ack_suppressed", coid))
+                raise self.profile.post_write_error(
+                    "injected Bybit post-write/pre-ACK transport loss"
+                )
+            self.profile.transport_barriers.append(("ack_received", coid))
             return {"orderId": order_id, "orderLinkId": payload.get("orderLinkId")}
         if endpoint == "/v5/order/amend":
             coid = payload["orderLinkId"]
@@ -393,15 +403,62 @@ class BybitProfile(ReferenceVenueProfile):
         self.raw_executions: list[dict[str, Any]] = []
         self.entry_attempts: list[str] = []
         self.structured_skips: list[dict[str, Any]] = []
+        self.drop_create_ack = False
+        self.transport_barriers: list[tuple[str, str]] = []
         self.warning_collector = _WarningCollector()
         logging.getLogger("pyne_core_logger").addHandler(self.warning_collector)
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineBybit:
         return OfflineBybit(self, run_name, store_ctx)
 
+    @staticmethod
+    def post_write_error(message: str) -> Exception:
+        return BybitConnectionError(message)
+
     def handle_step(self, runner: Any, step: Step) -> bool:
         if step.kind == "set_bybit_last_price":
             runner.runs[step.run].broker._last_price = float(step.values["price"])
+            return True
+        if step.kind == "drop_next_bybit_create_ack":
+            self.drop_create_ack = True
+            return True
+        if step.kind == "expect_bybit_post_write_ack_loss":
+            suppressed = [
+                coid for event, coid in self.transport_barriers
+                if event == "ack_suppressed"
+            ]
+            if len(suppressed) != 1:
+                raise AssertionError(
+                    f"expected one suppressed Bybit create ACK, got {suppressed}"
+                )
+            coid = suppressed[0]
+            events = [
+                event for event, event_coid in self.transport_barriers
+                if event_coid == coid
+            ]
+            if events != ["write_emitted", "ack_suppressed"]:
+                raise AssertionError(
+                    "post-write/pre-ACK seam not proven: "
+                    f"expected write then suppressed ACK, got {events}"
+                )
+            if not any(
+                raw.get("orderLinkId") == coid for raw in self.raw_orders.values()
+            ):
+                raise AssertionError(
+                    "post-write/pre-ACK seam not proven: venue order is absent"
+                )
+            pending = runner.runs[step.run].engine.pending_verification
+            if coid not in pending:
+                raise AssertionError(
+                    f"lost-ACK order {coid!r} was not parked for verification"
+                )
+            return True
+        if step.kind == "expect_bybit_no_pending_verification":
+            pending = runner.runs[step.run].engine.pending_verification
+            if pending:
+                raise AssertionError(
+                    f"expected no pending Bybit dispatch verification, got {pending}"
+                )
             return True
         if step.kind == "expect_bybit_request":
             requests = [
@@ -751,6 +808,65 @@ class BybitProfile(ReferenceVenueProfile):
         logging.getLogger("pyne_core_logger").removeHandler(self.warning_collector)
         super().close()
 
+    def check_invariants(self, runner: Any):
+        violations = list(super().check_invariants(runner))
+        live_by_coid: dict[str, int] = {}
+        for raw in self.raw_orders.values():
+            if raw["orderStatus"] in ("Cancelled", "Filled"):
+                continue
+            coid = str(raw.get("orderLinkId") or "")
+            live_by_coid[coid] = live_by_coid.get(coid, 0) + 1
+        for coid, count in live_by_coid.items():
+            if coid and count > 1:
+                violations.append(
+                    f"Bybit client-order-id idempotence violated for {coid}: "
+                    f"{count} live physical orders"
+                )
+        live_by_intent_leg: dict[tuple[str, str, str, str], int] = {}
+        for run_name, runtime in runner.runs.items():
+            for raw in self.raw_orders.values():
+                if raw["orderStatus"] in ("Cancelled", "Filled"):
+                    continue
+                row = runtime.store_ctx.get_order(str(raw.get("orderLinkId") or ""))
+                if row is None or not row.intent_key:
+                    continue
+                extras = row.extras or {}
+                key = (
+                    run_name,
+                    row.intent_key,
+                    str(extras.get("kind") or ""),
+                    str(extras.get("leg") or ""),
+                )
+                live_by_intent_leg[key] = live_by_intent_leg.get(key, 0) + 1
+        for (run_name, intent_key, kind, leg), count in live_by_intent_leg.items():
+            if count > 1:
+                violations.append(
+                    "Bybit exactly-once physical-order invariant violated for "
+                    f"{run_name}/{intent_key}/{kind}/{leg}: {count} live orders"
+                )
+        for event, coid in self.transport_barriers:
+            if event != "ack_suppressed":
+                continue
+            prior = []
+            for barrier_event, barrier_coid in self.transport_barriers:
+                if barrier_event == "ack_suppressed" and barrier_coid == coid:
+                    break
+                if barrier_coid == coid:
+                    prior.append(barrier_event)
+            if "write_emitted" not in prior:
+                violations.append(
+                    f"post-write/pre-ACK seam not proven for {coid}: write absent"
+                )
+        return violations
+
+
+class MisclassifiedAckLossBybitProfile(BybitProfile):
+    """Broken control that misclassifies a booked order as rejected."""
+
+    @staticmethod
+    def post_write_error(message: str) -> Exception:
+        return BybitAPIError(message, ret_code=10001)
+
 
 class AliasingBybitProfile(BybitProfile):
     """Deliberately broken physical-order identity model for oracle testing."""
@@ -793,6 +909,53 @@ class InverseBybitProfile(BybitProfile):
 
 def smoke_scenarios(seed: int = 0) -> list[Scenario]:
     return [
+        Scenario(
+            name="bybit-post-write-lost-create-ack-adopts-exactly-once",
+            profile_factory=BybitProfile,
+            seed=seed,
+            steps=(
+                Step("drop_next_bybit_create_ack"),
+                Step(
+                    "entry",
+                    values={"id": "ACK", "side": "buy", "qty": 0.1, "limit": 90.0},
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step("expect_bybit_post_write_ack_loss"),
+                Step("expect_bybit_create_count", values={"count": 1}),
+                Step("expect_bybit_raw_open_count", values={"count": 1}),
+                Step("restart", check_invariants=False),
+                Step(
+                    "entry",
+                    values={"id": "ACK", "side": "buy", "qty": 0.1, "limit": 90.0},
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step("expect_bybit_no_pending_verification"),
+                Step("expect_bybit_create_count", values={"count": 1}),
+                Step("expect_bybit_raw_open_count", values={"count": 1}),
+                Step("cancel", values={"id": "ACK"}),
+                Step("sync", values={"last_price": 100.0}),
+                Step("expect_bybit_raw_open_count", values={"count": 0}),
+                Step(
+                    "expect",
+                    values={"position": 0.0, "engine_position": 0.0, "open_orders": 0},
+                ),
+            ),
+        ),
+        Scenario(
+            name="control-bybit-post-write-ack-loss-reject-causes-duplicate",
+            profile_factory=MisclassifiedAckLossBybitProfile,
+            seed=seed,
+            expected_violation="Bybit exactly-once physical-order invariant violated",
+            steps=(
+                Step("drop_next_bybit_create_ack"),
+                Step(
+                    "entry",
+                    values={"id": "ACK", "side": "buy", "qty": 0.1, "limit": 90.0},
+                ),
+                Step("sync", values={"last_price": 100.0}),
+                Step("sync", values={"last_price": 100.0}),
+            ),
+        ),
         Scenario(
             name="bybit-market-entry-uses-real-transport-shape",
             profile_factory=BybitProfile,
