@@ -14,10 +14,12 @@ only add endpoints, not transport machinery.
 State touched: ``_http_client`` (lazy, connection-pooled), ``_instruments``
 (the per-``(category, symbol)`` rule cache filled by the provider mix-in).
 """
+
 import asyncio
 import hashlib
 import hmac
 import json as json_module
+import logging
 import time
 from json import JSONDecodeError
 from urllib.parse import urlencode
@@ -27,6 +29,15 @@ import httpx
 from ._base import _BybitBase
 from .exceptions import BybitAPIError, BybitConnectionError
 from .helpers import RECV_WINDOW_MS, REST_TIMEOUT_S
+
+logger = logging.getLogger(__name__)
+
+_TIMESTAMP_RETRY_COUNT = 2
+_TIMESTAMP_RECV_WINDOW_STEP_MS = 2_500
+
+
+def _epoch_ms() -> int:
+    return int(time.time() * 1000)
 
 
 class _RestMixin(_BybitBase):
@@ -49,9 +60,15 @@ class _RestMixin(_BybitBase):
             self._http_client = client
         return client
 
-    def __call__(self, endpoint: str, params: dict | None = None, *,
-                 method: str = 'get', body: dict | None = None,
-                 auth: bool = False) -> dict:
+    def __call__(
+        self,
+        endpoint: str,
+        params: dict | None = None,
+        *,
+        method: str = "get",
+        body: dict | None = None,
+        auth: bool = False,
+    ) -> dict:
         """Call a Bybit v5 REST endpoint (synchronous).
 
         :param endpoint: Path below the host (e.g. ``"/v5/market/kline"``).
@@ -66,44 +83,62 @@ class _RestMixin(_BybitBase):
         query = {k: v for k, v in (params or {}).items() if v is not None}
         method_lc = method.lower()
 
-        headers: dict[str, str] = {}
+        base_headers: dict[str, str] = {}
         content: str | None = None
-        if method_lc == 'post':
+        if method_lc == "post":
             content = json_module.dumps(body or {})
-            headers['Content-Type'] = 'application/json'
-        if auth:
-            payload = content if method_lc == 'post' else urlencode(query)
-            headers.update(self._sign_headers(payload or ''))
+            base_headers["Content-Type"] = "application/json"
+        payload = content if method_lc == "post" else urlencode(query)
+        recv_window_ms = RECV_WINDOW_MS
 
-        try:
-            res = self._get_http_client().request(
-                method_lc.upper(), endpoint,
-                params=query or None, content=content, headers=headers,
-            )
-        except (httpx.TimeoutException, httpx.TransportError) as e:
-            raise BybitConnectionError(
-                f"Bybit HTTP transport error on {endpoint}: {e}"
-            ) from e
-        try:
-            envelope = res.json()
-        except JSONDecodeError as e:
-            raise BybitConnectionError(
-                f"Bybit returned non-JSON response on {endpoint} "
-                f"(HTTP {res.status_code})"
-            ) from e
+        for attempt in range(_TIMESTAMP_RETRY_COUNT + 1):
+            headers = dict(base_headers)
+            if auth:
+                headers.update(self._sign_headers(payload or "", recv_window_ms))
+            try:
+                res = self._get_http_client().request(
+                    method_lc.upper(),
+                    endpoint,
+                    params=query or None,
+                    content=content,
+                    headers=headers,
+                )
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                raise BybitConnectionError(f"Bybit HTTP transport error on {endpoint}: {e}") from e
+            try:
+                envelope = res.json()
+            except JSONDecodeError as e:
+                raise BybitConnectionError(
+                    f"Bybit returned non-JSON response on {endpoint} " f"(HTTP {res.status_code})"
+                ) from e
 
-        ret_code = int(envelope.get('retCode', -1))
-        if ret_code != 0:
+            ret_code = int(envelope.get("retCode", -1))
+            if ret_code == 0:
+                return envelope.get("result") or {}
+            if auth and ret_code == 10002 and attempt < _TIMESTAMP_RETRY_COUNT:
+                recv_window_ms += _TIMESTAMP_RECV_WINDOW_STEP_MS
+                logger.warning(
+                    "Bybit authenticated request timestamp expired on %s; "
+                    "retrying with a fresh signature and recv_window=%d ms",
+                    endpoint,
+                    recv_window_ms,
+                )
+                continue
             raise BybitAPIError(
-                f"Bybit API error on {endpoint}: retCode={ret_code} "
-                f"retMsg={envelope.get('retMsg', '')!r}",
+                f"Bybit API error on {endpoint}: retCode={ret_code} " f"retMsg={envelope.get('retMsg', '')!r}",
                 ret_code=ret_code,
             )
-        return envelope.get('result') or {}
+        raise AssertionError("Bybit timestamp retry loop exhausted without a response")
 
-    async def _call(self, endpoint: str, params: dict | None = None, *,
-                    method: str = 'get', body: dict | None = None,
-                    auth: bool = False) -> dict:
+    async def _call(
+        self,
+        endpoint: str,
+        params: dict | None = None,
+        *,
+        method: str = "get",
+        body: dict | None = None,
+        auth: bool = False,
+    ) -> dict:
         """Async wrapper around the sync REST dispatcher.
 
         Offloading to a thread keeps the network call off the event loop
@@ -112,10 +147,19 @@ class _RestMixin(_BybitBase):
         magnitude below what :func:`asyncio.to_thread` can sustain.
         """
         return await asyncio.to_thread(
-            self, endpoint, params, method=method, body=body, auth=auth,
+            self,
+            endpoint,
+            params,
+            method=method,
+            body=body,
+            auth=auth,
         )
 
-    def _sign_headers(self, payload: str) -> dict[str, str]:
+    def _sign_headers(
+        self,
+        payload: str,
+        recv_window_ms: int = RECV_WINDOW_MS,
+    ) -> dict[str, str]:
         """Build the ``X-BAPI-*`` header set for a signed request.
 
         :param payload: The urlencoded query string (GET) or the raw JSON
@@ -124,18 +168,18 @@ class _RestMixin(_BybitBase):
         :return: Headers carrying key, timestamp, recv window and signature.
         """
         assert self.config is not None
-        timestamp = str(int(time.time() * 1000))
-        prefix = f"{timestamp}{self.config.api_key}{RECV_WINDOW_MS}"
+        timestamp = str(_epoch_ms())
+        prefix = f"{timestamp}{self.config.api_key}{recv_window_ms}"
         signature = hmac.new(
             self.config.api_secret.encode(),
             (prefix + payload).encode(),
             hashlib.sha256,
         ).hexdigest()
         return {
-            'X-BAPI-API-KEY': self.config.api_key,
-            'X-BAPI-TIMESTAMP': timestamp,
-            'X-BAPI-SIGN': signature,
-            'X-BAPI-RECV-WINDOW': str(RECV_WINDOW_MS),
+            "X-BAPI-API-KEY": self.config.api_key,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-RECV-WINDOW": str(recv_window_ms),
         }
 
     def _close_http_client(self) -> None:

@@ -14,9 +14,11 @@ on the global demo on 2026-07-16. Unknown non-zero codes on an
 order write default to :class:`ExchangeOrderRejectedError` — a safe
 fail-closed reject, never a silent success.
 """
+
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
     BrokerError,
+    ExchangeConnectionError,
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
     InsufficientMarginError,
@@ -62,7 +64,7 @@ class BybitAPIError(BybitError):
     #: rate limiting (10006), internal errors (10016), timeouts (10000) and
     #: the WS/system-maintenance code (10018). Everything else is treated as
     #: a permanent request problem.
-    _RETRYABLE_CODES = frozenset({10000, 10006, 10016, 10018})
+    _RETRYABLE_CODES = frozenset({10000, 10002, 10006, 10016, 10018})
 
     def __init__(self, message: str, *, ret_code: int):
         super().__init__(message)
@@ -143,7 +145,7 @@ def is_benign_trading_stop_reject(exc: BybitAPIError) -> bool:
     """
     if exc.ret_code == 34040:
         return True
-    return exc.ret_code == 10001 and 'zero position' in str(exc)
+    return exc.ret_code == 10001 and "zero position" in str(exc)
 
 
 def is_reduce_only_zero_position_reject(exc: BybitAPIError) -> bool:
@@ -158,7 +160,7 @@ def is_reduce_only_zero_position_reject(exc: BybitAPIError) -> bool:
     a defensive close is still required — so the "position is zero" message
     is matched too (mirrors :func:`is_benign_trading_stop_reject`).
     """
-    return exc.ret_code == 110017 and 'position is zero' in str(exc)
+    return exc.ret_code == 110017 and "position is zero" in str(exc)
 
 
 def map_broker_error(exc: BybitAPIError) -> BrokerError | None:
@@ -177,6 +179,8 @@ def map_broker_error(exc: BybitAPIError) -> BrokerError | None:
         return AuthenticationError(str(exc), reason=f"retCode={exc.ret_code}")
     if exc.ret_code in RATE_LIMIT_CODES:
         return ExchangeRateLimitError(str(exc), retry_after=1.0)
+    if exc.ret_code == 10002:
+        return ExchangeConnectionError(str(exc))
     if exc.ret_code in INSUFFICIENT_BALANCE_CODES:
         return InsufficientMarginError(str(exc))
     return None
