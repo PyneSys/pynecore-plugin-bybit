@@ -26,8 +26,9 @@ the ``.P`` suffix), then probes ``instruments-info`` per category in the
 order above. The first category that lists the name wins.
 
 State touched: ``_instruments`` (per ``(category, symbol)``
-:class:`~.models.InstrumentInfo` cache), ``_market`` (the chart symbol's
-resolved instrument, pinned on first use).
+:class:`~.models.InstrumentInfo` cache), ``_market`` (the currently configured
+chart symbol's resolved instrument) and ``_market_symbol`` (its user-facing
+cache key).
 """
 from datetime import UTC, datetime, time
 from typing import Callable, Literal
@@ -176,13 +177,21 @@ class _ProviderMixin(_BybitBase):
         )
 
     def _get_market(self) -> InstrumentInfo:
-        """Return the chart symbol's resolved instrument, pinning on first use."""
+        """Return the currently configured chart symbol's resolved instrument."""
+        symbol = self.symbol
+        if not symbol:
+            raise BybitSymbolError("Bybit provider has no symbol configured")
+
         market = self._market
-        if market is None:
-            if not self.symbol:
-                raise BybitSymbolError("Bybit provider has no symbol configured")
-            market = self._resolve_market(self.symbol)
+        market_symbol = self._market_symbol
+        if market is not None and market_symbol is None:
+            # Keep test fixtures and private integrations that seed ``_market``
+            # directly compatible by associating the injected value lazily.
+            self._market_symbol = symbol
+        elif market is None or market_symbol != symbol:
+            market = self._resolve_market(symbol)
             self._market = market
+            self._market_symbol = symbol
         return market
 
     # --- symbol metadata -----------------------------------------------------

@@ -94,8 +94,12 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # Normalized instrument-rule cache keyed by ``(category, symbol)``,
     # shared by symbol resolution, SymInfo synthesis and order quantization.
     _instruments: 'dict[tuple[str, str], InstrumentInfo]'
-    # The chart symbol's resolved instrument, pinned on first use.
+    # The currently configured chart symbol's resolved instrument.
     _market: 'InstrumentInfo | None'
+    # User-facing ``self.symbol`` value for which ``_market`` was resolved.
+    # The symbol browser reuses one provider instance and changes ``self.symbol``
+    # as the cursor moves, so the cached market must follow it.
+    _market_symbol: str | None
 
     # --- WebSocket state (live_provider.py) ---
     # Public market-stream connection. ``None`` until ``connect()`` has run

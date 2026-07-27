@@ -253,6 +253,35 @@ def __test_bybit_update_symbol_info__():
         plugin.update_symbol_info()
 
 
+def __test_bybit_market_cache_follows_symbol__():
+    """A reused provider resolves the market again when its symbol changes."""
+    listed = {
+        ('spot', '0GUSDT'): _instrument(
+            'spot', '0GUSDT', base_coin='0G', tick_size_str='0.0001',
+            tick_size=0.0001,
+        ),
+        ('linear', '1000XECUSDT'): _instrument(
+            'linear', '1000XECUSDT', base_coin='1000XEC',
+            tick_size_str='0.00001', tick_size=0.00001,
+        ),
+    }
+
+    class _Resolver(_FakeRestBybit):
+        def _fetch_instrument(self, category, symbol):
+            return listed.get((category, symbol))
+
+    plugin = _Resolver(symbol='0GUSDT', timeframe='1D')
+    first = plugin.update_symbol_info()
+    plugin.symbol = '1000XECUSDT.P'
+    second = plugin.update_symbol_info()
+
+    assert first.ticker == '0GUSDT'
+    assert first.basecurrency == '0G'
+    assert second.ticker == '1000XECUSDT.P'
+    assert second.basecurrency == '1000XEC'
+    assert second.mintick == 0.00001
+
+
 def __test_bybit_download_paging__(tmp_path):
     """Forward paging: ascending writes, forming-bar drop, boundary dedup"""
     now = int(datetime.now(UTC).timestamp()) // 60 * 60

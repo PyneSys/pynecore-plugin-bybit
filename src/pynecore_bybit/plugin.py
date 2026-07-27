@@ -100,6 +100,7 @@ class Bybit(
         # Instrument resolution caches.
         self._instruments = {}
         self._market = None
+        self._market_symbol = None
 
         # Live streaming state (set on connect by ``_LiveProviderMixin``).
         self._public_ws = None
