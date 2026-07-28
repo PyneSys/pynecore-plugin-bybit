@@ -216,7 +216,7 @@ class _LiveProviderMixin(_BybitBase):
             return
         interval = self.to_exchange_timeframe(self.timeframe)
         cursor = add_interval(last_closed, interval, 1)
-        now_ts = int(epoch_time())
+        now_ts = int(epoch_time() * 1000)
         if bar_close_ts(cursor, interval) > now_ts:
             return
         market = await asyncio.to_thread(self._get_market)
@@ -227,13 +227,13 @@ class _LiveProviderMixin(_BybitBase):
                 'category': market.category,
                 'symbol': market.symbol,
                 'interval': interval,
-                'start': cursor * 1000,
-                'end': chunk_end * 1000,
+                'start': cursor,
+                'end': chunk_end,
                 'limit': KLINE_LIMIT,
             })
             wrote = False
             for row in sorted(result.get('list') or [], key=lambda r: int(r[0])):
-                bar_start = int(row[0]) // 1000
+                bar_start = int(row[0])
                 if bar_start <= (self._last_closed_bar_ts or 0):
                     continue
                 if bar_close_ts(bar_start, interval) > now_ts:
@@ -304,7 +304,7 @@ class _LiveProviderMixin(_BybitBase):
         for entry in data.get('data') or ():
             try:
                 bar = OHLCV(
-                    timestamp=int(entry['start']) // 1000,
+                    timestamp=int(entry['start']),
                     open=float(entry['open']),
                     high=float(entry['high']),
                     low=float(entry['low']),

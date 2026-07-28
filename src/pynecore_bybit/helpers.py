@@ -33,22 +33,22 @@ TIMEFRAMES: dict[str, str] = {
 
 TIMEFRAMES_INV: dict[str, str] = {v: k for k, v in TIMEFRAMES.items()}
 
-# Bar duration in seconds per Bybit interval. ``M`` is absent on purpose:
+# Bar duration in milliseconds per Bybit interval. ``M`` is absent on purpose:
 # calendar months vary in length, use :func:`add_interval` /
 # :func:`bar_close_ts` instead of a fixed step.
-INTERVAL_SECONDS: dict[str, int] = {
-    '1': 60,
-    '3': 180,
-    '5': 300,
-    '15': 900,
-    '30': 1800,
-    '60': 3600,
-    '120': 7200,
-    '240': 14400,
-    '360': 21600,
-    '720': 43200,
-    'D': 86400,
-    'W': 604800,
+INTERVAL_MS: dict[str, int] = {
+    '1': 60_000,
+    '3': 180_000,
+    '5': 300_000,
+    '15': 900_000,
+    '30': 1_800_000,
+    '60': 3_600_000,
+    '120': 7_200_000,
+    '240': 14_400_000,
+    '360': 21_600_000,
+    '720': 43_200_000,
+    'D': 86_400_000,
+    'W': 604_800_000,
 }
 
 # ``GET /v5/market/kline`` serves at most this many candles per request.
@@ -260,30 +260,31 @@ def round_price(price: float, tick_str: str) -> Decimal:
 
 
 def add_interval(ts: int, interval: str, n: int) -> int:
-    """Return the epoch-seconds timestamp ``n`` bars after ``ts``.
+    """Return the epoch-milliseconds timestamp ``n`` bars after ``ts``.
 
     Fixed-length intervals advance arithmetically; calendar months advance
     on UTC month boundaries (Bybit ``M`` bars open on the first of the
     month, 00:00 UTC).
 
-    :param ts: Bar-open epoch seconds (for ``M`` it must be a month start).
+    :param ts: Bar-open epoch milliseconds (for ``M`` it must be a month start).
     :param interval: Bybit kline interval value.
     :param n: Number of bars to advance (may be 0).
-    :return: Epoch seconds of the bar open ``n`` bars later.
+    :return: Epoch milliseconds of the bar open ``n`` bars later.
     """
-    seconds = INTERVAL_SECONDS.get(interval)
-    if seconds is not None:
-        return ts + n * seconds
-    dt = datetime.fromtimestamp(ts, UTC)
+    step_ms = INTERVAL_MS.get(interval)
+    if step_ms is not None:
+        return ts + n * step_ms
+    dt = datetime.fromtimestamp(ts / 1000.0, UTC)
     month_index = dt.year * 12 + (dt.month - 1) + n
-    return int(datetime(month_index // 12, month_index % 12 + 1, 1, tzinfo=UTC).timestamp())
+    month_start = datetime(month_index // 12, month_index % 12 + 1, 1, tzinfo=UTC)
+    return int(month_start.timestamp()) * 1000
 
 
 def bar_close_ts(bar_start: int, interval: str) -> int:
-    """Return the epoch-seconds close time of the bar opening at ``bar_start``.
+    """Return the epoch-milliseconds close time of the bar opening at ``bar_start``.
 
-    :param bar_start: Bar-open epoch seconds.
+    :param bar_start: Bar-open epoch milliseconds.
     :param interval: Bybit kline interval value.
-    :return: Epoch seconds at which the bar closes (== next bar's open).
+    :return: Epoch milliseconds at which the bar closes (== next bar's open).
     """
     return add_interval(bar_start, interval, 1)

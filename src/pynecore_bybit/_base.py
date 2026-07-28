@@ -120,8 +120,9 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     _data_ready: 'asyncio.Event | None'
     # Stale-feed watchdog task. Cancelled on disconnect.
     _watchdog_task: 'asyncio.Task | None'
-    # Most recent closed bar's open timestamp (epoch seconds). Sizes the
-    # reconnect REST backfill window and guards closed-bar duplicates.
+    # Most recent closed bar's open timestamp (epoch milliseconds, the unit
+    # both the Bybit kline API and OHLCV records use). Sizes the reconnect
+    # REST backfill window and guards closed-bar duplicates.
     _last_closed_bar_ts: int | None
     # Holding pen for WS closed bars while a reconnect backfill is pending
     # (``None`` = no backfill pending). See ``connect()`` for the ordering

@@ -329,22 +329,22 @@ class _ProviderMixin(_BybitBase):
             else time_to.astimezone(UTC)
         end_dt = min(end_dt, datetime.now(UTC))
 
-        cursor = int(start_dt.timestamp())
-        end_ts = int(end_dt.timestamp())
-        now_ts = int(datetime.now(UTC).timestamp())
+        cursor = int(start_dt.timestamp()) * 1000
+        end_ts = int(end_dt.timestamp()) * 1000
+        now_ts = int(datetime.now(UTC).timestamp()) * 1000
         last_written: int | None = None
 
         while cursor < end_ts:
             chunk_end = min(add_interval(cursor, interval, effective_limit - 1), end_ts)
             if on_progress is not None:
-                on_progress(datetime.fromtimestamp(cursor, UTC).replace(tzinfo=None))
+                on_progress(datetime.fromtimestamp(cursor / 1000.0, UTC).replace(tzinfo=None))
 
             result = self('/v5/market/kline', {
                 'category': market.category,
                 'symbol': market.symbol,
                 'interval': interval,
-                'start': cursor * 1000,
-                'end': chunk_end * 1000,
+                'start': cursor,
+                'end': chunk_end,
                 'limit': effective_limit,
             })
             rows = result.get('list') or []
@@ -356,7 +356,7 @@ class _ProviderMixin(_BybitBase):
 
             # Bybit returns newest-first; ascend before writing.
             for row in sorted(rows, key=lambda r: int(r[0])):
-                bar_start = int(row[0]) // 1000
+                bar_start = int(row[0])
                 if bar_start < cursor:
                     # Defensive: stay strictly within the requested window.
                     continue

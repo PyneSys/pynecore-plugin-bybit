@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from pynecore.core.ohlcv_file import OHLCVReader
+from pynecore.core.ohlcv import OHLCVReader
 from pynecore.types.ohlcv import OHLCV
 import pynecore_bybit.live_provider as live_provider_module
 from pynecore_bybit import Bybit, BybitConfig
@@ -172,15 +172,15 @@ def __test_bybit_parse_instrument__():
 
 def __test_bybit_interval_math__():
     """Fixed intervals advance arithmetically, months on calendar boundaries"""
-    jan = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())
-    assert add_interval(jan, '60', 3) == jan + 3 * 3600
-    assert add_interval(jan, 'W', 2) == jan + 2 * 604800
-    assert datetime.fromtimestamp(add_interval(jan, 'M', 1), UTC) \
+    jan = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp()) * 1000
+    assert add_interval(jan, '60', 3) == jan + 3 * 3_600_000
+    assert add_interval(jan, 'W', 2) == jan + 2 * 604_800_000
+    assert datetime.fromtimestamp(add_interval(jan, 'M', 1) / 1000, UTC) \
         == datetime(2026, 2, 1, tzinfo=UTC)
-    assert datetime.fromtimestamp(add_interval(jan, 'M', 13), UTC) \
+    assert datetime.fromtimestamp(add_interval(jan, 'M', 13) / 1000, UTC) \
         == datetime(2027, 2, 1, tzinfo=UTC)
-    dec = int(datetime(2025, 12, 1, tzinfo=UTC).timestamp())
-    assert datetime.fromtimestamp(bar_close_ts(dec, 'M'), UTC) \
+    dec = int(datetime(2025, 12, 1, tzinfo=UTC).timestamp()) * 1000
+    assert datetime.fromtimestamp(bar_close_ts(dec, 'M') / 1000, UTC) \
         == datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -284,16 +284,16 @@ def __test_bybit_market_cache_follows_symbol__():
 
 def __test_bybit_download_paging__(tmp_path):
     """Forward paging: ascending writes, forming-bar drop, boundary dedup"""
-    now = int(datetime.now(UTC).timestamp()) // 60 * 60
-    start = now - 10 * 60
+    now = int(datetime.now(UTC).timestamp()) // 60 * 60 * 1000
+    start = now - 10 * 60_000
 
     def _row(ts):
-        return [str(ts * 1000), '100', '101', '99', '100.5', '2.5', '250']
+        return [str(ts), '100', '101', '99', '100.5', '2.5', '250']
 
     # Two pages, newest-first as Bybit serves them; the second page repeats
     # the boundary bar and includes the still-forming current minute.
-    page1 = {'list': [_row(ts) for ts in range(start + 4 * 60, start - 60, -60)]}
-    page2 = {'list': [_row(ts) for ts in range(now, start + 3 * 60, -60)]}
+    page1 = {'list': [_row(ts) for ts in range(start + 4 * 60_000, start - 60_000, -60_000)]}
+    page2 = {'list': [_row(ts) for ts in range(now, start + 3 * 60_000, -60_000)]}
 
     plugin = _FakeRestBybit([page1, page2], symbol='BTCUSDT', timeframe='1',
                             ohlcv_dir=tmp_path)
@@ -301,7 +301,8 @@ def __test_bybit_download_paging__(tmp_path):
     # Chunk size 5 forces two requests over the 10-bar window.
     with plugin:
         plugin.download_ohlcv(
-            datetime.fromtimestamp(start, UTC), datetime.fromtimestamp(now, UTC),
+            datetime.fromtimestamp(start / 1000, UTC),
+            datetime.fromtimestamp(now / 1000, UTC),
             limit=5,
         )
 
@@ -309,7 +310,7 @@ def __test_bybit_download_paging__(tmp_path):
         bars = list(reader)
     timestamps = [b.timestamp for b in bars]
     # 10 closed bars, strictly ascending, no duplicates, forming bar absent.
-    assert timestamps == list(range(start, now, 60))
+    assert timestamps == list(range(start, now, 60_000))
     assert all(b.close == 100.5 for b in bars)
     assert plugin.calls[0][0] == '/v5/market/kline'
     assert plugin.calls[0][1]['category'] == 'spot'
@@ -321,7 +322,7 @@ def __test_bybit_ws_dispatch__():
     def _push(ts, confirm, close='101'):
         return {
             'topic': 'kline.1.BTCUSDT',
-            'data': [{'start': str(ts * 1000), 'open': '100', 'high': '102',
+            'data': [{'start': str(ts), 'open': '100', 'high': '102',
                       'low': '99', 'close': close, 'volume': '3',
                       'confirm': confirm}],
         }
@@ -331,39 +332,39 @@ def __test_bybit_ws_dispatch__():
         plugin._update_queue = asyncio.Queue()
         plugin._data_ready = asyncio.Event()
 
-        plugin._on_ws_message(_push(60, False, close='100.7'))
+        plugin._on_ws_message(_push(60_000, False, close='100.7'))
         assert plugin._update_queue.empty()
         snapshot = plugin._latest_snapshot
         assert snapshot is not None and not snapshot.is_closed
         assert snapshot.close == 100.7
 
-        plugin._on_ws_message(_push(60, True))
+        plugin._on_ws_message(_push(60_000, True))
         closed = plugin._update_queue.get_nowait()
-        assert closed.is_closed and closed.timestamp == 60
-        assert plugin._last_closed_bar_ts == 60
+        assert closed.is_closed and closed.timestamp == 60_000
+        assert plugin._last_closed_bar_ts == 60_000
         # The forming snapshot of the just-closed bar is stale — cleared so
         # it cannot be emitted as an intra-bar tick after its own close.
         assert plugin._latest_snapshot is None
 
         # Duplicate confirm is dropped.
-        plugin._on_ws_message(_push(60, True))
+        plugin._on_ws_message(_push(60_000, True))
         assert plugin._update_queue.empty()
 
         # Pending mode (reconnect backfill in flight) holds closed bars back,
         # then releases them in order after the backfill.
         plugin._pending_closed = []
-        plugin._on_ws_message(_push(240, True))
-        plugin._on_ws_message(_push(180, True))
+        plugin._on_ws_message(_push(240_000, True))
+        plugin._on_ws_message(_push(180_000, True))
         assert plugin._update_queue.empty()
         # A forming bar NEWER than every released close must survive the
         # release; the stale-snapshot clearing only drops same-or-older ones.
-        plugin._on_ws_message(_push(300, False))
+        plugin._on_ws_message(_push(300_000, False))
         plugin._release_pending_closed()
-        assert plugin._update_queue.get_nowait().timestamp == 180
-        assert plugin._update_queue.get_nowait().timestamp == 240
+        assert plugin._update_queue.get_nowait().timestamp == 180_000
+        assert plugin._update_queue.get_nowait().timestamp == 240_000
         assert plugin._pending_closed is None
         assert plugin._latest_snapshot is not None
-        assert plugin._latest_snapshot.timestamp == 300
+        assert plugin._latest_snapshot.timestamp == 300_000
 
         # Sentinel surfacing: watch_ohlcv raises ConnectionError.
         await plugin._on_ws_closed()
@@ -414,17 +415,19 @@ def __test_bybit_reconnect_backfill__(monkeypatch):
     """Backfill pages beyond one kline request; a REST failure keeps the gap"""
     # Freeze the backfill clock mid-minute so a wall-clock minute boundary
     # during the test cannot open an extra (uncanned) request window.
-    now = int(datetime.now(UTC).timestamp()) // 60 * 60
-    monkeypatch.setattr(live_provider_module, 'epoch_time', lambda: now + 30)
+    now_s = int(datetime.now(UTC).timestamp()) // 60 * 60
+    monkeypatch.setattr(live_provider_module, 'epoch_time', lambda: now_s + 30)
+    now = now_s * 1000
 
     def _row(ts):
-        return [str(ts * 1000), '100', '101', '99', '100.5', '2.5', '250']
+        return [str(ts), '100', '101', '99', '100.5', '2.5', '250']
 
     async def paged_scenario():
         gap_bars = KLINE_LIMIT + 2
-        last_closed = now - (gap_bars + 1) * 60
-        first_window = range(last_closed + 60, last_closed + 60 + KLINE_LIMIT * 60, 60)
-        second_window = range(last_closed + 60 + KLINE_LIMIT * 60, now, 60)
+        last_closed = now - (gap_bars + 1) * 60_000
+        first_window = range(last_closed + 60_000,
+                             last_closed + 60_000 + KLINE_LIMIT * 60_000, 60_000)
+        second_window = range(last_closed + 60_000 + KLINE_LIMIT * 60_000, now, 60_000)
 
         plugin = _FakeRestBybit(
             [{'list': [_row(ts) for ts in reversed(first_window)]},
@@ -443,8 +446,8 @@ def __test_bybit_reconnect_backfill__(monkeypatch):
         timestamps = []
         while not plugin._update_queue.empty():
             timestamps.append(plugin._update_queue.get_nowait().timestamp)
-        assert timestamps == list(range(last_closed + 60, now, 60))
-        assert plugin._last_closed_bar_ts == now - 60
+        assert timestamps == list(range(last_closed + 60_000, now, 60_000))
+        assert plugin._last_closed_bar_ts == now - 60_000
         assert plugin._pending_closed is None
 
     async def failing_scenario():
@@ -460,13 +463,13 @@ def __test_bybit_reconnect_backfill__(monkeypatch):
             async def close(self):
                 self.closed = True
 
-        now = int(datetime.now(UTC).timestamp()) // 60 * 60
+        now = int(datetime.now(UTC).timestamp()) // 60 * 60 * 1000
         plugin = _FailingRest(symbol='BTCUSDT', timeframe='1')
         plugin._market = _instrument('spot', 'BTCUSDT')
         plugin._update_queue = asyncio.Queue()
         plugin._data_ready = asyncio.Event()
-        plugin._last_closed_bar_ts = now - 600
-        held = OHLCV(timestamp=now - 60, open=100.0, high=101.0, low=99.0,
+        plugin._last_closed_bar_ts = now - 600_000
+        held = OHLCV(timestamp=now - 60_000, open=100.0, high=101.0, low=99.0,
                      close=100.5, volume=1.0, is_closed=True)
         plugin._pending_closed = [held]
         ws = _FakeWS()
@@ -480,14 +483,14 @@ def __test_bybit_reconnect_backfill__(monkeypatch):
         # drives the runner into another full reconnect + backfill cycle.
         with pytest.raises(BybitConnectionError):
             await plugin.on_reconnect()
-        assert plugin._last_closed_bar_ts == now - 600
+        assert plugin._last_closed_bar_ts == now - 600_000
         assert plugin._pending_closed is None
         assert ws.closed and plugin._public_ws is None
         # The queued sentinel makes the consumer raise, which is what sends
         # the runner into another full reconnect + backfill cycle.
         with pytest.raises(ConnectionError):
             await plugin.watch_ohlcv('BTCUSDT', '1')
-        assert plugin._last_closed_bar_ts == now - 600
+        assert plugin._last_closed_bar_ts == now - 600_000
 
     asyncio.run(paged_scenario())
     asyncio.run(failing_scenario())
