@@ -372,6 +372,34 @@ class _PositionsMixin(_BybitBase, ABC):
 
     # --- startup adoption baseline (double-count barrier) -----------------------
 
+    def _parked_adoption_executions(
+            self, market: InstrumentInfo, order_id: str, floor_ms: int,
+    ) -> tuple[set[str], float]:
+        """Return exact private execution slices parked behind the adoption gate."""
+        ids: set[str] = set()
+        quantity = 0.0
+        for frame in self._pre_adoption_frames:
+            if str(frame.get('topic') or '') != 'execution':
+                continue
+            for entry in frame.get('data') or ():
+                if str(entry.get('symbol') or '') != market.symbol:
+                    continue
+                if str(entry.get('category') or market.category) != market.category:
+                    continue
+                if str(entry.get('execType') or 'Trade') != 'Trade':
+                    continue
+                if str(entry.get('orderId') or '') != order_id:
+                    continue
+                exec_time = _wire_int(entry.get('execTime'), field='execTime')
+                if exec_time > floor_ms:
+                    continue
+                exec_id = str(entry.get('execId') or '')
+                if not exec_id or exec_id in ids:
+                    continue
+                ids.add(exec_id)
+                quantity += _wire_float(entry.get('execQty'), field='execQty')
+        return ids, quantity
+
     async def _venue_time_ms(self) -> int:
         """Read the venue server clock (``/v5/market/time``) in epoch-ms."""
         result = await self._call('/v5/market/time')
@@ -571,6 +599,13 @@ class _PositionsMixin(_BybitBase, ABC):
                             "adoption baseline: execution seed read failed "
                             f"for order {order_id}",
                         )
+                    parked_ids, parked_qty = self._parked_adoption_executions(
+                        market,
+                        order_id,
+                        floor_ms,
+                    )
+                    ids.update(parked_ids)
+                    qty_sum += parked_qty
                 if lookup is not None:
                     # F8 order-truth gate: the position snapshot can reflect
                     # a fill whose execution row is not indexed yet — a

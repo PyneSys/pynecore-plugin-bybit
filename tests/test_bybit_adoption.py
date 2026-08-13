@@ -2,6 +2,8 @@
 @pyne
 """
 import asyncio
+from collections.abc import AsyncGenerator
+from typing import cast
 
 import pytest
 
@@ -472,6 +474,26 @@ def __test_baseline_full_seed_completes_exit_intent__(tmp_path):
     assert 'exit1' not in envelopes
 
 
+def __test_baseline_uses_parked_private_execution_while_rest_index_lags__(tmp_path):
+    broker = _AdoptionFake(
+        market=_linear_instrument(),
+        positions=[_pos(side='Buy', size='0.01')],
+        execs={'o1': []},
+        order_lookups={'c11': {'orderId': 'o1', 'orderStatus': 'Filled',
+                               'cumExecQty': '0.01'}},
+    )
+    _open(tmp_path, broker)
+    _seed(broker, 'c11', qty=0.01, filled_qty=0.0)
+    broker._pre_adoption_frames = [_exec_frame('e-private', '0.01', coid='c11')]
+
+    _adopt(broker)
+
+    assert broker._adoption_baselined is True
+    assert broker.store_ctx.get_order('c11').filled_qty == 0.01
+    assert 'e-private' in broker._seen_exec_ids
+    assert broker._replay_pre_adoption_frames(broker._market) == []
+
+
 def __test_baseline_raises_on_execution_index_lag__(tmp_path):
     # The order truth gate: both stable position snapshots already reflect
     # a fill whose execution row is not indexed yet — the walked execQty
@@ -573,7 +595,7 @@ def __test_startup_gate_parks_frames_until_baseline__(tmp_path):
         queue.put_nowait(_exec_frame('e-race', '0.006'))
         broker._private_events = queue
         broker._private_ws = type('_StubWS', (), {'is_open': True})()
-        agen = broker.watch_orders()
+        agen = cast(AsyncGenerator, broker.watch_orders())
         task = asyncio.ensure_future(agen.__anext__())
         # ``drained`` fires when the loop consumed the frame and blocked
         # on the next (empty) read — the deterministic "frame processed"
@@ -609,7 +631,13 @@ def __test_startup_gate_replay_owns_each_fill_once__(tmp_path):
     _seed(broker, 'c2', qty=0.002, filled_qty=0.0, exchange_order_id='o2')
     broker._pre_adoption_frames = [
         _exec_frame('e-race', '0.006'),
-        _exec_frame('e-post', '0.002', coid='c2', order_id='o2'),
+        {
+            **_exec_frame('e-post', '0.002', coid='c2', order_id='o2'),
+            'data': [{
+                **_exec_frame('e-post', '0.002', coid='c2', order_id='o2')['data'][0],
+                'execTime': str(_VENUE_TIME_MS + 1000),
+            }],
+        },
     ]
     market = broker._market
     # While the gate is active the replay is a no-op — nothing may be
