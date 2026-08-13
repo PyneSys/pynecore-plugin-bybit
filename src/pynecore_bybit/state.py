@@ -21,6 +21,7 @@ plus the broker lifecycle glue:
 """
 import asyncio
 import logging
+from abc import ABC
 from dataclasses import replace
 
 from pynecore.core.broker.exceptions import (
@@ -37,7 +38,7 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.plugin import override
 
-from ._base import _BybitBase
+from ._base import _BybitBase, _JsonScalar
 from .exceptions import (
     BybitAPIError,
     BybitConnectionError,
@@ -113,7 +114,7 @@ def parse_exchange_order(entry: dict) -> ExchangeOrder:
     )
 
 
-class _StateMixin(_BybitBase):
+class _StateMixin(_BybitBase, ABC):
     """Broker state queries, capability declaration and startup glue."""
 
     # --- account identity ---------------------------------------------------
@@ -162,6 +163,24 @@ class _StateMixin(_BybitBase):
                 f"instrument ({market.symbol!r}) — this is a plugin bug"
             )
         return market
+
+    async def call_api(
+            self, endpoint: str, params: dict[str, _JsonScalar] | None = None, *,
+            method: str = 'get', body: dict[str, _JsonScalar] | None = None,
+            auth: bool = False,
+    ) -> dict:
+        """Call the Bybit API for a composed internal service."""
+        return await self._call(
+            endpoint, params, method=method, body=body, auth=auth,
+        )
+
+    async def fetch_wallet_coin(self, coin: str) -> dict:
+        """Fetch one wallet-balance coin row for the inventory service."""
+        return await self._fetch_wallet_coin(coin)
+
+    def owns_order_link_id(self, link_id: str) -> bool:
+        """Whether the current process dispatched ``link_id``."""
+        return link_id in self._order_identity
 
     def _broker_market(self) -> InstrumentInfo:
         """Return the chart instrument for the broker paths.
@@ -312,20 +331,18 @@ class _StateMixin(_BybitBase):
                     if mode == POSITION_MODE_HEDGE else "",
                 )
             elif self.store_ctx is not None:
-                from pynecore.core.broker.spot_inventory import SpotInventoryManager
-                from .inventory import spot_port_for
-                port = spot_port_for(self, market)
-                # Exposed for the startup contract probe's port-surface
-                # check and for operator introspection.
-                self.spot_inventory_port = port
-                manager = SpotInventoryManager(
-                    self.store_ctx,
-                    port,
+                from .inventory import spot_manager_for
+                manager, port = spot_manager_for(
+                    self,
+                    market,
                     account_id=self.account_id,
                     symbol=self.symbol or market.symbol,
                     request_quarantine=self.quarantine_sink,
                     on_inventory_conflict=self.on_inventory_conflict,
                 )
+                # Exposed for the startup contract probe's port-surface
+                # check and for operator introspection.
+                self.spot_inventory_port = port
                 result = await manager.startup()
                 self._spot_manager = manager
                 self._spot_port = port

@@ -24,6 +24,7 @@ there for the attribute surface.
 """
 import asyncio
 import logging
+from abc import ABC
 from time import time as epoch_time
 
 from pynecore.core.plugin import override
@@ -37,7 +38,7 @@ from .ws import BybitWebSocket
 logger = logging.getLogger(__name__)
 
 
-class _LiveProviderMixin(_BybitBase):
+class _LiveProviderMixin(_BybitBase, ABC):
     """Public kline stream + queue/snapshot bridge to ``watch_ohlcv``."""
 
     # --- Lifecycle -----------------------------------------------------------

@@ -67,6 +67,7 @@ Resolution rules:
 """
 import asyncio
 import logging
+from abc import ABC
 from decimal import Decimal, InvalidOperation
 from time import time as epoch_time
 
@@ -88,7 +89,7 @@ from .models import InstrumentInfo
 logger = logging.getLogger(__name__)
 
 
-class _RecoveryMixin(_BybitBase):
+class _RecoveryMixin(_BybitBase, ABC):
     """Persist-first crash recovery + startup-orphan retirement."""
 
     async def _recover_in_flight_submissions(self) -> None:
@@ -338,12 +339,16 @@ class _RecoveryMixin(_BybitBase):
                     "skipping the startup orphan pass", exc_info=True,
                 )
                 return False, False
-            for row in rows:
-                try:
-                    if float(row.get('size') or 0.0) > 0.0:
+            try:
+                for row in rows:
+                    if self._position_row_size(row) > 0.0:
                         return True, True
-                except (TypeError, ValueError):
-                    continue
+            except BybitError:
+                logger.warning(
+                    "Bybit recovery: position snapshot was invalid; "
+                    "skipping the startup orphan pass", exc_info=True,
+                )
+                return False, False
             return False, True
         manager = self._spot_manager
         if manager is None:

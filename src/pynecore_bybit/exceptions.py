@@ -54,6 +54,17 @@ class BybitAdoptionBaselineError(BybitError):
     retryable = True
 
 
+class BybitPositionDataError(BybitError):
+    """A position response contains an invalid numeric field.
+
+    Position snapshots are exposure authority, so malformed or non-finite
+    values must never degrade to an authoritative flat reading. Treat the
+    snapshot as retryable input failure and leave the last valid state intact.
+    """
+
+    retryable = True
+
+
 class BybitAPIError(BybitError):
     """The API answered with a non-zero ``retCode``.
 

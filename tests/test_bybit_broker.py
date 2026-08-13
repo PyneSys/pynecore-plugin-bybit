@@ -27,6 +27,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 
+import pynecore_bybit.events as events_module
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import BybitAPIError
 from pynecore_bybit.helpers import (
@@ -149,6 +150,70 @@ def _entry_envelope(**overrides) -> DispatchEnvelope:
         intent=EntryIntent(**values), run_tag='t3st',
         bar_ts_ms=1_752_600_000_000, coid_max_len=36,
     )
+
+
+def __test_private_account_update_fanout_is_non_consuming__():
+    plugin = _FakeBrokerBybit()
+    observed: list[dict] = []
+    unsubscribe = plugin.soak_subscribe_account_updates(observed.append)
+    frame = {'topic': 'wallet', 'data': [{'coin': 'USDC'}]}
+
+    plugin._publish_private_account_update(frame)
+
+    assert observed == [frame]
+    assert plugin._private_events is None
+    unsubscribe()
+    plugin._publish_private_account_update(frame)
+    assert observed == [frame]
+
+
+def __test_private_account_update_observer_failure_is_isolated__(caplog):
+    plugin = _FakeBrokerBybit()
+    observed: list[dict] = []
+
+    def broken(_frame: dict) -> None:
+        raise RuntimeError('observer failed')
+
+    plugin.soak_subscribe_account_updates(broken)
+    plugin.soak_subscribe_account_updates(observed.append)
+    frame = {'topic': 'position', 'data': []}
+
+    plugin._publish_private_account_update(frame)
+
+    assert observed == [frame]
+    assert 'private account-update observer failed' in caplog.text
+
+
+def __test_private_ws_connect_cancellation_closes_local_socket__(monkeypatch):
+    async def scenario() -> None:
+        started = asyncio.Event()
+        closed = asyncio.Event()
+
+        class FakeWebSocket:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def open(self, **_kwargs) -> None:
+                started.set()
+                await asyncio.Future()
+
+            async def subscribe(self, _topics) -> None:
+                raise AssertionError("subscribe must not run after cancelled open")
+
+            async def close(self) -> None:
+                closed.set()
+
+        monkeypatch.setattr(events_module, 'BybitWebSocket', FakeWebSocket)
+        plugin = _FakeBrokerBybit()
+        task = asyncio.create_task(plugin._open_private_ws(_linear_instrument()))
+        await started.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert closed.is_set()
+        assert plugin._private_ws is None
+
+    asyncio.run(scenario())
 
 
 def __test_bybit_quantize_helpers__():

@@ -115,6 +115,9 @@ class Bybit(
         # Broker state (driven by the state/execution/events mix-ins).
         self._private_ws = None
         self._private_events = None
+        self._private_account_update_subscribers = set()
+        self._private_account_updates_started = asyncio.Event()
+        self._soak_account_update_task = None
         self._pre_adoption_frames = []
         self._spot_manager = None
         self._spot_port = None

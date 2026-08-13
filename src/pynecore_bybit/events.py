@@ -44,9 +44,11 @@ reduce-side conversions.
 """
 import asyncio
 import logging
+from abc import ABC
+from collections.abc import AsyncIterator, Callable
 from decimal import Decimal
 from time import time as epoch_time
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.core.broker.models import (
@@ -115,7 +117,7 @@ _MAX_BACKFILL_WINDOW_PAGES = 200
 _DERIV_EXEC_CURSOR_EVENT = 'deriv_exec_cursor'
 
 
-class _EventStreamMixin(_BybitBase):
+class _EventStreamMixin(_BybitBase, ABC):
     """Order-event PUSH stream: private ``order`` + ``execution`` topics."""
 
     @override
@@ -233,6 +235,43 @@ class _EventStreamMixin(_BybitBase):
         if halt is not None:
             raise halt
 
+    def soak_subscribe_account_updates(
+            self, callback: Callable[[dict], None],
+    ) -> Callable[[], None]:
+        """Observe raw private account frames without consuming the event queue."""
+        self._private_account_update_subscribers.add(callback)
+
+        def unsubscribe() -> None:
+            self._private_account_update_subscribers.discard(callback)
+
+        return unsubscribe
+
+    async def soak_wait_account_updates_started(self) -> None:
+        """Wait until the authenticated private account stream is subscribed."""
+        await self._private_account_updates_started.wait()
+
+    def soak_set_account_update_task(self, task: asyncio.Task[None]) -> None:
+        """Bind the production ``watch_orders`` task started by the direct canary."""
+        if self._soak_account_update_task is not None:
+            raise RuntimeError("Bybit direct account-update task is already bound")
+        self._soak_account_update_task = task
+
+    async def soak_close_account_updates(self) -> None:
+        """Close and reap the private account stream used by a direct canary."""
+        task = self._soak_account_update_task
+        self._soak_account_update_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._close_private_ws()
+
+    def _publish_private_account_update(self, frame: dict) -> None:
+        for callback in tuple(self._private_account_update_subscribers):
+            try:
+                callback(frame)
+            except (LookupError, RuntimeError, TypeError, ValueError):
+                logger.exception("Bybit private account-update observer failed")
+
     # --- private transport ------------------------------------------------------
 
     async def _open_private_ws(self, market: 'InstrumentInfo') -> None:
@@ -257,6 +296,7 @@ class _EventStreamMixin(_BybitBase):
             queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
             def _on_message(data: dict, q: asyncio.Queue = queue) -> None:
+                self._publish_private_account_update(data)
                 q.put_nowait(data)
 
             async def _on_closed(q: asyncio.Queue = queue) -> None:
@@ -276,6 +316,9 @@ class _EventStreamMixin(_BybitBase):
                 await ws.open(api_key=self.config.api_key,
                               api_secret=self.config.api_secret)
                 await ws.subscribe(topics)
+            except asyncio.CancelledError:
+                await asyncio.shield(ws.close())
+                raise
             except BybitError as e:
                 await ws.close()
                 delay = PRIVATE_WS_BACKOFF_S[min(attempt, len(PRIVATE_WS_BACKOFF_S) - 1)]
@@ -286,8 +329,12 @@ class _EventStreamMixin(_BybitBase):
                 )
                 await asyncio.sleep(delay)
                 continue
+            except BaseException:
+                await ws.close()
+                raise
             self._private_ws = ws
             self._private_events = queue
+            self._private_account_updates_started.set()
             if attempt:
                 logger.info("Bybit private WS reconnected after %d attempt(s)", attempt)
             return
@@ -297,6 +344,7 @@ class _EventStreamMixin(_BybitBase):
         ws = self._private_ws
         self._private_ws = None
         self._private_events = None
+        self._private_account_updates_started.clear()
         if ws is not None:
             await ws.close()
 

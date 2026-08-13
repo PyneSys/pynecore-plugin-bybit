@@ -37,6 +37,8 @@ inverse hedge account is refused at broker startup with instructions to
 switch to one-way mode.
 """
 import asyncio
+import math
+from abc import ABC
 from decimal import ROUND_DOWN, Decimal
 from time import time as epoch_time
 from typing import Callable
@@ -64,6 +66,7 @@ from .exceptions import (
     BybitAdoptionBaselineError,
     BybitAPIError,
     BybitError,
+    BybitPositionDataError,
     is_benign_trading_stop_reject,
     map_broker_error,
     reject_error,
@@ -101,7 +104,52 @@ _ADOPTION_STABLE_ATTEMPTS = 3
 _FILL_EPS = 1e-9
 
 
-class _PositionsMixin(_BybitBase):
+def _wire_float(value: object, *, field: str) -> float:
+    """Parse a finite JSON scalar as ``float``; empty values map to zero."""
+    if value is None or value == '':
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise BybitPositionDataError(
+            f"Bybit position field {field!r} must be numeric, got "
+            f"{type(value).__name__}"
+        )
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise BybitPositionDataError(
+            f"Bybit position field {field!r} is not numeric: {value!r}"
+        ) from exc
+    if not math.isfinite(number):
+        raise BybitPositionDataError(
+            f"Bybit position field {field!r} must be finite, got {value!r}"
+        )
+    return number
+
+
+def _wire_int(value: object, *, field: str) -> int:
+    """Parse an integral JSON scalar; empty values map to zero."""
+    if value is None or value == '':
+        return 0
+    if isinstance(value, bool):
+        raise BybitPositionDataError(
+            f"Bybit position field {field!r} must be an integer, got bool"
+        )
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        raise BybitPositionDataError(
+            f"Bybit position field {field!r} must be an integer, got "
+            f"{type(value).__name__}"
+        )
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise BybitPositionDataError(
+            f"Bybit position field {field!r} is not an integer: {value!r}"
+        ) from exc
+
+
+class _PositionsMixin(_BybitBase, ABC):
     """Derivative position path: mode detection, venue reads, PositionPort."""
 
     # --- mode detection ------------------------------------------------------
@@ -116,7 +164,7 @@ class _PositionsMixin(_BybitBase):
         """
         rows = await self._fetch_position_rows(market)
         for row in rows:
-            if int(row.get('positionIdx') or 0) in (HEDGE_IDX_BUY, HEDGE_IDX_SELL):
+            if self._position_row_index(row) in (HEDGE_IDX_BUY, HEDGE_IDX_SELL):
                 return POSITION_MODE_HEDGE
         return POSITION_MODE_ONE_WAY
 
@@ -132,19 +180,29 @@ class _PositionsMixin(_BybitBase):
 
     @staticmethod
     def _position_row_size(row: dict) -> float:
-        """Parse one position row's open size (0.0 when flat/unparsable)."""
-        try:
-            return float(row.get('size') or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
+        """Parse one position row's finite, non-negative open size."""
+        size = _wire_float(row.get('size'), field='size')
+        if size < 0.0:
+            raise BybitPositionDataError(
+                f"Bybit position field 'size' must be non-negative, got {size!r}"
+            )
+        return size
+
+    @staticmethod
+    def _position_row_index(row: dict) -> int:
+        """Parse one position row's position index."""
+        return _wire_int(row.get('positionIdx'), field='positionIdx')
 
     @staticmethod
     def _position_row_updated_ms(row: dict) -> int:
-        """Parse one position row's ``updatedTime`` (0 when absent/unparsable)."""
-        try:
-            return int(row.get('updatedTime') or 0)
-        except (TypeError, ValueError):
-            return 0
+        """Parse one position row's non-negative ``updatedTime``."""
+        updated_ms = _wire_int(row.get('updatedTime'), field='updatedTime')
+        if updated_ms < 0:
+            raise BybitPositionDataError(
+                "Bybit position field 'updatedTime' must be non-negative, "
+                f"got {updated_ms!r}"
+            )
+        return updated_ms
 
     def _ingest_position_sizes(self, rows: list[dict]) -> None:
         """Update the net-size cache from position rows (WS push or REST).
@@ -156,16 +214,23 @@ class _PositionsMixin(_BybitBase):
         reading (a ``position`` push that has not yet caught up with the
         bot's own fill) never retires a live entry row.
         """
-        sizes = self._deriv_sizes
-        if sizes is None:
-            sizes = {}
-            self._deriv_sizes = sizes
+        parsed: list[tuple[int, float, int]] = []
         snapshot_ms = 0
         for row in rows:
-            idx = int(row.get('positionIdx') or 0)
-            sizes[idx] = self._position_row_size(row)
-            snapshot_ms = max(snapshot_ms, self._position_row_updated_ms(row))
+            updated_ms = self._position_row_updated_ms(row)
+            parsed.append((
+                self._position_row_index(row),
+                self._position_row_size(row),
+                updated_ms,
+            ))
+            snapshot_ms = max(snapshot_ms, updated_ms)
         if rows:
+            sizes = self._deriv_sizes
+            if sizes is None:
+                sizes = {}
+                self._deriv_sizes = sizes
+            for idx, size, _ in parsed:
+                sizes[idx] = size
             # A snapshot just received reflects the venue state as of now;
             # fall back to the local clock when the rows carry no
             # ``updatedTime`` (a degenerate feed) so the freshness gate is
@@ -237,7 +302,7 @@ class _PositionsMixin(_BybitBase):
             return []
         wanted_idx = HEDGE_IDX_BUY if owned > 0.0 else HEDGE_IDX_SELL
         for row in rows:
-            if int(row.get('positionIdx') or 0) != wanted_idx:
+            if self._position_row_index(row) != wanted_idx:
                 continue
             physical = self._position_row_size(row)
             scoped = min(abs(owned), physical)
@@ -268,27 +333,39 @@ class _PositionsMixin(_BybitBase):
             if size <= 0.0:
                 continue
             side = str(row.get('side') or '').lower()
-            entry_price = float(row.get('avgPrice') or 0.0)
-            unrealized = float(row.get('unrealisedPnl') or 0.0)
+            if side not in ('buy', 'sell'):
+                raise BybitPositionDataError(
+                    f"Bybit position field 'side' is invalid for open exposure: {side!r}"
+                )
+            entry_price = _wire_float(row.get('avgPrice'), field='avgPrice')
+            unrealized = _wire_float(
+                row.get('unrealisedPnl'), field='unrealisedPnl',
+            )
             if market.is_inverse and entry_price > 0.0:
                 size = contracts_to_base(size, entry_price)
                 # Inverse unrealised PnL arrives in the settle coin; the
                 # core's openprofit is quote-denominated — convert at the
                 # mark price (falling back to the last trade, then the
                 # entry price, so the number is never left settle-coined).
-                mark = (float(row.get('markPrice') or 0.0)
+                mark = (_wire_float(row.get('markPrice'), field='markPrice')
                         or self._last_price or entry_price)
                 unrealized *= mark
+                if not math.isfinite(unrealized):
+                    raise BybitPositionDataError(
+                        "Bybit inverse unrealized PnL conversion is non-finite"
+                    )
+            liquidation = _wire_float(row.get('liqPrice'), field='liqPrice')
+            leverage = _wire_float(row.get('leverage'), field='leverage')
             return ExchangePosition(
                 symbol=self.symbol or market.symbol,
                 side='long' if side == 'buy' else 'short',
                 size=size,
                 entry_price=entry_price,
                 unrealized_pnl=unrealized,
-                liquidation_price=float(row.get('liqPrice') or 0.0) or None,
-                leverage=float(row.get('leverage') or 0.0),
+                liquidation_price=liquidation or None,
+                leverage=leverage,
                 margin_mode=_MARGIN_MODE.get(
-                    int(row.get('tradeMode') or 0), 'cross',
+                    _wire_int(row.get('tradeMode'), field='tradeMode'), 'cross',
                 ),
             )
         return None
@@ -299,9 +376,16 @@ class _PositionsMixin(_BybitBase):
         """Read the venue server clock (``/v5/market/time``) in epoch-ms."""
         result = await self._call('/v5/market/time')
         nano = result.get('timeNano')
-        if nano:
-            return int(nano) // 1_000_000
-        return int(result.get('timeSecond') or 0) * 1000
+        try:
+            if nano not in (None, ''):
+                return _wire_int(nano, field='timeNano') // 1_000_000
+            return _wire_int(
+                result.get('timeSecond'), field='timeSecond',
+            ) * 1000
+        except BybitPositionDataError as exc:
+            raise BybitAdoptionBaselineError(
+                "adoption baseline: venue time response is invalid"
+            ) from exc
 
     @staticmethod
     def _position_rows_signature(rows: list[dict]) -> tuple:
@@ -313,7 +397,7 @@ class _PositionsMixin(_BybitBase):
         reads between them saw a quiescent venue.
         """
         return tuple(sorted(
-            (int(row.get('positionIdx') or 0),
+            (_wire_int(row.get('positionIdx'), field='positionIdx'),
              str(row.get('side') or ''),
              str(row.get('size') or ''),
              str(row.get('avgPrice') or ''),
@@ -493,10 +577,9 @@ class _PositionsMixin(_BybitBase):
                     # clean-but-incomplete walk must not commit an
                     # understated cursor / de-dup seed. ``cumExecQty`` and
                     # the walked ``execQty`` sum share the wire domain.
-                    try:
-                        cum_exec = float(lookup.get('cumExecQty') or 0.0)
-                    except (TypeError, ValueError):
-                        cum_exec = 0.0
+                    cum_exec = _wire_float(
+                        lookup.get('cumExecQty'), field='cumExecQty',
+                    )
                     if qty_sum < cum_exec - _FILL_EPS:
                         raise BybitAdoptionBaselineError(
                             "adoption baseline: execution index lags order "
@@ -521,7 +604,9 @@ class _PositionsMixin(_BybitBase):
             self._deriv_exec_floor_ms = floor_ms
             for row, order_id, ids, qty_sum, dead in seeds:
                 self._seen_exec_ids.update(ids)
-                cumulative = min(row.qty, max(row.filled_qty, qty_sum))
+                cumulative: float = min(
+                    float(row.qty), max(float(row.filled_qty), qty_sum),
+                )
                 if cumulative > row.filled_qty:
                     self.store_ctx.set_filled(row.client_order_id, cumulative)
                     self.store_ctx.log_event(
@@ -630,7 +715,7 @@ class _PositionsMixin(_BybitBase):
             if size <= 0.0:
                 continue
             side = str(row.get('side') or '').lower()
-            avg = float(row.get('avgPrice') or 0.0)
+            avg = _wire_float(row.get('avgPrice'), field='avgPrice')
             if side not in ('buy', 'sell') or avg <= 0.0:
                 continue
             sign = 1.0 if side == 'buy' else -1.0
@@ -682,13 +767,17 @@ class _PositionsMixin(_BybitBase):
             if side not in ('buy', 'sell'):
                 continue
             legs.append(PositionLeg(
-                leg_id=str(int(row.get('positionIdx') or 0)),
+                leg_id=str(self._position_row_index(row)),
                 symbol=symbol,
                 side=side,
                 qty=size,
-                entry_price=float(row.get('avgPrice') or 0.0),
-                open_time=float(row.get('createdTime') or 0.0) / 1000.0,
-                unrealized_pnl=float(row.get('unrealisedPnl') or 0.0),
+                entry_price=_wire_float(row.get('avgPrice'), field='avgPrice'),
+                open_time=_wire_float(
+                    row.get('createdTime'), field='createdTime',
+                ) / 1000.0,
+                unrealized_pnl=_wire_float(
+                    row.get('unrealisedPnl'), field='unrealisedPnl',
+                ),
             ))
         legs.sort(key=lambda leg: leg.open_time)
         return legs

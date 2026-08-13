@@ -19,6 +19,7 @@ Since M2 the base derives from :class:`~pynecore.core.plugin.broker.BrokerPlugin
 working unchanged while the broker mix-ins add the execution side.
 """
 import asyncio
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 from pynecore.core.broker.models import LegType
@@ -51,7 +52,10 @@ if TYPE_CHECKING:
     from .ws import BybitWebSocket
 
 
-class _BybitBase(BrokerPlugin[BybitConfig]):
+_JsonScalar = str | int | float | bool | None
+
+
+class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     """Shared instance state + Bybit-private cross-mix-in surface.
 
     Concrete implementations live in the individual mix-ins; this class
@@ -140,6 +144,11 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # produced by the WS callback, consumed by ``watch_orders``. ``None``
     # sentinel = the private transport died (reconnect needed).
     _private_events: 'asyncio.Queue[dict | None] | None'
+    # Non-consuming raw-frame observers used by direct broker canaries. The
+    # production event stream remains the only queue consumer.
+    _private_account_update_subscribers: 'set[Callable[[dict], None]]'
+    _private_account_updates_started: asyncio.Event
+    _soak_account_update_task: 'asyncio.Task[None] | None'
     # Private frames parked by ``watch_orders`` while the startup adoption
     # baseline (F2) has not committed yet (derivatives with persistence
     # only). ``run_event_stream`` is scheduled BEFORE the engine's startup
@@ -274,101 +283,153 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     # ------------------------------------------------------------------
 
     # --- REST core (rest.py) ---
-    def __call__(self, endpoint: str, params: dict | None = None, *,
-                 method: str = 'get', body: dict | None = None,
+    @abstractmethod
+    def __call__(self, endpoint: str, params: dict[str, _JsonScalar] | None = None, *,
+                 method: str = 'get', body: dict[str, _JsonScalar] | None = None,
                  auth: bool = False) -> dict: ...
 
-    async def _call(self, endpoint: str, params: dict | None = None, *,
-                    method: str = 'get', body: dict | None = None,
+    @abstractmethod
+    async def _call(self, endpoint: str, params: dict[str, _JsonScalar] | None = None, *,
+                    method: str = 'get', body: dict[str, _JsonScalar] | None = None,
                     auth: bool = False) -> dict: ...
 
+    @abstractmethod
     def _get_http_client(self) -> 'httpx.Client': ...
 
-    def _sign_headers(self, payload: str) -> dict[str, str]: ...
+    @abstractmethod
+    def _sign_headers(self, payload: str, recv_window_ms: int) -> dict[str, str]: ...
 
+    @abstractmethod
     def _close_http_client(self) -> None: ...
 
     # --- Instrument resolution (provider.py) ---
+    @abstractmethod
     def _fetch_instrument(self, category: str, symbol: str) -> 'InstrumentInfo | None': ...
 
+    @abstractmethod
     def _resolve_market(self, symbol: str) -> 'InstrumentInfo': ...
 
+    @abstractmethod
     def _get_market(self) -> 'InstrumentInfo': ...
 
     # --- Live streaming (live_provider.py) ---
+    @abstractmethod
     def _on_ws_message(self, data: dict) -> None: ...
 
+    @abstractmethod
     async def _on_ws_closed(self) -> None: ...
 
+    @abstractmethod
     async def _feed_watchdog_loop(self) -> None: ...
 
+    @abstractmethod
     async def _backfill_gap(self) -> None: ...
 
+    @abstractmethod
     def _release_pending_closed(self) -> None: ...
 
+    @abstractmethod
     def _enqueue_closed(self, queue: 'asyncio.Queue[OHLCV | None]', bar: OHLCV) -> None: ...
 
     # --- Broker lifecycle (state.py) ---
+    @abstractmethod
     def _spot_market(self) -> 'InstrumentInfo': ...
 
+    @abstractmethod
     def _broker_market(self) -> 'InstrumentInfo': ...
 
+    @abstractmethod
     async def _ensure_broker_started(self) -> None: ...
 
+    @abstractmethod
     async def _fetch_wallet_coin(self, coin: str) -> dict: ...
 
+    @abstractmethod
+    async def call_api(
+            self, endpoint: str, params: dict[str, _JsonScalar] | None = None, *,
+            method: str = 'get', body: dict[str, _JsonScalar] | None = None,
+            auth: bool = False,
+    ) -> dict: ...
+
+    @abstractmethod
+    async def fetch_wallet_coin(self, coin: str) -> dict: ...
+
+    @abstractmethod
+    def owns_order_link_id(self, link_id: str) -> bool: ...
+
     # --- Restart recovery (recovery.py) ---
+    @abstractmethod
     async def _recover_in_flight_submissions(self) -> None: ...
 
+    @abstractmethod
     async def _recovery_open_order_ids(
             self, market: 'InstrumentInfo',
     ) -> 'tuple[set[str], bool]': ...
 
+    @abstractmethod
     async def _recovery_fill_ids(
             self, market: 'InstrumentInfo', order_id: str, from_ms: int,
             until_ms: int | None = None,
     ) -> 'tuple[set[str], float, bool]': ...
 
+    @abstractmethod
     def _inverse_order_to_base(self, order: 'ExchangeOrder') -> 'ExchangeOrder': ...
 
     # --- Linear position path (positions.py) ---
+    @abstractmethod
     async def _detect_position_mode(self, market: 'InstrumentInfo') -> str: ...
 
+    @abstractmethod
     async def _fetch_position_rows(self, market: 'InstrumentInfo') -> list[dict]: ...
 
+    @staticmethod
+    @abstractmethod
+    def _position_row_size(row: dict) -> float: ...
+
+    @abstractmethod
     def _ingest_position_sizes(self, rows: list[dict]) -> None: ...
 
+    @abstractmethod
     def _deriv_is_flat(self) -> bool: ...
 
+    @abstractmethod
     async def _fetch_deriv_position(
             self, market: 'InstrumentInfo',
     ) -> 'ExchangePosition | None': ...
 
+    @abstractmethod
     def _inverse_seed_net(self, rows: list[dict]) -> None: ...
 
+    @abstractmethod
     def _apply_inverse_fill(self, side: str, contracts: float, base: float) -> None: ...
 
     # PositionPort transport primitives (hedge-mode one-way emulation) —
     # declared on the base so ``position_port = self`` satisfies the core
     # Protocol from any mix-in (the cTrader plugin's pattern).
+    @abstractmethod
     async def fetch_raw_positions(self, symbol: str) -> 'list[PositionLeg]': ...
 
+    @abstractmethod
     async def get_volume_quantizer(
             self, symbol: str,
     ) -> 'Callable[[float], int]': ...
 
+    @abstractmethod
     async def close_leg(
             self, symbol: str, leg_id: str, volume: int, coid: str,
     ) -> None: ...
 
+    @abstractmethod
     async def reject_out_of_range(
             self, envelope: 'DispatchEnvelope', qty: float,
     ) -> None: ...
 
+    @abstractmethod
     async def place_leg(
             self, envelope: 'DispatchEnvelope', qty: float,
     ) -> 'list[ExchangeOrder]': ...
 
+    @abstractmethod
     async def amend_bracket(
             self, symbol: str, leg_id: str, *,
             side: str,
@@ -379,38 +440,67 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     ) -> None: ...
 
     # --- Execution internals (execution.py) ---
+    @abstractmethod
     def _record_identity(self, coid: str, *, pine_id: str | None,
                          from_entry: str | None, leg_type: LegType,
                          qty: float) -> None: ...
 
+    @abstractmethod
     def _resolve_identity(
             self, order_link_id: str | None, order_id: str | None,
     ) -> 'tuple[str | None, str | None, LegType | None]': ...
 
-    async def _order_post(self, endpoint: str, body: dict, *,
+    @abstractmethod
+    async def _order_post(self, endpoint: str, body: dict[str, _JsonScalar], *,
                           coid: str, context: str) -> dict: ...
 
+    @abstractmethod
     async def _lookup_order_by_coid(self, coid: str) -> dict | None: ...
 
     # --- Runtime reconcile (reconcile.py) ---
+    @abstractmethod
     async def _confirm_lookup(
             self, market: 'InstrumentInfo', coid: str,
     ) -> 'tuple[dict | None, bool]': ...
 
+    @abstractmethod
     async def _cancel_outcome_for(
             self, market: 'InstrumentInfo', coid: str,
     ) -> 'CancelDispositionOutcome': ...
 
+    @abstractmethod
     def _inverse_anchor_for(self, coid: str, *,
                             fallback: 'float | None' = None) -> 'Decimal | None': ...
 
-    def _quantize_or_skip(self, market: 'InstrumentInfo', qty: float, *,
+    @staticmethod
+    @abstractmethod
+    def _quantize_or_skip(market: 'InstrumentInfo', qty: float, *,
                           intent_key: str, label: str) -> 'Decimal': ...
 
+    @abstractmethod
     def _preflight_order(self, market: 'InstrumentInfo', qty: 'Decimal', *,
                          is_market: bool, price: 'Decimal | None',
                          intent_key: str, label: str) -> None: ...
 
+    # --- Direct private account observation (events.py) ---
+    @abstractmethod
+    def soak_subscribe_account_updates(
+            self, callback: 'Callable[[dict], None]',
+    ) -> 'Callable[[], None]': ...
+
+    @abstractmethod
+    async def soak_wait_account_updates_started(self) -> None: ...
+
+    @abstractmethod
+    def soak_set_account_update_task(self, task: 'asyncio.Task[None]') -> None: ...
+
+    @abstractmethod
+    async def soak_close_account_updates(self) -> None: ...
+
+    @abstractmethod
+    def _publish_private_account_update(self, frame: dict) -> None: ...
+
+    @abstractmethod
     async def _place_entry_order(
             self, envelope: 'DispatchEnvelope', intent: 'EntryIntent',
             market: 'InstrumentInfo', qty: 'Decimal',
@@ -418,6 +508,7 @@ class _BybitBase(BrokerPlugin[BybitConfig]):
     ) -> 'list[ExchangeOrder]': ...
 
     # --- Disappearance detection (reconcile.py) ---
+    @abstractmethod
     async def _reconcile_disappearance(
             self, market: 'InstrumentInfo', position_rows: list[dict] | None,
     ) -> 'list[OrderEvent]': ...

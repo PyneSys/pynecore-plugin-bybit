@@ -42,6 +42,7 @@ graceful stop.
 """
 import asyncio
 import logging
+from abc import ABC
 from decimal import Decimal, InvalidOperation
 from time import time as epoch_time
 from typing import TYPE_CHECKING
@@ -99,7 +100,7 @@ _LIVE_ORDER_STATUSES = frozenset({
 })
 
 
-class _ReconcileMixin(_BybitBase):
+class _ReconcileMixin(_BybitBase, ABC):
     """Runtime disappearance detection over the core tracker."""
 
     def _disappearance_tracker(self) -> DisappearanceTracker:
@@ -247,21 +248,20 @@ class _ReconcileMixin(_BybitBase):
             if position_rows is None:
                 present['positions'] = None
             else:
-                present['positions'] = (
-                    {market.symbol} if self._rows_have_exposure(position_rows)
-                    else set()
-                )
+                try:
+                    present['positions'] = (
+                        {market.symbol} if self._rows_have_exposure(position_rows)
+                        else set()
+                    )
+                except BybitError:
+                    present['positions'] = None
         return present
 
-    @staticmethod
-    def _rows_have_exposure(position_rows: list[dict]) -> bool:
+    def _rows_have_exposure(self, position_rows: list[dict]) -> bool:
         """Whether any position row carries a non-zero size."""
         for row in position_rows:
-            try:
-                if float(row.get('size') or 0.0) > 0.0:
-                    return True
-            except (TypeError, ValueError):
-                continue
+            if self._position_row_size(row) > 0.0:
+                return True
         return False
 
     # --- grace-expiry confirmation ----------------------------------------------
@@ -295,8 +295,11 @@ class _ReconcileMixin(_BybitBase):
             rows = await self._fetch_position_rows(market)
         except BybitError:
             return MissingConfirmation(MissingResolution.INCONCLUSIVE)
-        if self._rows_have_exposure(rows):
-            return MissingConfirmation(MissingResolution.STILL_PRESENT)
+        try:
+            if self._rows_have_exposure(rows):
+                return MissingConfirmation(MissingResolution.STILL_PRESENT)
+        except BybitError:
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
         return MissingConfirmation(
             MissingResolution.CLOSED, position_ref=market.symbol,
         )

@@ -21,12 +21,13 @@ import hmac
 import json as json_module
 import logging
 import time
+from abc import ABC
 from json import JSONDecodeError
 from urllib.parse import urlencode
 
 import httpx
 
-from ._base import _BybitBase
+from ._base import _BybitBase, _JsonScalar
 from .exceptions import BybitAPIError, BybitConnectionError
 from .helpers import RECV_WINDOW_MS, REST_TIMEOUT_S
 
@@ -40,7 +41,7 @@ def _epoch_ms() -> int:
     return int(time.time() * 1000)
 
 
-class _RestMixin(_BybitBase):
+class _RestMixin(_BybitBase, ABC):
     """REST surface: signed request dispatcher + async wrapper."""
 
     def _get_http_client(self) -> httpx.Client:
@@ -63,10 +64,10 @@ class _RestMixin(_BybitBase):
     def __call__(
         self,
         endpoint: str,
-        params: dict | None = None,
+        params: dict[str, _JsonScalar] | None = None,
         *,
         method: str = "get",
-        body: dict | None = None,
+        body: dict[str, _JsonScalar] | None = None,
         auth: bool = False,
     ) -> dict:
         """Call a Bybit v5 REST endpoint (synchronous).
@@ -133,10 +134,10 @@ class _RestMixin(_BybitBase):
     async def _call(
         self,
         endpoint: str,
-        params: dict | None = None,
+        params: dict[str, _JsonScalar] | None = None,
         *,
         method: str = "get",
-        body: dict | None = None,
+        body: dict[str, _JsonScalar] | None = None,
         auth: bool = False,
     ) -> dict:
         """Async wrapper around the sync REST dispatcher.

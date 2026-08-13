@@ -25,9 +25,13 @@ balance, the invariant fires by design.
 import logging
 from decimal import Decimal
 from time import time as epoch_time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
-from pynecore.core.broker.spot_inventory import SpotExecution, SpotExecutionBatch
+from pynecore.core.broker.spot_inventory import (
+    SpotExecution,
+    SpotExecutionBatch,
+    SpotInventoryManager,
+)
 
 from .exceptions import BybitError
 from .helpers import (
@@ -37,7 +41,9 @@ from .helpers import (
 )
 
 if TYPE_CHECKING:
-    from ._base import _BybitBase
+    from pynecore.core.broker.storage import RunContext
+
+    from ._base import _JsonScalar
     from .models import InstrumentInfo
 
 logger = logging.getLogger(__name__)
@@ -54,9 +60,52 @@ _MAX_WINDOW_PAGES = 200
 _SETTLEMENT_GRACE_S = 60.0
 
 
-def spot_port_for(plugin: '_BybitBase', market: 'InstrumentInfo') -> '_BybitSpotPort':
+class _BybitSpotHost(Protocol):
+    """Plugin capabilities required by the standalone inventory port."""
+
+    store_ctx: 'RunContext | None'
+
+    async def fetch_wallet_coin(self, coin: str) -> dict: ...
+
+    async def call_api(
+            self, endpoint: str, params: 'dict[str, _JsonScalar] | None' = None, *,
+            method: str = 'get', body: 'dict[str, _JsonScalar] | None' = None,
+            auth: bool = False,
+    ) -> dict: ...
+
+    def owns_order_link_id(self, link_id: str) -> bool: ...
+
+
+def spot_port_for(
+        plugin: _BybitSpotHost, market: 'InstrumentInfo',
+) -> '_BybitSpotPort':
     """Build the inventory port for the resolved chart instrument."""
     return _BybitSpotPort(plugin, market)
+
+
+def spot_manager_for(
+        plugin: _BybitSpotHost,
+        market: 'InstrumentInfo',
+        *,
+        account_id: str,
+        symbol: str,
+        request_quarantine,
+        on_inventory_conflict: str,
+) -> tuple[SpotInventoryManager, '_BybitSpotPort']:
+    """Build the inventory manager and its Bybit venue port."""
+    port = spot_port_for(plugin, market)
+    store_ctx = plugin.store_ctx
+    if store_ctx is None:
+        raise RuntimeError("Bybit spot inventory requires broker persistence")
+    manager = SpotInventoryManager(
+        store_ctx,
+        port,
+        account_id=account_id,
+        symbol=symbol,
+        request_quarantine=request_quarantine,
+        on_inventory_conflict=on_inventory_conflict,
+    )
+    return manager, port
 
 
 class _BybitSpotPort:
@@ -69,7 +118,7 @@ class _BybitSpotPort:
     base_tolerance = Decimal(0)
     settlement_grace_s = _SETTLEMENT_GRACE_S
 
-    def __init__(self, plugin: '_BybitBase', market: 'InstrumentInfo') -> None:
+    def __init__(self, plugin: _BybitSpotHost, market: 'InstrumentInfo') -> None:
         self._plugin = plugin
         self._market = market
         self.product_id = market.symbol
@@ -126,7 +175,7 @@ class _BybitSpotPort:
         ``locked`` field is an informational subset) — verified live in
         the M2 smoke test with a resting sell order.
         """
-        entry = await self._plugin._fetch_wallet_coin(self.base_asset)
+        entry = await self._plugin.fetch_wallet_coin(self.base_asset)
         raw = str(entry.get('walletBalance') or '0') or '0'
         return Decimal(raw)
 
@@ -140,7 +189,7 @@ class _BybitSpotPort:
         cursor: str | None = None
         for _ in range(_MAX_WINDOW_PAGES):
             try:
-                result = await self._plugin._call('/v5/execution/list', {
+                result = await self._plugin.call_api('/v5/execution/list', {
                     'category': self._market.category,
                     'symbol': self._market.symbol,
                     'startTime': start_ms,
@@ -254,7 +303,7 @@ class _BybitSpotPort:
         plugin = self._plugin
         link_id = str(entry.get('orderLinkId') or '')
         if link_id:
-            if link_id in plugin._order_identity:
+            if plugin.owns_order_link_id(link_id):
                 return link_id
             if plugin.store_ctx is not None \
                     and plugin.store_ctx.get_order(link_id) is not None:

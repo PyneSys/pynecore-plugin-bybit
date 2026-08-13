@@ -30,6 +30,7 @@ State touched: ``_instruments`` (per ``(category, symbol)``
 chart symbol's resolved instrument) and ``_market_symbol`` (its user-facing
 cache key).
 """
+from abc import ABC
 from datetime import UTC, datetime, time
 from typing import Callable, Literal
 
@@ -80,7 +81,7 @@ _24_7_SESSION_ENDS: tuple[SymInfoSession, ...] = tuple(
 )
 
 
-class _ProviderMixin(_BybitBase):
+class _ProviderMixin(_BybitBase, ABC):
     """Provider mix-in: timeframe converters, symbol metadata, REST OHLCV."""
 
     # --- timeframe helpers --------------------------------------------------

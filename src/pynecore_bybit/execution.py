@@ -71,6 +71,7 @@ are the robustness milestone, mirroring the cTrader plugin's phasing.
 """
 import asyncio
 import logging
+from abc import ABC
 from decimal import Decimal, InvalidOperation
 from time import time as epoch_time
 
@@ -109,7 +110,7 @@ from pynecore.core.broker.store_helpers import (
 )
 from pynecore.core.plugin import override
 
-from ._base import _BybitBase
+from ._base import _BybitBase, _JsonScalar
 from .exceptions import (
     AMBIGUOUS_DISPOSITION_CODES,
     BybitAPIError,
@@ -159,7 +160,7 @@ _DEAD_ORDER_STATUSES = frozenset({
 _SPENT_COID_SKEW_MS = 5_000
 
 
-class _ExecutionMixin(_BybitBase):
+class _ExecutionMixin(_BybitBase, ABC):
     """Order execution mix-in: every ``execute_*`` and ``modify_*`` path."""
 
     # --- identity bookkeeping ----------------------------------------------
@@ -208,7 +209,7 @@ class _ExecutionMixin(_BybitBase):
 
     # --- dispatch core --------------------------------------------------------
 
-    async def _order_post(self, endpoint: str, body: dict, *,
+    async def _order_post(self, endpoint: str, body: dict[str, _JsonScalar], *,
                           coid: str, context: str) -> dict:
         """POST one signed order request, classifying the failure modes.
 
@@ -480,8 +481,9 @@ class _ExecutionMixin(_BybitBase):
             f"convert the base quantity to inverse contracts"
         )
 
+    @staticmethod
     def _inverse_entry_contracts(
-            self, market: InstrumentInfo, qty: float, anchor: Decimal, *,
+            market: InstrumentInfo, qty: float, anchor: Decimal, *,
             intent_key: str, label: str,
     ) -> Decimal:
         """Convert a base-denominated quantity to contracts at a fixed anchor.
@@ -556,7 +558,8 @@ class _ExecutionMixin(_BybitBase):
         self._wire_anchor[coid] = anchor
         return {**extras, 'anchor': format_decimal(anchor)}
 
-    def _core_qty(self, qty: Decimal, anchor: Decimal | None) -> float:
+    @staticmethod
+    def _core_qty(qty: Decimal, anchor: Decimal | None) -> float:
         """The core-facing (base) value of a wire quantity."""
         if anchor is None:
             return float(qty)
@@ -917,8 +920,23 @@ class _ExecutionMixin(_BybitBase):
             # and its residual enumeration owns the still-live sibling
             # row.
             for placed in legs:
+                placed_coid = placed.client_order_id
+                if not placed_coid:
+                    raise BracketAttachAfterFillRejectedError(
+                        f"Bybit bracket rollback cannot identify the already-placed "
+                        f"sibling after a spent leg id (exit={intent.pine_id!r}, "
+                        f"from_entry={intent.from_entry!r}); the venue order "
+                        f"response did not preserve its orderLinkId",
+                        position_coid=self._entry_coid_for(intent.from_entry)
+                        or f"__pyne_orphan__{intent.symbol}__{intent.from_entry}",
+                        symbol=intent.symbol,
+                        position_side='buy' if intent.side == 'sell' else 'sell',
+                        qty=self._core_qty(qty, anchor),
+                        from_entry=intent.from_entry,
+                        exit_id=intent.pine_id,
+                    ) from spent
                 rolled_back, executed = await self._rollback_spent_sibling(
-                    market, placed.client_order_id)
+                    market, placed_coid)
                 if not rolled_back:
                     # Size the defensive close to the confirmed residual:
                     # a fill that raced the rollback already reduced the
@@ -940,7 +958,7 @@ class _ExecutionMixin(_BybitBase):
                         f"Bybit bracket rollback unresolved after a spent "
                         f"leg id (exit={intent.pine_id!r}, "
                         f"from_entry={intent.from_entry!r}): sibling "
-                        f"{placed.client_order_id} "
+                        f"{placed_coid} "
                         + (f"executed {executed} of {qty}"
                            if executed is not None
                            else "disposition unknown"),
@@ -953,7 +971,7 @@ class _ExecutionMixin(_BybitBase):
                         exit_id=intent.pine_id,
                     ) from spent
                 if self.store_ctx is not None:
-                    self.store_ctx.close_order(placed.client_order_id)
+                    self.store_ctx.close_order(placed_coid)
             raise
         except ExchangeOrderRejectedError as exc:
             # The parent entry has already filled by the time an exit
@@ -1127,7 +1145,7 @@ class _ExecutionMixin(_BybitBase):
             market, qty, is_market=True, price=None,
             intent_key=intent.intent_key, label=label,
         )
-        body = {
+        body: dict[str, _JsonScalar] = {
             'category': market.category,
             'symbol': market.symbol,
             'side': _SIDE_WIRE[intent.side],
