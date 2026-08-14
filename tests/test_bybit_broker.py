@@ -1796,3 +1796,127 @@ def __test_bybit_inverse_position_and_hedge_gate__():
     )
     with pytest.raises(ExchangeCapabilityError):
         asyncio.run(plugin._ensure_broker_started())
+
+
+def _venue_stop_execution(**overrides) -> dict:
+    """A coid-less trading-stop execution row (venue-materialised close)."""
+    row = {
+        'symbol': 'BTCUSDT', 'category': 'linear', 'execType': 'Trade',
+        'execId': 'vs-1', 'orderId': 'venue-999', 'orderLinkId': '',
+        'side': 'Buy', 'execQty': '0.02', 'execPrice': '1887.6',
+        'execFee': '0', 'execTime': '1752600000500',
+        'closedSize': '0.02', 'stopOrderType': 'StopLoss',
+    }
+    row.update(overrides)
+    return row
+
+
+def _seed_bracket_ownership(plugin, *, side: str = 'buy', exit_id: str = 'S-X',
+                            from_entry: str = 'S', leg_id: str = '2',
+                            attach_coid: str = 'attach-s') -> None:
+    from pynecore.core.broker.store_helpers import create_bracket_ownership_row
+    create_bracket_ownership_row(
+        plugin.store_ctx, coid=f"{attach_coid}:{leg_id}",
+        symbol=plugin._market.symbol, side=side, qty=0.02,
+        intent_key=f"{exit_id}\x00{from_entry}", pine_entry_id=exit_id,
+        from_entry=from_entry, leg_id=leg_id, attach_coid=attach_coid,
+        tp_price=1879.0, sl_price=1887.0, trail_price=None, trail_offset=None,
+    )
+
+
+def __test_bybit_venue_trading_stop_fill_attributes_to_owning_bracket__(tmp_path):
+    """A coid-less trading-stop execution is the bot's OWN bracket firing.
+
+    On a hedge account the bracket is a position attribute: when it triggers,
+    Bybit creates the closing order itself, with no ``orderLinkId`` and an
+    orderId this run never journalled. Measured live: the S-X stop fired, the
+    fill was ignored as external, and the book stayed short for 47 minutes —
+    mis-sizing the next folded reversal. The durable bracket-ownership row is
+    the proof the protection that fired is ours, so the fill must book as the
+    bracket's own leg.
+    """
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "venue-stop")
+    _seed_bracket_ownership(plugin)
+    market = plugin._market
+
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [_venue_stop_execution()],
+    }, market)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.leg_type is LegType.STOP_LOSS
+    assert event.pine_id == 'S-X'
+    assert event.from_entry == 'S'
+    assert event.fill_qty == pytest.approx(0.02)
+    ignored = list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored'))
+    assert ignored == []
+    attributed = list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'venue_bracket_fill_attributed'))
+    assert len(attributed) == 1
+
+
+def __test_bybit_venue_trading_stop_fill_attributes_in_backfill__(tmp_path):
+    """The reconnect backfill must attribute the same way the stream would.
+
+    Live incident: the WS drop delayed the bracket's execution into the
+    post-reconnect backfill window, and the backfill arm dropped it as
+    ``external_activity_ignored`` with ``source=deriv_backfill``.
+    """
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "venue-stop-bf")
+    _seed_bracket_ownership(plugin)
+    market = plugin._market
+
+    event = plugin._backfill_one_execution(_venue_stop_execution(), market)
+
+    assert event is not None
+    assert event.leg_type is LegType.STOP_LOSS
+    assert event.pine_id == 'S-X'
+    assert event.from_entry == 'S'
+    assert list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored')) == []
+
+
+def __test_bybit_manual_close_without_stop_type_stays_external__(tmp_path):
+    """A venue-UI manual close carries no ``stopOrderType`` — still external."""
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "manual-close")
+    _seed_bracket_ownership(plugin)
+    market = plugin._market
+
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [_venue_stop_execution(stopOrderType='', execId='vs-2')],
+    }, market)
+
+    assert events == []
+    assert len(list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored'))) == 1
+
+
+def __test_bybit_ambiguous_bracket_ownership_refuses_to_guess__(tmp_path):
+    """Two live same-side ownership rows: attribution must refuse, not guess."""
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "ambiguous")
+    _seed_bracket_ownership(plugin, exit_id='S-X', from_entry='S',
+                            attach_coid='attach-s')
+    _seed_bracket_ownership(plugin, exit_id='T-X', from_entry='T',
+                            attach_coid='attach-t')
+    market = plugin._market
+
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [_venue_stop_execution(execId='vs-3')],
+    }, market)
+
+    assert events == []
+    assert len(list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored'))) == 1

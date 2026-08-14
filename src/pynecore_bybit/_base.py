@@ -128,6 +128,11 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # both the Bybit kline API and OHLCV records use). Sizes the reconnect
     # REST backfill window and guards closed-bar duplicates.
     _last_closed_bar_ts: int | None
+    # Newest bar open observed on the kline stream, forming bars included.
+    # Until the stream closes its first bar there is no closed-bar cursor,
+    # and this is the only anchor a reconnect backfill has: the bar seen
+    # forming is the first one that can close while offline.
+    _stream_bar_ts: int | None
     # Holding pen for WS closed bars while a reconnect backfill is pending
     # (``None`` = no backfill pending). See ``connect()`` for the ordering
     # invariant it protects.

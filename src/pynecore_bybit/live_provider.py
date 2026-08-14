@@ -77,8 +77,9 @@ class _LiveProviderMixin(_BybitBase, ABC):
         # live generator drops any closed bar older than the newest one it
         # has seen, so letting a fresh WS close overtake the backfill would
         # permanently lose the gap bars. ``None`` = no backfill pending
-        # (initial connect).
-        self._pending_closed = [] if self._last_closed_bar_ts is not None else None
+        # (initial connect, nothing to resume from).
+        self._pending_closed = [] if (self._last_closed_bar_ts is not None
+                                      or self._stream_bar_ts is not None) else None
 
         ws = BybitWebSocket(
             f"wss://{host}/v5/public/{market.category}",
@@ -171,23 +172,26 @@ class _LiveProviderMixin(_BybitBase, ABC):
         core live generator drops out-of-order closed bars, so this order
         is what keeps the gap bars alive.
 
-        A REST failure mid-backfill must NOT let the fresh stream go live:
-        the live runner swallows an ``on_reconnect`` exception (it logs
-        ``Reconnect failed`` and resumes its watch loop on the newly opened
-        socket), so re-raising alone would let the next WS close advance
-        the cursor past the still-missing gap and lose it permanently.
-        Instead the transport is force-closed and the closure sentinel
-        queued: ``watch_ohlcv`` first drains any bars an earlier backfill
-        page already delivered, then raises ``ConnectionError``, which
-        sends the runner into a full disconnect/backoff/connect/
-        on_reconnect cycle — and the retried backfill re-fetches
-        everything past the still-unadvanced ``_last_closed_bar_ts``.
+        A REST failure mid-backfill must NOT let the fresh stream go live.
+        The live runner logs ``Reconnect failed`` and goes straight back
+        into its disconnect/backoff/connect cycle WITHOUT reading the
+        update queue, and that ``disconnect()`` throws the queue away — so
+        every bar an earlier backfill page already enqueued dies there,
+        with the cursor sitting past them. The cursor is therefore rewound
+        to where the backfill started, which makes the retry re-fetch the
+        whole gap. The transport is force-closed and the closure sentinel
+        queued on top, so should the runner ever read the queue instead,
+        ``watch_ohlcv`` raises ``ConnectionError`` and drives the same
+        cycle rather than letting the fresh stream advance over the gap.
         """
+        resume_from = self._last_closed_bar_ts
         try:
             await self._backfill_gap()
         except BybitError:
-            # Discard the held bars: the cursor still points before them,
-            # so the retried backfill re-fetches them from REST.
+            # Rewind past the pages that never reached the runner, and
+            # discard the held bars — the retried backfill re-fetches
+            # everything from REST.
+            self._last_closed_bar_ts = resume_from
             self._pending_closed = None
             # Kill the transport so the stream cannot go live without the
             # gap (see docstring). If the socket already died, its receive
@@ -210,13 +214,22 @@ class _LiveProviderMixin(_BybitBase, ABC):
         REST layer propagates to :meth:`on_reconnect`.
         """
         last_closed = self._last_closed_bar_ts
-        if last_closed is None or self.timeframe is None:
+        if self.timeframe is None:
             return
         queue = self._update_queue
         if queue is None:
             return
         interval = self.to_exchange_timeframe(self.timeframe)
-        cursor = add_interval(last_closed, interval, 1)
+        if last_closed is not None:
+            cursor = add_interval(last_closed, interval, 1)
+        elif self._stream_bar_ts is not None:
+            # The stream has not closed a bar yet, so there is no cursor —
+            # but the bar seen forming is exactly the first one that can
+            # have closed while offline, and everything before it came
+            # from the warmup history.
+            cursor = self._stream_bar_ts
+        else:
+            return
         now_ts = int(epoch_time() * 1000)
         if bar_close_ts(cursor, interval) > now_ts:
             return
@@ -263,9 +276,14 @@ class _LiveProviderMixin(_BybitBase, ABC):
     ) -> list[OHLCV]:
         """Fetch klines that closed between the warmup history and the stream.
 
-        Same endpoint and chunking as :meth:`_backfill_gap`, but it touches
-        neither the update queue nor the closed-bar cursor: the framework owns
-        the returned bars and splices them in ahead of the first live one.
+        Same endpoint and chunking as :meth:`_backfill_gap`, but the bars
+        never touch the update queue: the framework owns them and splices
+        them in ahead of the first live one. The closed-bar cursor DOES
+        advance to the newest bar handed over (``since_ms`` when the gap
+        was empty), because that is the newest closed bar the run holds —
+        without it a drop before the stream's own first close would leave
+        the reconnect backfill with nothing to resume from and the whole
+        outage window would be lost.
 
         :param symbol: Provider-format symbol (unused; the plugin instance is
             already bound to its instrument).
@@ -275,6 +293,7 @@ class _LiveProviderMixin(_BybitBase, ABC):
         """
         interval = self.to_exchange_timeframe(timeframe)
         now_ts = int(epoch_time() * 1000)
+        self._advance_closed_cursor(since_ms)
         cursor = add_interval(since_ms, interval, 1)
         if bar_close_ts(cursor, interval) > now_ts:
             return []
@@ -315,7 +334,18 @@ class _LiveProviderMixin(_BybitBase, ABC):
             else:
                 cursor = max(add_interval(chunk_end, interval, 1),
                              add_interval(cursor, interval, 1))
+        if recovered:
+            self._advance_closed_cursor(recovered[-1].timestamp)
         return recovered
+
+    def _advance_closed_cursor(self, bar_ts: int) -> None:
+        """Move the closed-bar cursor forward to ``bar_ts``, never backwards.
+
+        The stream runs concurrently with the startup-gap query and may
+        already have closed a newer bar of its own.
+        """
+        if self._last_closed_bar_ts is None or self._last_closed_bar_ts < bar_ts:
+            self._last_closed_bar_ts = bar_ts
 
     def _release_pending_closed(self) -> None:
         """Flush the closed bars held back during backfill into the queue."""
@@ -378,6 +408,8 @@ class _LiveProviderMixin(_BybitBase, ABC):
             # feeds the spot position mark and the market-order
             # minimum-notional pre-check.
             self._last_price = bar.close
+            if self._stream_bar_ts is None or bar.timestamp > self._stream_bar_ts:
+                self._stream_bar_ts = bar.timestamp
             if bar.is_closed:
                 if self._pending_closed is not None:
                     # Reconnect backfill still pending — hold the bar back

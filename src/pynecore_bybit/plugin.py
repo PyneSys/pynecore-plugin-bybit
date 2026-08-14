@@ -109,6 +109,7 @@ class Bybit(
         self._data_ready = None
         self._watchdog_task = None
         self._last_closed_bar_ts = None
+        self._stream_bar_ts = None
         self._pending_closed = None
         self._last_price = None
 

@@ -61,6 +61,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    iter_active_bracket_ownerships,
 )
 from pynecore.core.plugin import override
 
@@ -115,6 +116,23 @@ _MAX_BACKFILL_WINDOW_PAGES = 200
 #: ``iter_events_by_kind_for_run_id`` — the storage layer's documented
 #: activity-cursor rebuild mechanism).
 _DERIV_EXEC_CURSOR_EVENT = 'deriv_exec_cursor'
+
+#: ``stopOrderType`` values a venue-materialised trading-stop execution can
+#: carry, mapped to the bracket leg they fire for. On a hedge account the
+#: bracket is a POSITION attribute (``/v5/position/trading-stop``): when it
+#: triggers, Bybit creates the closing market order ITSELF, with no
+#: ``orderLinkId`` and an ``orderId`` this run never journalled — so the
+#: dispatch-bookkeeping reverse map cannot see it and the bot's own
+#: protective close would be dropped as external activity (measured live:
+#: the S-X stop fired at 17:55, the fill was ignored twice, and the book
+#: stayed short 0.02 for 47 minutes, mis-sizing the next folded reversal).
+_VENUE_STOP_ORDER_LEG = {
+    'TakeProfit': LegType.TAKE_PROFIT,
+    'PartialTakeProfit': LegType.TAKE_PROFIT,
+    'StopLoss': LegType.STOP_LOSS,
+    'PartialStopLoss': LegType.STOP_LOSS,
+    'TrailingStop': LegType.TRAILING_STOP,
+}
 
 
 class _EventStreamMixin(_BybitBase, ABC):
@@ -413,6 +431,14 @@ class _EventStreamMixin(_BybitBase, ABC):
             pine_id, from_entry, leg_type = self._resolve_identity(
                 coid or None, str(entry.get('orderId') or '') or None,
             )
+            venue_bracket = False
+            if leg_type is None:
+                # Second chance: a venue-materialised trading-stop close
+                # carries no coid and an unknown orderId, but the durable
+                # bracket-ownership row proves it is ours.
+                pine_id, from_entry, leg_type = \
+                    self._attribute_venue_bracket_execution(entry, market)
+                venue_bracket = leg_type is not None
             if leg_type is None:
                 # External activity (manual trade, another bot): it must
                 # not move this strategy's position. The balance invariant
@@ -435,12 +461,76 @@ class _EventStreamMixin(_BybitBase, ABC):
             event = self._fill_event(
                 entry, market, coid=coid, pine_id=pine_id,
                 from_entry=from_entry, leg_type=leg_type,
+                venue_bracket=venue_bracket,
             )
             if event is not None:
                 events.append(event)
         if events:
             self._close_entry_rows_when_flat(market)
         return events
+
+    def _attribute_venue_bracket_execution(
+            self, entry: dict, market: 'InstrumentInfo',
+    ) -> tuple[str | None, str | None, LegType | None]:
+        """Attribute a coid-less trading-stop execution to the owning bracket.
+
+        Second-chance identity resolution for executions
+        :meth:`_resolve_identity` could not map: a hedge-account bracket is
+        attached as a position attribute, so the closing order the venue
+        creates when it triggers carries no ``orderLinkId`` and an unknown
+        ``orderId`` — but the durable bracket-ownership row this run
+        persisted BEFORE attaching (:data:`_VENUE_STOP_ORDER_LEG` explains
+        the shape) proves the protection that fired is ours. The match is
+        deliberately conservative: only a reduce execution
+        (``closedSize > 0``) with a known ``stopOrderType``, on this
+        symbol, whose side equals exactly ONE live ownership row's exit
+        side, is claimed. A manual venue-UI close carries no
+        ``stopOrderType`` and stays external; an ambiguous double-sided
+        state (both brackets momentarily live mid-reversal) refuses to
+        guess and leaves the disappearance pass to reconcile.
+        """
+        if self.store_ctx is None:
+            return None, None, None
+        if str(entry.get('orderLinkId') or ''):
+            return None, None, None
+        leg = _VENUE_STOP_ORDER_LEG.get(str(entry.get('stopOrderType') or ''))
+        if leg is None:
+            return None, None, None
+        try:
+            closed_size = float(entry.get('closedSize') or 0.0)
+        except (TypeError, ValueError):
+            return None, None, None
+        if closed_size <= 0.0:
+            return None, None, None
+        exec_side = str(entry.get('side') or '').lower()
+        candidates = [
+            row for row in iter_active_bracket_ownerships(
+                self.store_ctx, symbol=market.symbol,
+            )
+            if (row.side or '').lower() == exec_side
+        ]
+        if len(candidates) != 1:
+            if candidates:
+                logger.warning(
+                    "Bybit venue trading-stop execution %s matches %d live "
+                    "bracket-ownership rows on %s — refusing to guess, "
+                    "leaving it to the disappearance reconcile",
+                    entry.get('execId'), len(candidates), market.symbol,
+                )
+            return None, None, None
+        row = candidates[0]
+        self.store_ctx.log_event(
+            'venue_bracket_fill_attributed',
+            client_order_id=row.client_order_id,
+            exchange_order_id=str(entry.get('orderId') or '') or None,
+            payload={
+                'exec_id': str(entry.get('execId') or ''),
+                'stop_order_type': str(entry.get('stopOrderType') or ''),
+                'exit_id': row.pine_entry_id,
+                'from_entry': row.from_entry,
+            },
+        )
+        return row.pine_entry_id, row.from_entry, leg
 
     def _close_entry_rows_when_flat(self, market: 'InstrumentInfo') -> None:
         """Close the fully filled entry rows once the position is gone.
@@ -538,7 +628,7 @@ class _EventStreamMixin(_BybitBase, ABC):
     def _fill_event(
             self, entry: dict, market: 'InstrumentInfo', *,
             coid: str, pine_id: str | None, from_entry: str | None,
-            leg_type: LegType,
+            leg_type: LegType, venue_bracket: bool = False,
     ) -> OrderEvent | None:
         """Build the OrderEvent of one execution slice.
 
@@ -632,7 +722,12 @@ class _EventStreamMixin(_BybitBase, ABC):
             # :meth:`_close_entry_rows_when_flat` closes them once the
             # ledger position is gone.
             self.store_ctx.close_order(coid)
-        if leg_type is LegType.CLOSE:
+        if leg_type is LegType.CLOSE or venue_bracket:
+            # A venue-materialised trading-stop fill reduces the hedge leg it
+            # protected exactly like a fanned close leg does — without this
+            # the durable entry-row ownership would keep counting exposure
+            # the bracket already closed, and the next restart's adoption
+            # would over-adopt.
             self._reduce_hedge_entry_ownership(side, exec_qty)
         order = ExchangeOrder(
             id=order_id,
@@ -1027,6 +1122,15 @@ class _EventStreamMixin(_BybitBase, ABC):
         pine_id, from_entry, leg_type = self._resolve_identity(
             coid or None, str(entry.get('orderId') or '') or None,
         )
+        venue_bracket = False
+        if leg_type is None:
+            # Second chance, mirroring the live-stream gate: a
+            # venue-materialised trading-stop close is ours when the durable
+            # bracket-ownership row says so — a reconnect backfill delivering
+            # it late must attribute it the same way the stream would have.
+            pine_id, from_entry, leg_type = \
+                self._attribute_venue_bracket_execution(entry, market)
+            venue_bracket = leg_type is not None
         if leg_type is None:
             # External activity (manual trade, another bot): never book it.
             # Seed the id so the fixed overlap re-read does not re-log it
@@ -1053,6 +1157,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         event = self._fill_event(
             entry, market, coid=coid, pine_id=pine_id,
             from_entry=from_entry, leg_type=leg_type,
+            venue_bracket=venue_bracket,
         )
         self._seen_exec_ids.add(exec_id)
         return event
