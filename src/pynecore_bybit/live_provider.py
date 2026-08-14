@@ -258,6 +258,65 @@ class _LiveProviderMixin(_BybitBase, ABC):
         if self._data_ready is not None:
             self._data_ready.set()
 
+    async def backfill_closed_bars(
+            self, symbol: str, timeframe: str, since_ms: int,
+    ) -> list[OHLCV]:
+        """Fetch klines that closed between the warmup history and the stream.
+
+        Same endpoint and chunking as :meth:`_backfill_gap`, but it touches
+        neither the update queue nor the closed-bar cursor: the framework owns
+        the returned bars and splices them in ahead of the first live one.
+
+        :param symbol: Provider-format symbol (unused; the plugin instance is
+            already bound to its instrument).
+        :param timeframe: Timeframe in TradingView format.
+        :param since_ms: Opening of the last bar the framework already holds.
+        :return: Closed bars strictly after ``since_ms``, ascending.
+        """
+        interval = self.to_exchange_timeframe(timeframe)
+        now_ts = int(epoch_time() * 1000)
+        cursor = add_interval(since_ms, interval, 1)
+        if bar_close_ts(cursor, interval) > now_ts:
+            return []
+        market = await asyncio.to_thread(self._get_market)
+        recovered: list[OHLCV] = []
+        while bar_close_ts(cursor, interval) <= now_ts:
+            chunk_end = min(add_interval(cursor, interval, KLINE_LIMIT - 1), now_ts)
+            result = await self._call('/v5/market/kline', {
+                'category': market.category,
+                'symbol': market.symbol,
+                'interval': interval,
+                'start': cursor,
+                'end': chunk_end,
+                'limit': KLINE_LIMIT,
+            })
+            newest: int | None = None
+            for row in sorted(result.get('list') or [], key=lambda r: int(r[0])):
+                bar_start = int(row[0])
+                if bar_start <= since_ms:
+                    continue
+                if recovered and bar_start <= recovered[-1].timestamp:
+                    continue
+                if bar_close_ts(bar_start, interval) > now_ts:
+                    # Still forming — the stream will deliver it.
+                    continue
+                recovered.append(OHLCV(
+                    timestamp=bar_start,
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5]),
+                    is_closed=True,
+                ))
+                newest = bar_start
+            if newest is not None:
+                cursor = add_interval(newest, interval, 1)
+            else:
+                cursor = max(add_interval(chunk_end, interval, 1),
+                             add_interval(cursor, interval, 1))
+        return recovered
+
     def _release_pending_closed(self) -> None:
         """Flush the closed bars held back during backfill into the queue."""
         pending = self._pending_closed
