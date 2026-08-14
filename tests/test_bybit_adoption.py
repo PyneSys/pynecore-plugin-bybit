@@ -494,6 +494,40 @@ def __test_baseline_uses_parked_private_execution_while_rest_index_lags__(tmp_pa
     assert broker._replay_pre_adoption_frames(broker._market) == []
 
 
+def __test_baseline_retries_execution_index_lag_in_same_adoption__(tmp_path):
+    # The order endpoint can expose cumExecQty before the execution index
+    # publishes the corresponding row. The bounded adoption pass re-reads the
+    # complete evidence and commits once the execution row becomes visible.
+    broker = _AdoptionFake(
+        market=_linear_instrument(),
+        positions=[_pos(side='Buy', size='0.01')],
+        order_lookups={'c11': {'orderId': 'o1', 'orderStatus': 'Filled',
+                               'cumExecQty': '0.01'}},
+    )
+
+    class _CatchingUpExecutions(dict):
+        reads = 0
+
+        def get(self, key, default=None):
+            if key == 'o1':
+                self.reads += 1
+                if self.reads < 3:
+                    return []
+            return super().get(key, default)
+
+    executions = _CatchingUpExecutions({'o1': [_exec('e1', '0.01')]})
+    broker.execs = executions
+    _open(tmp_path, broker)
+    _seed(broker, 'c11', qty=0.01, filled_qty=0.0)
+
+    _adopt(broker)
+
+    assert executions.reads == 3
+    assert broker._adoption_baselined is True
+    assert broker.store_ctx.get_order('c11').filled_qty == 0.01
+    assert 'e1' in broker._seen_exec_ids
+
+
 def __test_baseline_raises_on_execution_index_lag__(tmp_path):
     # The order truth gate: both stable position snapshots already reflect
     # a fill whose execution row is not indexed yet — the walked execQty

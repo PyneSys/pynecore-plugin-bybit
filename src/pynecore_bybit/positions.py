@@ -506,9 +506,10 @@ class _PositionsMixin(_BybitBase, ABC):
         both stable position snapshots while its execution row is not
         indexed yet. So when the conclusive lookup FOUND the order, the
         walked ``execQty`` sum must cover its authoritative ``cumExecQty``
-        (same wire domain), or the baseline raises (retryable indexing
-        lag). A not-found order skips the gate — it aged out of the order
-        history, so its fills are old and long indexed. The walk's end is
+        (same wire domain), or the complete snapshot is re-read within the
+        bounded stability pass. Persistent indexing lag raises without
+        committing a partial seed. A not-found order skips the gate — it aged
+        out of the order history, so its fills are old and long indexed. The walk's end is
         additionally clamped to at least the venue-clock floor, so a
         lagging LOCAL clock can never truncate the seed below the floor.
 
@@ -562,8 +563,10 @@ class _PositionsMixin(_BybitBase, ABC):
             raise BybitAdoptionBaselineError(
                 "adoption baseline: venue time read returned no timestamp",
             )
+        last_index_lag: str | None = None
         for _ in range(_ADOPTION_STABLE_ATTEMPTS):
             seeds: list[tuple] = []
+            pass_index_lag: str | None = None
             for row in self.store_ctx.iter_live_orders(symbol=market.symbol):
                 if row.state in PENDING_DISPATCH_STATES:
                     continue
@@ -616,11 +619,10 @@ class _PositionsMixin(_BybitBase, ABC):
                         lookup.get('cumExecQty'), field='cumExecQty',
                     )
                     if qty_sum < cum_exec - _FILL_EPS:
-                        raise BybitAdoptionBaselineError(
-                            "adoption baseline: execution index lags order "
-                            f"truth for order {order_id} "
-                            f"({qty_sum} < {cum_exec})",
+                        pass_index_lag = (
+                            f"order {order_id} ({qty_sum} < {cum_exec})"
                         )
+                        last_index_lag = pass_index_lag
                 seeds.append((row, order_id, ids, qty_sum, lookup is None))
             try:
                 verify = await self._fetch_position_rows(market)
@@ -633,6 +635,12 @@ class _PositionsMixin(_BybitBase, ABC):
                     != self._position_rows_signature(rows)):
                 # A fill raced the reads — the walks and the caller snapshot
                 # may disagree. Re-run against the fresh snapshot.
+                rows = verify
+                continue
+            if pass_index_lag is not None:
+                # Order truth can lead the execution index briefly after a
+                # fill. Re-run the complete bounded snapshot instead of
+                # failing the first startup read; no partial seed is committed.
                 rows = verify
                 continue
             self._adoption_baselined = True
@@ -728,6 +736,12 @@ class _PositionsMixin(_BybitBase, ABC):
                                  'kind': (row.extras or {}).get('kind')},
                     )
             return verify
+        if last_index_lag is not None:
+            raise BybitAdoptionBaselineError(
+                "adoption baseline: execution index remained behind order "
+                f"truth across {_ADOPTION_STABLE_ATTEMPTS} attempts: "
+                f"{last_index_lag}",
+            )
         raise BybitAdoptionBaselineError(
             "adoption baseline: position snapshot kept changing across "
             f"{_ADOPTION_STABLE_ATTEMPTS} attempts",
