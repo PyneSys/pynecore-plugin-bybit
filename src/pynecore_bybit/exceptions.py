@@ -156,6 +156,18 @@ def is_benign_trading_stop_reject(exc: BybitAPIError) -> bool:
     """
     if exc.ret_code == 34040:
         return True
+    return is_trading_stop_zero_position_reject(exc)
+
+
+def is_trading_stop_zero_position_reject(exc: BybitAPIError) -> bool:
+    """Whether a trading-stop reject proves the addressed position is flat.
+
+    The zero-position half of :func:`is_benign_trading_stop_reject`, split
+    out for the netting attach path: there a vanished position is not a
+    benign no-op but a moot exit (the engine skips the defensive close on
+    the proven-flat signal), while 34040 "not modified" stays a plain
+    idempotent success.
+    """
     return exc.ret_code == 10001 and "zero position" in str(exc)
 
 

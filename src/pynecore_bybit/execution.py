@@ -102,11 +102,16 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 from pynecore.core.broker.store_helpers import (
+    BRACKET_OWN_STATE_RELEASED,
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    EXTRAS_KEY_BRACKET_OWN_LEG_ID,
+    create_bracket_ownership_row,
     create_entry_order_row,
+    iter_active_bracket_ownerships,
     mark_disposition_unknown,
     mark_rejected,
+    update_bracket_ownership_state,
 )
 from pynecore.core.plugin import override
 
@@ -117,7 +122,9 @@ from .exceptions import (
     BybitError,
     DUPLICATE_COID_CODES,
     ORDER_NOT_FOUND_CODES,
+    is_benign_trading_stop_reject,
     is_reduce_only_zero_position_reject,
+    is_trading_stop_zero_position_reject,
     map_broker_error,
     reject_error,
 )
@@ -137,6 +144,12 @@ from .positions import HEDGE_IDX_BUY, HEDGE_IDX_SELL, POSITION_MODE_HEDGE
 logger = logging.getLogger(__name__)
 
 _SIDE_WIRE = {'buy': 'Buy', 'sell': 'Sell'}
+
+#: Synthetic broker leg id of the one-way (netting) position in the
+#: bracket-ownership rows: ``positionIdx`` 0 on the wire. Hedge rows carry
+#: the venue leg indexes '1'/'2', so this doubles as the netting-vs-hedge
+#: discriminator on the cancel/modify clear paths.
+_NETTING_LEG_ID = '0'
 
 #: Terminal ``orderStatus`` values with nothing live and no fill behind
 #: them: the order died without becoming a position. A duplicate
@@ -858,20 +871,25 @@ class _ExecutionMixin(_BybitBase, ABC):
 
         The engine owns the OCA cascade between the legs (``oca_cancel``
         SOFTWARE) and the partial-fill qty amends (``tp_sl_bracket``
-        SOFTWARE), so this path only places the resting orders. Spot has
-        no trailing primitive and the capability declares UNSUPPORTED, so
-        a trail-carrying intent is refused loudly (the validator already
-        blocks such scripts at startup).
+        SOFTWARE), so this path only places the resting orders. A
+        trail-carrying exit on the derivatives takes the trading-stop
+        position-attribute path instead
+        (:meth:`_execute_exit_trading_stop`); spot has no trailing
+        primitive and the capability declares UNSUPPORTED, so a spot
+        trail intent is refused loudly (the validator already blocks
+        such scripts at startup).
         """
         await self._ensure_broker_started()
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
-        if intent.trail_price is not None or intent.trail_offset is not None:
+        market = await asyncio.to_thread(self._broker_market)
+        trail_carrying = (intent.trail_price is not None
+                          or intent.trail_offset is not None)
+        if trail_carrying and market.category == CATEGORY_SPOT:
             raise ExchangeOrderRejectedError(
                 f"Bybit spot has no trailing-stop support "
                 f"(exit id={intent.pine_id!r})"
             )
-        market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} exit id={intent.pine_id!r} "
                  f"from={intent.from_entry!r}")
         anchor: Decimal | None = None
@@ -882,6 +900,10 @@ class _ExecutionMixin(_BybitBase, ABC):
         else:
             qty = self._quantize_or_skip(
                 market, intent.qty, intent_key=intent.intent_key, label=label,
+            )
+        if trail_carrying:
+            return await self._execute_exit_trading_stop(
+                envelope, intent, market, qty, anchor=anchor,
             )
 
         legs: list[ExchangeOrder] = []
@@ -1010,6 +1032,332 @@ class _ExecutionMixin(_BybitBase, ABC):
                             if isinstance(cause, BybitAPIError) else None),
             ) from exc
         return legs
+
+    async def _execute_exit_trading_stop(
+            self, envelope: DispatchEnvelope, intent: ExitIntent,
+            market: InstrumentInfo, qty: Decimal, *,
+            anchor: Decimal | None,
+    ) -> list[ExchangeOrder]:
+        """Attach a trail-carrying exit as the netting position's trading stop.
+
+        ``POST /v5/position/trading-stop`` writes the one-way position's
+        TP / SL / trailing attributes (``positionIdx`` 0, ``tpslMode``
+        ``'Full'``) — no venue order exists until a level fires, when
+        Bybit materialises a market order with an EMPTY ``orderLinkId``
+        and a ``stopOrderType``. The event stream attributes that fill
+        back to this exit through the PERSIST-FIRST bracket-ownership
+        row written below: the same row / matcher contract the one-way
+        emulation uses on hedge accounts, keyed on the synthetic netting
+        leg id ``'0'``, so the existing venue-fill attribution needs no
+        netting special case.
+
+        The activation price (``trail_price``) is dropped — the trailing
+        arms immediately, the same compromise the hedge-mode emulation
+        makes (``activePrice`` could not be verified on the demo
+        readback). A definitive reject releases the ownership row and
+        escalates to the engine's defensive flatten; a vanished position
+        (zero-position reject) signals proven-flat (``qty=0``) so the
+        engine skips the moot close; an ambiguous / transport outcome is
+        resolved by a position readback plus one retry, and if still
+        undecided the row STAYS ACTIVE (the attach may have landed) and
+        the defensive flatten resolves the exposure either way.
+        """
+        attach_coid = envelope.client_order_id(KIND_EXIT_SL)
+        own_coid = f"{attach_coid}:{_NETTING_LEG_ID}"
+        tp_price = (round_price(intent.tp_price, market.tick_size_str)
+                    if intent.tp_price is not None else None)
+        sl_price = (round_price(intent.sl_price, market.tick_size_str)
+                    if intent.sl_price is not None else None)
+        trail_distance = self._trail_distance(market, intent.trail_offset)
+        if self.store_ctx is not None:
+            create_bracket_ownership_row(
+                self.store_ctx,
+                coid=own_coid,
+                symbol=intent.symbol,
+                side=intent.side,
+                qty=float(self._core_qty(qty, anchor)),
+                intent_key=intent.intent_key,
+                pine_entry_id=intent.pine_id,
+                from_entry=intent.from_entry,
+                leg_id=_NETTING_LEG_ID,
+                attach_coid=attach_coid,
+                tp_price=intent.tp_price,
+                sl_price=intent.sl_price,
+                trail_price=intent.trail_price,
+                trail_offset=intent.trail_offset,
+                oca_name=intent.oca_name,
+                oca_type=intent.oca_type,
+            )
+
+        def attach_reject(msg: str, *, moot: bool) -> BracketAttachAfterFillRejectedError:
+            return BracketAttachAfterFillRejectedError(
+                f"Bybit trading-stop attach {msg} "
+                f"(exit={intent.pine_id!r}, from_entry={intent.from_entry!r})",
+                position_coid=self._entry_coid_for(intent.from_entry)
+                or f"__pyne_orphan__{intent.symbol}__{intent.from_entry}",
+                symbol=intent.symbol,
+                position_side='buy' if intent.side == 'sell' else 'sell',
+                qty=0.0 if moot else self._core_qty(qty, anchor),
+                from_entry=intent.from_entry,
+                exit_id=intent.pine_id,
+            )
+
+        try:
+            await self._post_trading_stop(
+                market, tp_price=tp_price, sl_price=sl_price,
+                trail_distance=trail_distance,
+            )
+        except BybitAPIError as e:
+            if e.ret_code == 34040:
+                # "Not modified": the values are already attached — an
+                # idempotent re-attach (restart replay, modify no-op).
+                pass
+            elif is_trading_stop_zero_position_reject(e):
+                # The position vanished before the attach — the exit is
+                # moot, not an unprotected-position emergency. Proven-flat
+                # (qty=0) makes the engine skip the defensive close.
+                self._release_netting_ownership(own_coid)
+                raise attach_reject(
+                    "found the position already flat", moot=True) from e
+            elif e.ret_code in AMBIGUOUS_DISPOSITION_CODES:
+                if not await self._resolve_ambiguous_trading_stop(
+                        market, tp_price=tp_price, sl_price=sl_price,
+                        trail_distance=trail_distance):
+                    # Undecided after readback + one retry. The attach may
+                    # have landed, so the ownership row stays ACTIVE; the
+                    # defensive flatten below resolves the exposure and a
+                    # landed attach becomes moot on the flat position.
+                    raise attach_reject(
+                        f"stayed unresolved after a server-side failure "
+                        f"(retCode={e.ret_code})", moot=False) from e
+            else:
+                self._release_netting_ownership(own_coid)
+                raise attach_reject(f"rejected: {e}", moot=False) from e
+        except BybitError as e:
+            if not await self._resolve_ambiguous_trading_stop(
+                    market, tp_price=tp_price, sl_price=sl_price,
+                    trail_distance=trail_distance):
+                raise attach_reject(
+                    f"stayed unresolved after a transport failure: {e}",
+                    moot=False) from e
+        if self.store_ctx is not None:
+            self.store_ctx.log_event(
+                'trading_stop_attached', client_order_id=own_coid,
+                intent_key=intent.intent_key,
+                payload={
+                    'tp': float(tp_price) if tp_price is not None else None,
+                    'sl': float(sl_price) if sl_price is not None else None,
+                    'trailing': (float(trail_distance)
+                                 if trail_distance is not None else None),
+                },
+            )
+        core_qty = self._core_qty(qty, anchor)
+        legs: list[ExchangeOrder] = []
+        if tp_price is not None:
+            legs.append(ExchangeOrder(
+                id=f"bracket:{_NETTING_LEG_ID}:{attach_coid}:tp",
+                symbol=intent.symbol,
+                side=intent.side,
+                order_type=OrderType.LIMIT,
+                qty=core_qty,
+                filled_qty=0.0,
+                remaining_qty=core_qty,
+                price=float(tp_price),
+                stop_price=None,
+                average_fill_price=None,
+                status=OrderStatus.OPEN,
+                timestamp=epoch_time(),
+                fee=0.0,
+                fee_currency='',
+                reduce_only=True,
+                client_order_id=envelope.client_order_id(KIND_EXIT_TP),
+            ))
+        legs.append(ExchangeOrder(
+            id=f"bracket:{_NETTING_LEG_ID}:{attach_coid}:sl",
+            symbol=intent.symbol,
+            side=intent.side,
+            order_type=OrderType.TRAILING_STOP,
+            qty=core_qty,
+            filled_qty=0.0,
+            remaining_qty=core_qty,
+            price=None,
+            stop_price=float(sl_price) if sl_price is not None else None,
+            average_fill_price=None,
+            status=OrderStatus.OPEN,
+            timestamp=epoch_time(),
+            fee=0.0,
+            fee_currency='',
+            reduce_only=True,
+            client_order_id=attach_coid,
+        ))
+        return legs
+
+    @staticmethod
+    def _trail_distance(
+            market: InstrumentInfo, trail_offset: float | None,
+    ) -> Decimal | None:
+        """Convert a Pine trailing offset (ticks) to a venue price distance.
+
+        Clamped to one tick from below: ``trailingStop`` treats the
+        literal ``"0"`` as "clear the trailing stop", so a zero-tick
+        offset (trail exactly from the water mark) maps to the tightest
+        distance the venue can express instead of erasing the stop.
+        """
+        if trail_offset is None:
+            return None
+        tick = Decimal(market.tick_size_str)
+        distance = Decimal(str(trail_offset)) * tick
+        return distance if distance >= tick else tick
+
+    async def _post_trading_stop(
+            self, market: InstrumentInfo, *,
+            tp_price: Decimal | None, sl_price: Decimal | None,
+            trail_distance: Decimal | None,
+    ) -> None:
+        """Write the one-way position's trading-stop attributes verbatim.
+
+        Full-replacement semantics: every field is sent on every call and
+        ``None`` maps to the literal ``"0"`` (Bybit's clear marker), so a
+        call with all three ``None`` wipes the bracket wholesale. Raw —
+        the callers own the error classification (attach, clear and
+        modify need different taxonomies).
+        """
+        body: dict[str, _JsonScalar] = {
+            'category': market.category,
+            'symbol': market.symbol,
+            'positionIdx': int(_NETTING_LEG_ID),
+            'tpslMode': 'Full',
+            'takeProfit': (format_decimal(tp_price)
+                           if tp_price is not None else '0'),
+            'stopLoss': (format_decimal(sl_price)
+                         if sl_price is not None else '0'),
+            'trailingStop': (format_decimal(trail_distance)
+                             if trail_distance is not None else '0'),
+        }
+        await self._call('/v5/position/trading-stop', method='post',
+                         body=body, auth=True)
+
+    async def _resolve_ambiguous_trading_stop(
+            self, market: InstrumentInfo, *,
+            tp_price: Decimal | None, sl_price: Decimal | None,
+            trail_distance: Decimal | None,
+    ) -> bool:
+        """Resolve an ambiguous trading-stop write: readback, retry, readback.
+
+        ``True`` when the position's attributes verifiably show the
+        intended values (the write landed, or the bounded retry landed
+        it); ``False`` when the outcome stays unknown — the caller
+        escalates to the defensive flatten.
+        """
+        if await self._trading_stop_attached(
+                market, tp_price=tp_price, sl_price=sl_price,
+                trail_distance=trail_distance):
+            return True
+        try:
+            await self._post_trading_stop(
+                market, tp_price=tp_price, sl_price=sl_price,
+                trail_distance=trail_distance,
+            )
+        except BybitAPIError as e:
+            if e.ret_code != 34040:
+                return False
+        except BybitError:
+            return False
+        return await self._trading_stop_attached(
+            market, tp_price=tp_price, sl_price=sl_price,
+            trail_distance=trail_distance)
+
+    async def _trading_stop_attached(
+            self, market: InstrumentInfo, *,
+            tp_price: Decimal | None, sl_price: Decimal | None,
+            trail_distance: Decimal | None,
+    ) -> bool:
+        """Whether the one-way position row shows exactly these attributes."""
+        try:
+            rows = await self._fetch_position_rows(market)
+        except BybitError:
+            return False
+        for row in rows:
+            try:
+                if int(row.get('positionIdx') or 0) != int(_NETTING_LEG_ID):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            return (self._bracket_field_matches(row, 'takeProfit', tp_price)
+                    and self._bracket_field_matches(row, 'stopLoss', sl_price)
+                    and self._bracket_field_matches(
+                        row, 'trailingStop', trail_distance))
+        return False
+
+    @staticmethod
+    def _bracket_field_matches(
+            row: dict, field: str, want: Decimal | None,
+    ) -> bool:
+        """Compare one position-row bracket attribute against the target."""
+        raw = str(row.get(field) or '').strip()
+        if want is None:
+            return raw in ('', '0', '0.0', '0.00000000')
+        try:
+            return Decimal(raw) == want
+        except InvalidOperation:
+            return False
+
+    def _release_netting_ownership(self, own_coid: str) -> None:
+        """Release + close one netting bracket-ownership row (no-op storeless)."""
+        if self.store_ctx is not None:
+            update_bracket_ownership_state(
+                self.store_ctx, coid=own_coid,
+                new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
+            )
+
+    def _owned_netting_stop_rows(
+            self, symbol: str, pine_id: str, from_entry: str | None,
+    ) -> list:
+        """Active netting (leg id '0') ownership rows of one exit intent."""
+        if self.store_ctx is None:
+            return []
+        return [
+            row for row in iter_active_bracket_ownerships(
+                self.store_ctx, symbol=symbol, from_entry=from_entry)
+            if (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+            == _NETTING_LEG_ID
+            and row.pine_entry_id == pine_id
+        ]
+
+    async def _clear_position_trading_stop(
+            self, market: InstrumentInfo, *, context_coid: str,
+    ) -> None:
+        """Clear the one-way position's trading stop (benign-tolerant).
+
+        An already-clear bracket ("not modified") and a vanished position
+        are both no-ops; a server-side / transport ambiguity parks as
+        disposition-unknown keyed on the ownership row's coid so the
+        cancel-tentative machine retries the clear.
+        """
+        try:
+            await self._post_trading_stop(
+                market, tp_price=None, sl_price=None, trail_distance=None,
+            )
+        except BybitAPIError as e:
+            if is_benign_trading_stop_reject(e):
+                return
+            if e.ret_code in AMBIGUOUS_DISPOSITION_CODES:
+                raise OrderDispositionUnknownError(
+                    f"Bybit trading-stop clear server-side failure for "
+                    f"{context_coid} (retCode={e.ret_code}); disposition "
+                    f"unknown",
+                    client_order_id=context_coid, cause=e,
+                ) from e
+            mapped = map_broker_error(e)
+            if mapped is not None:
+                raise mapped from e
+            raise reject_error(e) from e
+        except BybitError as e:
+            raise OrderDispositionUnknownError(
+                f"Bybit trading-stop clear transport failure for "
+                f"{context_coid}; disposition unknown",
+                client_order_id=context_coid, cause=e,
+            ) from e
 
     def _entry_coid_for(self, from_entry: str) -> str | None:
         """Resolve the live entry row's coid for a Pine entry id."""
@@ -1257,7 +1605,30 @@ class _ExecutionMixin(_BybitBase, ABC):
                     self.store_ctx.close_order(coid)
             else:
                 cancelled_any = False
+        # A trading-stop-attached exit has no venue order to cancel — its
+        # "cancel" is clearing the position attributes and releasing the
+        # ownership row. Entry cancels (``from_entry`` None) never touch
+        # the bracket (TV semantics: cancelling an entry leaves its exit).
+        if intent.from_entry is not None:
+            for row in self._owned_netting_stop_rows(
+                    intent.symbol, intent.pine_id, intent.from_entry):
+                await self._clear_owned_trading_stop(market, row)
         return cancelled_any
+
+    async def _clear_owned_trading_stop(
+            self, market: InstrumentInfo, row,
+    ) -> None:
+        """Clear one owned netting trading stop + release its row."""
+        await self._clear_position_trading_stop(
+            market, context_coid=row.client_order_id,
+        )
+        self._release_netting_ownership(row.client_order_id)
+        if self.store_ctx is not None:
+            self.store_ctx.log_event(
+                'trading_stop_cleared',
+                client_order_id=row.client_order_id,
+                intent_key=row.intent_key,
+            )
 
     async def _cancel_by_coid(self, market: InstrumentInfo, coid: str) -> bool:
         """Cancel one order by ``orderLinkId``; not-found is a benign True."""
@@ -1382,11 +1753,24 @@ class _ExecutionMixin(_BybitBase, ABC):
         assert isinstance(intent, CancelIntent)
         market = await asyncio.to_thread(self._broker_market)
         coids = self._live_coids_for_cancel(intent)
-        if not coids:
+        owned = ([] if intent.from_entry is None
+                 else self._owned_netting_stop_rows(
+                     intent.symbol, intent.pine_id, intent.from_entry))
+        if not coids and not owned:
             return CancelDispositionOutcome.UNKNOWN
         outcomes: list[CancelDispositionOutcome] = []
         for coid in coids:
             outcomes.append(await self._cancel_outcome_for(market, coid))
+        for row in owned:
+            # A trading-stop "cancel" is the attribute clear: deterministic
+            # when it completes, UNKNOWN on an ambiguous write so the
+            # cancel-tentative machine retries this same path.
+            try:
+                await self._clear_owned_trading_stop(market, row)
+            except OrderDispositionUnknownError:
+                outcomes.append(CancelDispositionOutcome.UNKNOWN)
+            else:
+                outcomes.append(CancelDispositionOutcome.CANCEL_CONFIRMED)
         if CancelDispositionOutcome.ALREADY_FILLED in outcomes:
             return CancelDispositionOutcome.ALREADY_FILLED
         if all(o is CancelDispositionOutcome.CANCEL_CONFIRMED for o in outcomes):
@@ -1636,6 +2020,16 @@ class _ExecutionMixin(_BybitBase, ABC):
         old_intent = old.intent
         assert isinstance(new_intent, ExitIntent)
         assert isinstance(old_intent, ExitIntent)
+        trail_old = (old_intent.trail_price is not None
+                     or old_intent.trail_offset is not None)
+        trail_new = (new_intent.trail_price is not None
+                     or new_intent.trail_offset is not None)
+        if trail_old and self._position_mode != POSITION_MODE_HEDGE:
+            market = await asyncio.to_thread(self._broker_market)
+            if market.category != CATEGORY_SPOT:
+                return await self._modify_trading_stop_exit(
+                    old, new, market, trail_new=trail_new,
+                )
         same_shape = (
             (new_intent.tp_price is None) == (old_intent.tp_price is None)
             and (new_intent.sl_price is None) == (old_intent.sl_price is None)
@@ -1749,6 +2143,38 @@ class _ExecutionMixin(_BybitBase, ABC):
                          'sl': new_intent.sl_price},
             )
         return legs
+
+    async def _modify_trading_stop_exit(
+            self, old: DispatchEnvelope, new: DispatchEnvelope,
+            market: InstrumentInfo, *, trail_new: bool,
+    ) -> list[ExchangeOrder]:
+        """Re-point a trading-stop-attached exit at its new levels.
+
+        The trading stop is a position attribute with full-replacement
+        write semantics: while the new intent still trails, the fresh
+        attach in :meth:`execute_exit` simply overwrites the old values
+        — no cancel window ever leaves the position unprotected. The old
+        attach's ownership row is released first (its coid derives from
+        the OLD envelope, so the new attach cannot upsert it; releasing
+        after the new persist would risk two ACTIVE rows, which the
+        venue-fill attribution refuses as ambiguous). When the new shape
+        dropped the trail, the attribute is explicitly cleared — even
+        with no ownership row on the books, a crash window may have left
+        the venue attribute set — before the order-leg path takes over
+        through the same :meth:`execute_exit` dispatch.
+        """
+        old_intent = old.intent
+        assert isinstance(old_intent, ExitIntent)
+        rows = self._owned_netting_stop_rows(
+            old_intent.symbol, old_intent.pine_id, old_intent.from_entry,
+        )
+        if not trail_new:
+            await self._clear_position_trading_stop(
+                market, context_coid=old.client_order_id(KIND_EXIT_SL),
+            )
+        for row in rows:
+            self._release_netting_ownership(row.client_order_id)
+        return await self.execute_exit(new)
 
     async def _amend_or_none(self, body: dict, *, coid: str) -> dict | None:
         """Run one ``/v5/order/amend``; ``None`` when the order is gone.

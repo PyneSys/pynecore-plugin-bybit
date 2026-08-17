@@ -29,7 +29,7 @@ from pynecore.core.broker.storage import BrokerStore
 
 import pynecore_bybit.events as events_module
 from pynecore_bybit import Bybit, BybitConfig
-from pynecore_bybit.exceptions import BybitAPIError
+from pynecore_bybit.exceptions import BybitAPIError, BybitConnectionError
 from pynecore_bybit.helpers import (
     base_to_contracts,
     contracts_to_base,
@@ -1210,8 +1210,8 @@ def __test_bybit_linear_capabilities_and_gate__():
     assert caps.short_selling is CapabilityLevel.NATIVE
     assert caps.stop_order is CapabilityLevel.NATIVE
     assert caps.idempotency is CapabilityLevel.NATIVE
-    # Conservative until verified live on the demo.
-    assert caps.trailing_stop is CapabilityLevel.UNSUPPORTED
+    # Trading-stop position attach: netting path + hedge emulation.
+    assert caps.trailing_stop is CapabilityLevel.NATIVE
     assert caps.tp_sl_bracket is CapabilityLevel.SOFTWARE
     assert caps.oca_cancel is CapabilityLevel.SOFTWARE
 
@@ -1920,3 +1920,237 @@ def __test_bybit_ambiguous_bracket_ownership_refuses_to_guess__(tmp_path):
     assert events == []
     assert len(list(plugin.store_ctx.iter_events_by_kind_for_run_id(
         'external_activity_ignored'))) == 1
+
+
+def _trail_exit_envelope(*, bar_ts_ms: int = 1_752_600_000_000,
+                         **overrides) -> DispatchEnvelope:
+    """A trail-carrying full-row exit on the linear perpetual."""
+    values = dict(
+        pine_id='Trail-X', from_entry='Long', symbol='BTCUSDT', side='sell',
+        qty=0.002, tp_price=110000.0, sl_price=90000.0,
+        trail_price=105000.0, trail_offset=50.0,
+    )
+    values.update(overrides)
+    return DispatchEnvelope(
+        intent=ExitIntent(**values), run_tag='t3st',
+        bar_ts_ms=bar_ts_ms, coid_max_len=36,
+    )
+
+
+def _active_netting_ownership_rows(plugin) -> list:
+    from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
+    return list(iter_active_bracket_ownerships(
+        plugin.store_ctx, symbol=plugin._market.symbol))
+
+
+def __test_bybit_netting_trailing_attaches_the_trading_stop__(tmp_path):
+    """A trail-carrying netting exit attaches as the position's trading stop.
+
+    No venue orders are created: the whole bracket rides on ONE
+    ``/v5/position/trading-stop`` write (``positionIdx`` 0, ``tpslMode``
+    Full), the durable proof of ownership is the persist-first bracket
+    row keyed on the synthetic netting leg id '0', and the returned
+    synthetic legs carry stable ``bracket:``-namespaced ids. The Pine
+    ``trail_offset`` (50 ticks) converts to the venue price distance
+    (50 * 0.10 = 5).
+    """
+    plugin = _linear_plugin(responses=[{}])
+    _attach_store(plugin, tmp_path, "net-trail")
+    legs = asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    assert len(plugin.calls) == 1
+    endpoint, _, body = plugin.calls[0]
+    assert endpoint == '/v5/position/trading-stop'
+    assert body['positionIdx'] == 0
+    assert body['tpslMode'] == 'Full'
+    assert body['takeProfit'] == '110000'
+    assert body['stopLoss'] == '90000'
+    assert body['trailingStop'] == '5'
+    assert len(legs) == 2
+    assert legs[0].order_type is OrderType.LIMIT
+    assert legs[0].price == 110000.0
+    assert legs[1].order_type is OrderType.TRAILING_STOP
+    assert legs[1].stop_price == 90000.0
+    assert all(leg.reduce_only for leg in legs)
+    assert all(leg.id.startswith('bracket:0:') for leg in legs)
+    rows = _active_netting_ownership_rows(plugin)
+    assert len(rows) == 1
+    assert rows[0].pine_entry_id == 'Trail-X'
+    assert rows[0].from_entry == 'Long'
+    assert rows[0].client_order_id.endswith(':0')
+    attached = list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'trading_stop_attached'))
+    assert len(attached) == 1
+
+
+def __test_bybit_netting_zero_trail_offset_clamps_to_one_tick__():
+    """A zero-tick offset must NOT serialise as '0' — that CLEARS the stop."""
+    plugin = _linear_plugin(responses=[{}])
+    asyncio.run(plugin.execute_exit(_trail_exit_envelope(
+        trail_offset=0.0, tp_price=None, sl_price=None,
+    )))
+    _, _, body = plugin.calls[0]
+    assert body['trailingStop'] == '0.1'
+    assert body['takeProfit'] == '0'
+    assert body['stopLoss'] == '0'
+
+
+def __test_bybit_netting_trailing_zero_position_is_moot__(tmp_path):
+    """A vanished position signals proven-flat (qty=0): no defensive close."""
+    plugin = _linear_plugin(responses=[BybitAPIError(
+        "can not set tp/sl/ts for zero position", ret_code=10001,
+    )])
+    _attach_store(plugin, tmp_path, "net-flat")
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    assert exc.value.qty == 0.0
+    assert _active_netting_ownership_rows(plugin) == []
+
+
+def __test_bybit_netting_trailing_definitive_reject_escalates__(tmp_path):
+    """A definitive attach reject releases the row and sizes the flatten."""
+    plugin = _linear_plugin(responses=[BybitAPIError(
+        "tp price invalid", ret_code=110092,
+    )])
+    _attach_store(plugin, tmp_path, "net-reject")
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    assert exc.value.qty == pytest.approx(0.002)
+    assert _active_netting_ownership_rows(plugin) == []
+
+
+def __test_bybit_netting_trailing_ambiguous_resolved_by_readback__(tmp_path):
+    """A server-side ambiguity that the position readback confirms is a success."""
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("Server Timeout", ret_code=10000),
+        {'list': [_position_row(
+            size='0.002', side='Buy', takeProfit='110000',
+            stopLoss='90000', trailingStop='5',
+        )]},
+    ])
+    _attach_store(plugin, tmp_path, "net-ambig-ok")
+    legs = asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    assert len(legs) == 2
+    assert plugin.calls[1][0] == '/v5/position/list'
+    assert len(_active_netting_ownership_rows(plugin)) == 1
+
+
+def __test_bybit_netting_trailing_unresolved_keeps_the_row_active__(tmp_path):
+    """An unresolvable attach escalates but keeps the row for replay.
+
+    The write may have landed, so releasing the ownership row would orphan
+    a live venue trailing stop; the defensive flatten resolves the
+    exposure either way (a landed attach is moot on the flat position).
+    """
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("Server Timeout", ret_code=10000),
+        BybitConnectionError("network down"),   # readback
+        BybitConnectionError("network down"),   # bounded retry
+    ])
+    _attach_store(plugin, tmp_path, "net-ambig-bad")
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    assert exc.value.qty == pytest.approx(0.002)
+    assert len(_active_netting_ownership_rows(plugin)) == 1
+
+
+def __test_bybit_cancel_clears_the_netting_trading_stop__(tmp_path):
+    """An exit cancel clears the position attributes and releases the row."""
+    plugin = _linear_plugin(responses=[{}, {}])
+    _attach_store(plugin, tmp_path, "net-cancel")
+    asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    cancelled = asyncio.run(plugin.execute_cancel(DispatchEnvelope(
+        intent=CancelIntent(pine_id='Trail-X', symbol='BTCUSDT',
+                            from_entry='Long'),
+        run_tag='t3st', bar_ts_ms=1_752_600_060_000, coid_max_len=36,
+    )))
+    assert cancelled is True
+    endpoint, _, body = plugin.calls[-1]
+    assert endpoint == '/v5/position/trading-stop'
+    assert body['takeProfit'] == '0'
+    assert body['stopLoss'] == '0'
+    assert body['trailingStop'] == '0'
+    assert _active_netting_ownership_rows(plugin) == []
+    cleared = list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'trading_stop_cleared'))
+    assert len(cleared) == 1
+
+
+def __test_bybit_entry_cancel_leaves_the_netting_trading_stop__(tmp_path):
+    """Cancelling the ENTRY must not strip the exit's bracket (TV semantics)."""
+    plugin = _linear_plugin(responses=[{}])
+    _attach_store(plugin, tmp_path, "net-entry-cancel")
+    asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    asyncio.run(plugin.execute_cancel(DispatchEnvelope(
+        intent=CancelIntent(pine_id='Long', symbol='BTCUSDT'),
+        run_tag='t3st', bar_ts_ms=1_752_600_060_000, coid_max_len=36,
+    )))
+    assert len(plugin.calls) == 1  # the attach only — no clear ran
+    assert len(_active_netting_ownership_rows(plugin)) == 1
+
+
+def __test_bybit_modify_reattaches_the_netting_trading_stop__(tmp_path):
+    """Trail->trail modify: full-replacement re-attach, no cancel window."""
+    plugin = _linear_plugin(responses=[{}, {}])
+    _attach_store(plugin, tmp_path, "net-modify")
+    old = _trail_exit_envelope()
+    asyncio.run(plugin.execute_exit(old))
+    first_coid = _active_netting_ownership_rows(plugin)[0].client_order_id
+    new = _trail_exit_envelope(bar_ts_ms=1_752_600_060_000, sl_price=95000.0)
+    legs = asyncio.run(plugin.modify_exit(old, new))
+    assert len(legs) == 2
+    assert [call[0] for call in plugin.calls] == [
+        '/v5/position/trading-stop', '/v5/position/trading-stop',
+    ]
+    assert plugin.calls[1][2]['stopLoss'] == '95000'
+    rows = _active_netting_ownership_rows(plugin)
+    assert len(rows) == 1
+    assert rows[0].client_order_id != first_coid
+
+
+def __test_bybit_modify_dropping_the_trail_clears_then_places_legs__(tmp_path):
+    """Trail->no-trail modify: explicit clear, then the order-leg bracket."""
+    plugin = _linear_plugin(responses=[
+        {}, {}, {'orderId': '701'}, {'orderId': '702'},
+    ])
+    _attach_store(plugin, tmp_path, "net-modify-drop")
+    old = _trail_exit_envelope()
+    asyncio.run(plugin.execute_exit(old))
+    new = _trail_exit_envelope(
+        bar_ts_ms=1_752_600_060_000, trail_price=None, trail_offset=None,
+    )
+    legs = asyncio.run(plugin.modify_exit(old, new))
+    assert len(legs) == 2
+    endpoints = [call[0] for call in plugin.calls]
+    assert endpoints == [
+        '/v5/position/trading-stop', '/v5/position/trading-stop',
+        '/v5/order/create', '/v5/order/create',
+    ]
+    clear_body = plugin.calls[1][2]
+    assert clear_body['takeProfit'] == clear_body['stopLoss'] \
+           == clear_body['trailingStop'] == '0'
+    assert _active_netting_ownership_rows(plugin) == []
+
+
+def __test_bybit_netting_venue_trailing_fill_attributes__(tmp_path):
+    """A coid-less TrailingStop execution books as the netting exit's leg.
+
+    The one-way mirror of the hedge attribution test: the ownership row
+    keyed on leg id '0' is the proof, and ``stopOrderType`` TrailingStop
+    maps to the TRAILING_STOP leg type.
+    """
+    plugin = _linear_plugin()
+    _attach_store(plugin, tmp_path, "net-attr")
+    _seed_bracket_ownership(plugin, exit_id='Trail-X', from_entry='Long',
+                            leg_id='0', attach_coid='attach-n')
+
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [_venue_stop_execution(stopOrderType='TrailingStop')],
+    }, plugin._market)
+
+    assert len(events) == 1
+    assert events[0].leg_type is LegType.TRAILING_STOP
+    assert events[0].pine_id == 'Trail-X'
+    assert events[0].from_entry == 'Long'
+    assert list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored')) == []

@@ -221,14 +221,17 @@ class _StateMixin(_BybitBase, ABC):
         **Linear / inverse** — the position-based profile:
         ``reduce_only`` / ``fetch_position`` / ``short_selling`` NATIVE
         (explicit ``reduceOnly`` flag, ``/v5/position/list``, shorting is
-        natural). The exit bracket stays the engine-driven SOFTWARE pair
-        of reduce-only order legs (the ``trading-stop`` position attach
-        is assessed on the demo before any raise, per the plan), so
-        ``tp_sl_bracket`` / ``oca_cancel`` match spot. ``trailing_stop``
-        UNSUPPORTED until the ``trading-stop`` trailing activation
-        semantics are verified live — same no-false-promise rule as spot.
-        Inverse shares the linear profile: the venue primitives are the
-        same endpoints; only the qty denomination differs (whole USD
+        natural). The non-trailing exit bracket stays the engine-driven
+        SOFTWARE pair of reduce-only order legs, so ``tp_sl_bracket`` /
+        ``oca_cancel`` match spot. ``trailing_stop`` NATIVE: a
+        trail-carrying exit attaches as the ``trading-stop`` position
+        attribute — on a one-way account through the netting attach path
+        (``_execute_exit_trading_stop``), on a hedge account through the
+        core one-way emulation's per-leg ``amend_bracket`` replication;
+        both arm the trailing immediately (the emulator's activation
+        compromise — ``activePrice`` is not demo-verifiable). Inverse
+        shares the linear profile: the venue primitives are the same
+        endpoints; only the qty denomination differs (whole USD
         contracts — mapped in the execution/positions mix-ins).
         """
         market = self._broker_market()
@@ -250,7 +253,7 @@ class _StateMixin(_BybitBase, ABC):
             )
         return ExchangeCapabilities(
             stop_order=CapabilityLevel.NATIVE,
-            trailing_stop=CapabilityLevel.UNSUPPORTED,
+            trailing_stop=CapabilityLevel.NATIVE,
             tp_sl_bracket=CapabilityLevel.SOFTWARE,
             partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
             partial_qty_bracket_exit_pyramiding=CapabilityLevel.SOFTWARE,
