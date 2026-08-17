@@ -530,14 +530,27 @@ class _EventStreamMixin(_BybitBase, ABC):
         if closed_size <= 0.0 or exec_qty <= 0.0:
             return []
         exec_side = str(entry.get('side') or '').lower()
+        # No symbol filter: the ownership writers journal under the ENGINE
+        # symbol (the chart ticker, e.g. 'ETHUSDT.P') while ``market.symbol``
+        # is the venue wire name ('ETHUSDT') — a wire-symbol filter matches
+        # nothing (measured live on cycle 33: the TP/SL trading-stop fills
+        # fell through to external_activity_ignored and the book desynced
+        # +0.01 on the next folded reversal). The store iteration is
+        # run-scoped and a run trades exactly one symbol, so the unfiltered
+        # walk is exact.
         candidates = [
-            row for row in iter_active_bracket_ownerships(
-                self.store_ctx, symbol=market.symbol,
-            )
+            row for row in iter_active_bracket_ownerships(self.store_ctx)
             if (row.side or '').lower() == exec_side
             and row.pine_entry_id is not None
         ]
         if not candidates:
+            logger.warning(
+                "Bybit venue trading-stop execution %s (%s %s closed=%s) on "
+                "%s matches no live bracket-ownership row — treating as "
+                "external activity",
+                entry.get('execId'), entry.get('side'),
+                entry.get('execQty'), entry.get('closedSize'), market.symbol,
+            )
             return []
         claims: list[tuple[str, str | None, LegType, float]]
         split = False

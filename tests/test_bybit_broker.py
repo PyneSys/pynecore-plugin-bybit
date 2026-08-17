@@ -1814,10 +1814,15 @@ def _venue_stop_execution(**overrides) -> dict:
 def _seed_bracket_ownership(plugin, *, side: str = 'buy', exit_id: str = 'S-X',
                             from_entry: str = 'S', leg_id: str = '2',
                             attach_coid: str = 'attach-s') -> None:
+    # Venue-true shape: the production writers journal ownership rows under
+    # the ENGINE symbol (``intent.symbol``, the chart ticker with the '.P'
+    # suffix), never under the wire ``market.symbol`` — attribution must not
+    # depend on the wire name (cycle 33: a wire-symbol filter matched
+    # nothing and the bot's own TP/SL fills were dropped as external).
     from pynecore.core.broker.store_helpers import create_bracket_ownership_row
     create_bracket_ownership_row(
         plugin.store_ctx, coid=f"{attach_coid}:{leg_id}",
-        symbol=plugin._market.symbol, side=side, qty=0.02,
+        symbol=f"{plugin._market.symbol}.P", side=side, qty=0.02,
         intent_key=f"{exit_id}\x00{from_entry}", pine_entry_id=exit_id,
         from_entry=from_entry, leg_id=leg_id, attach_coid=attach_coid,
         tp_price=1879.0, sl_price=1887.0, trail_price=None, trail_offset=None,
