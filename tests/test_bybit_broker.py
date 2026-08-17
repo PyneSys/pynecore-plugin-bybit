@@ -1873,9 +1873,10 @@ def __test_bybit_venue_trading_stop_fill_attributes_in_backfill__(tmp_path):
     _seed_bracket_ownership(plugin)
     market = plugin._market
 
-    event = plugin._backfill_one_execution(_venue_stop_execution(), market)
+    events = plugin._backfill_one_execution(_venue_stop_execution(), market)
 
-    assert event is not None
+    assert len(events) == 1
+    event = events[0]
     assert event.leg_type is LegType.STOP_LOSS
     assert event.pine_id == 'S-X'
     assert event.from_entry == 'S'
@@ -2152,5 +2153,117 @@ def __test_bybit_netting_venue_trailing_fill_attributes__(tmp_path):
     assert events[0].leg_type is LegType.TRAILING_STOP
     assert events[0].pine_id == 'Trail-X'
     assert events[0].from_entry == 'Long'
+    assert list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored')) == []
+
+
+def __test_bybit_pyramid_shared_stop_fill_splits_across_owners__(tmp_path):
+    """One 'Full' stop closing a pyramid books EVERY owning exit's slice.
+
+    Measured live (cycle 31): three pyramid exits amended the ONE shared
+    hedge-leg trading stop; when it fired, the single venue order closed
+    all 0.06 and the old refuse-on-ambiguity left the whole journal
+    exposure stale — the reversal then netted against phantom longs and
+    the run ended venue -0.06 vs book +0.02. Same-leg candidates whose
+    quantities sum to the execution are the pyramid shape and must split
+    FIFO, one fill event per exit.
+    """
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "pyramid-split")
+    for exit_id, from_entry, coid in (
+            ('L1-X', 'L1', 'attach-1'),
+            ('L2-X', 'L2', 'attach-2'),
+            ('L3-X', 'L3', 'attach-3'),
+    ):
+        _seed_bracket_ownership(plugin, side='sell', exit_id=exit_id,
+                                from_entry=from_entry, leg_id='1',
+                                attach_coid=coid)
+
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [_venue_stop_execution(
+            side='Sell', execQty='0.06', closedSize='0.06',
+            execFee='0.03', execId='vs-split',
+        )],
+    }, plugin._market)
+
+    assert [e.pine_id for e in events] == ['L1-X', 'L2-X', 'L3-X']
+    assert [e.from_entry for e in events] == ['L1', 'L2', 'L3']
+    assert all(e.leg_type is LegType.STOP_LOSS for e in events)
+    assert [e.fill_qty for e in events] == pytest.approx([0.02, 0.02, 0.02])
+    attributed = list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'venue_bracket_fill_attributed'))
+    assert len(attributed) == 3
+    assert list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored')) == []
+
+
+def __test_bybit_partial_shared_stop_slice_still_refuses__(tmp_path):
+    """A slice smaller than the owners' total stays refused (no guessing)."""
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "pyramid-partial")
+    _seed_bracket_ownership(plugin, side='sell', exit_id='L1-X',
+                            from_entry='L1', leg_id='1', attach_coid='a1')
+    _seed_bracket_ownership(plugin, side='sell', exit_id='L2-X',
+                            from_entry='L2', leg_id='1', attach_coid='a2')
+
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [_venue_stop_execution(
+            side='Sell', execQty='0.03', closedSize='0.03',
+            execId='vs-partial',
+        )],
+    }, plugin._market)
+
+    assert events == []
+    assert len(list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored'))) == 1
+
+
+def __test_bybit_cross_leg_owners_still_refuse__(tmp_path):
+    """Same-side owners on DIFFERENT legs never split — that is a real
+    ambiguity (mid-reversal double-sided state), not the pyramid shape."""
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "cross-leg")
+    _seed_bracket_ownership(plugin, side='sell', exit_id='L1-X',
+                            from_entry='L1', leg_id='1', attach_coid='a1')
+    _seed_bracket_ownership(plugin, side='sell', exit_id='Z-X',
+                            from_entry='Z', leg_id='0', attach_coid='a2')
+
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [_venue_stop_execution(
+            side='Sell', execQty='0.04', closedSize='0.04',
+            execId='vs-crossleg',
+        )],
+    }, plugin._market)
+
+    assert events == []
+    assert len(list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored'))) == 1
+
+
+def __test_bybit_pyramid_shared_stop_splits_in_backfill__(tmp_path):
+    """The reconnect backfill splits the shared-stop fill the same way."""
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "pyramid-split-bf")
+    for exit_id, from_entry, coid in (
+            ('S1-X', 'S1', 'attach-1'),
+            ('S2-X', 'S2', 'attach-2'),
+    ):
+        _seed_bracket_ownership(plugin, side='buy', exit_id=exit_id,
+                                from_entry=from_entry, leg_id='2',
+                                attach_coid=coid)
+
+    events = plugin._backfill_one_execution(_venue_stop_execution(
+        side='Buy', execQty='0.04', closedSize='0.04', execId='vs-split-bf',
+    ), plugin._market)
+
+    assert [e.pine_id for e in events] == ['S1-X', 'S2-X']
+    assert [e.fill_qty for e in events] == pytest.approx([0.02, 0.02])
     assert list(plugin.store_ctx.iter_events_by_kind_for_run_id(
         'external_activity_ignored')) == []

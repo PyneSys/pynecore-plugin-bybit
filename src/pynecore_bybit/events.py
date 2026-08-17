@@ -61,6 +61,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    EXTRAS_KEY_BRACKET_OWN_LEG_ID,
     iter_active_bracket_ownerships,
 )
 from pynecore.core.plugin import override
@@ -432,14 +433,16 @@ class _EventStreamMixin(_BybitBase, ABC):
                 coid or None, str(entry.get('orderId') or '') or None,
             )
             venue_bracket = False
+            claims: list[tuple[str, str | None, LegType, float]] = []
             if leg_type is None:
                 # Second chance: a venue-materialised trading-stop close
                 # carries no coid and an unknown orderId, but the durable
-                # bracket-ownership row proves it is ours.
-                pine_id, from_entry, leg_type = \
-                    self._attribute_venue_bracket_execution(entry, market)
-                venue_bracket = leg_type is not None
-            if leg_type is None:
+                # bracket-ownership row(s) prove it is ours — a pyramid's
+                # shared 'Full' stop closes several exits in one order and
+                # arrives as multiple claims.
+                claims = self._attribute_venue_bracket_execution(entry, market)
+                venue_bracket = bool(claims)
+            if leg_type is None and not claims:
                 # External activity (manual trade, another bot): it must
                 # not move this strategy's position. The balance invariant
                 # is the guard that catches base-asset interference.
@@ -458,6 +461,18 @@ class _EventStreamMixin(_BybitBase, ABC):
                     self._seen_exec_ids.add(exec_id)
                     continue
             self._seen_exec_ids.add(exec_id)
+            if claims:
+                for slice_entry, s_pine, s_from, s_leg in \
+                        self._venue_bracket_claim_slices(entry, claims):
+                    event = self._fill_event(
+                        slice_entry, market, coid=coid, pine_id=s_pine,
+                        from_entry=s_from, leg_type=s_leg,
+                        venue_bracket=True,
+                    )
+                    if event is not None:
+                        events.append(event)
+                continue
+            assert leg_type is not None
             event = self._fill_event(
                 entry, market, coid=coid, pine_id=pine_id,
                 from_entry=from_entry, leg_type=leg_type,
@@ -471,66 +486,136 @@ class _EventStreamMixin(_BybitBase, ABC):
 
     def _attribute_venue_bracket_execution(
             self, entry: dict, market: 'InstrumentInfo',
-    ) -> tuple[str | None, str | None, LegType | None]:
-        """Attribute a coid-less trading-stop execution to the owning bracket.
+    ) -> list[tuple[str, str | None, LegType, float]]:
+        """Attribute a coid-less trading-stop execution to the owning bracket(s).
 
         Second-chance identity resolution for executions
-        :meth:`_resolve_identity` could not map: a hedge-account bracket is
-        attached as a position attribute, so the closing order the venue
-        creates when it triggers carries no ``orderLinkId`` and an unknown
+        :meth:`_resolve_identity` could not map: a position-attribute
+        bracket's closing order (hedge-leg amend or the netting
+        trading-stop) carries no ``orderLinkId`` and an unknown
         ``orderId`` — but the durable bracket-ownership row this run
         persisted BEFORE attaching (:data:`_VENUE_STOP_ORDER_LEG` explains
-        the shape) proves the protection that fired is ours. The match is
-        deliberately conservative: only a reduce execution
-        (``closedSize > 0``) with a known ``stopOrderType``, on this
-        symbol, whose side equals exactly ONE live ownership row's exit
-        side, is claimed. A manual venue-UI close carries no
-        ``stopOrderType`` and stays external; an ambiguous double-sided
-        state (both brackets momentarily live mid-reversal) refuses to
-        guess and leaves the disappearance pass to reconcile.
+        the shape) proves the protection that fired is ours. Only a
+        reduce execution (``closedSize > 0``) with a known
+        ``stopOrderType``, on this symbol, matching live ownership rows
+        of the execution's side, is claimed; a manual venue-UI close
+        carries no ``stopOrderType`` and stays external.
+
+        Returns claims as ``(exit_id, from_entry, leg, claim_qty)``. One
+        matching row claims the whole slice. SEVERAL matching rows on the
+        SAME broker leg are the pyramid shape: every exit amends the one
+        shared position attribute, so when the ``tpslMode`` 'Full' stop
+        fires it closes ALL of them in one venue order — measured live on
+        cycle 31, where refusing left the whole journal exposure stale
+        and cascaded into a venue/book mismatch. When the slice equals
+        the rows' total quantity (grid tolerance), the fill is split
+        row-by-row in insertion (FIFO) order — the TV semantics of every
+        pyramid exit closing its own entry. A partial slice of a
+        multi-row bracket and a genuinely double-sided state (both
+        brackets momentarily live mid-reversal, or distinct legs) still
+        refuse to guess and leave the disappearance pass to reconcile.
         """
         if self.store_ctx is None:
-            return None, None, None
+            return []
         if str(entry.get('orderLinkId') or ''):
-            return None, None, None
+            return []
         leg = _VENUE_STOP_ORDER_LEG.get(str(entry.get('stopOrderType') or ''))
         if leg is None:
-            return None, None, None
+            return []
         try:
             closed_size = float(entry.get('closedSize') or 0.0)
+            exec_qty = float(entry.get('execQty') or 0.0)
         except (TypeError, ValueError):
-            return None, None, None
-        if closed_size <= 0.0:
-            return None, None, None
+            return []
+        if closed_size <= 0.0 or exec_qty <= 0.0:
+            return []
         exec_side = str(entry.get('side') or '').lower()
         candidates = [
             row for row in iter_active_bracket_ownerships(
                 self.store_ctx, symbol=market.symbol,
             )
             if (row.side or '').lower() == exec_side
+            and row.pine_entry_id is not None
         ]
-        if len(candidates) != 1:
-            if candidates:
+        if not candidates:
+            return []
+        claims: list[tuple[str, str | None, LegType, float]]
+        split = False
+        if len(candidates) == 1:
+            only = candidates[0]
+            assert only.pine_entry_id is not None
+            claims = [(only.pine_entry_id, only.from_entry, leg, exec_qty)]
+        else:
+            leg_ids = {
+                (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+                for row in candidates
+            }
+            total = sum(row.qty for row in candidates)
+            tolerance = market.qty_step / 2 if market.qty_step > 0 else _FILL_EPS
+            if len(leg_ids) != 1 or abs(total - exec_qty) > tolerance:
                 logger.warning(
                     "Bybit venue trading-stop execution %s matches %d live "
-                    "bracket-ownership rows on %s — refusing to guess, "
-                    "leaving it to the disappearance reconcile",
+                    "bracket-ownership rows on %s (legs=%s, total=%s, "
+                    "exec=%s) — refusing to guess, leaving it to the "
+                    "disappearance reconcile",
                     entry.get('execId'), len(candidates), market.symbol,
+                    sorted(str(x) for x in leg_ids), total, exec_qty,
                 )
-            return None, None, None
-        row = candidates[0]
-        self.store_ctx.log_event(
-            'venue_bracket_fill_attributed',
-            client_order_id=row.client_order_id,
-            exchange_order_id=str(entry.get('orderId') or '') or None,
-            payload={
-                'exec_id': str(entry.get('execId') or ''),
-                'stop_order_type': str(entry.get('stopOrderType') or ''),
-                'exit_id': row.pine_entry_id,
-                'from_entry': row.from_entry,
-            },
-        )
-        return row.pine_entry_id, row.from_entry, leg
+                return []
+            split = True
+            claims = []
+            for row in candidates:
+                assert row.pine_entry_id is not None
+                claims.append((row.pine_entry_id, row.from_entry, leg, row.qty))
+        for row, claim in zip(candidates, claims):
+            self.store_ctx.log_event(
+                'venue_bracket_fill_attributed',
+                client_order_id=row.client_order_id,
+                exchange_order_id=str(entry.get('orderId') or '') or None,
+                payload={
+                    'exec_id': str(entry.get('execId') or ''),
+                    'stop_order_type': str(entry.get('stopOrderType') or ''),
+                    'exit_id': row.pine_entry_id,
+                    'from_entry': row.from_entry,
+                    'claim_qty': claim[3],
+                    'split': split,
+                },
+            )
+        return claims
+
+    @staticmethod
+    def _venue_bracket_claim_slices(
+            entry: dict, claims: list[tuple[str, str | None, LegType, float]],
+    ) -> list[tuple[dict, str, str | None, LegType]]:
+        """Cut one venue-bracket execution into per-claim entry slices.
+
+        Each claim gets a shallow copy of the raw execution row with
+        ``execQty`` (and a pro-rated ``execFee``, remainder on the last
+        slice so the total is exact) replaced by its share, ready for the
+        shared :meth:`_fill_event` builder. A single whole-slice claim
+        passes the original row through untouched.
+        """
+        if len(claims) == 1:
+            pine_id, from_entry, leg, _ = claims[0]
+            return [(entry, pine_id, from_entry, leg)]
+        try:
+            total_fee = float(entry.get('execFee') or 0.0)
+        except (TypeError, ValueError):
+            total_fee = 0.0
+        total_qty = sum(claim[3] for claim in claims)
+        slices: list[tuple[dict, str, str | None, LegType]] = []
+        fee_left = total_fee
+        for index, (pine_id, from_entry, leg, qty) in enumerate(claims):
+            if index == len(claims) - 1:
+                fee = fee_left
+            else:
+                fee = total_fee * (qty / total_qty) if total_qty > 0 else 0.0
+                fee_left -= fee
+            slices.append((
+                {**entry, 'execQty': repr(qty), 'execFee': repr(fee)},
+                pine_id, from_entry, leg,
+            ))
+        return slices
 
     def _close_entry_rows_when_flat(self, market: 'InstrumentInfo') -> None:
         """Close the fully filled entry rows once the position is gone.
@@ -1031,9 +1116,7 @@ class _EventStreamMixin(_BybitBase, ABC):
                 )
                 entries.sort(key=lambda e: int(e.get('execTime') or 0))
                 for entry in entries:
-                    event = self._backfill_one_execution(entry, market)
-                    if event is not None:
-                        events.append(event)
+                    events.extend(self._backfill_one_execution(entry, market))
                 if not conclusive:
                     # The window did not drain — leave the watermark where it
                     # is (the execIds seen so far are in the dedup frontier, a
@@ -1097,41 +1180,41 @@ class _EventStreamMixin(_BybitBase, ABC):
 
     def _backfill_one_execution(
             self, entry: dict, market: 'InstrumentInfo',
-    ) -> OrderEvent | None:
-        """Translate one backfilled execution row into a fill event, or skip.
+    ) -> list[OrderEvent]:
+        """Translate one backfilled execution row into fill event(s), or skip.
 
         Mirrors the per-row gate of :meth:`_translate_executions`: wrong
         symbol / category / exec-type and already-seen ``execId`` are
         dropped, an unattributable row is logged as foreign and skipped, and
-        the survivor goes through the shared :meth:`_fill_event` builder. The
+        the survivor goes through the shared :meth:`_fill_event` builder —
+        a venue-bracket row closing a pyramid's shared 'Full' stop splits
+        into one event per owning exit, exactly like the live stream. The
         extra deriv barrier is the ``filled_qty`` cursor diff: a row the
         adoption baseline (or a completed order) already covers to its full
         size is a no-op — re-booking would double-count on top of the
         adopted position.
         """
         if str(entry.get('symbol') or '') != market.symbol:
-            return None
+            return []
         if str(entry.get('category') or market.category) != market.category:
-            return None
+            return []
         if str(entry.get('execType') or 'Trade') != 'Trade':
-            return None
+            return []
         exec_id = str(entry.get('execId') or '')
         if not exec_id or exec_id in self._seen_exec_ids:
-            return None
+            return []
         coid = str(entry.get('orderLinkId') or '')
         pine_id, from_entry, leg_type = self._resolve_identity(
             coid or None, str(entry.get('orderId') or '') or None,
         )
-        venue_bracket = False
+        claims: list[tuple[str, str | None, LegType, float]] = []
         if leg_type is None:
             # Second chance, mirroring the live-stream gate: a
             # venue-materialised trading-stop close is ours when the durable
             # bracket-ownership row says so — a reconnect backfill delivering
             # it late must attribute it the same way the stream would have.
-            pine_id, from_entry, leg_type = \
-                self._attribute_venue_bracket_execution(entry, market)
-            venue_bracket = leg_type is not None
-        if leg_type is None:
+            claims = self._attribute_venue_bracket_execution(entry, market)
+        if leg_type is None and not claims:
             # External activity (manual trade, another bot): never book it.
             # Seed the id so the fixed overlap re-read does not re-log it
             # every pass; the position adoption / disappearance pass own any
@@ -1143,7 +1226,7 @@ class _EventStreamMixin(_BybitBase, ABC):
                     exchange_order_id=str(entry.get('orderId') or '') or None,
                     payload={'exec_id': exec_id, 'source': 'deriv_backfill'},
                 )
-            return None
+            return []
         if coid and self.store_ctx is not None:
             row = self.store_ctx.get_order(coid)
             if row is not None and row.filled_qty >= row.qty - _FILL_EPS:
@@ -1153,14 +1236,25 @@ class _EventStreamMixin(_BybitBase, ABC):
                 # already owned, so dedup and skip instead of re-applying
                 # the slice.
                 self._seen_exec_ids.add(exec_id)
-                return None
+                return []
+        self._seen_exec_ids.add(exec_id)
+        if claims:
+            events: list[OrderEvent] = []
+            for slice_entry, s_pine, s_from, s_leg in \
+                    self._venue_bracket_claim_slices(entry, claims):
+                event = self._fill_event(
+                    slice_entry, market, coid=coid, pine_id=s_pine,
+                    from_entry=s_from, leg_type=s_leg, venue_bracket=True,
+                )
+                if event is not None:
+                    events.append(event)
+            return events
+        assert leg_type is not None
         event = self._fill_event(
             entry, market, coid=coid, pine_id=pine_id,
             from_entry=from_entry, leg_type=leg_type,
-            venue_bracket=venue_bracket,
         )
-        self._seen_exec_ids.add(exec_id)
-        return event
+        return [event] if event is not None else []
 
     def _load_deriv_exec_watermark(self, market: 'InstrumentInfo') -> int | None:
         """Read the persisted derivative execution watermark for this run.
