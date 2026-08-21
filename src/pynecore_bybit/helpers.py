@@ -211,6 +211,30 @@ def base_to_contracts(qty: float | Decimal, price: float | Decimal,
     return _floor_to_step(qty_d * price_d, step_str)
 
 
+def base_to_contracts_reduce(qty: float | Decimal, price: float | Decimal,
+                             step_str: str) -> Decimal:
+    """Reduce-side sibling of :func:`base_to_contracts`: nearest grid multiple.
+
+    Entry-side conversions floor (an open must stay inside the asked size
+    and the buying power), but flooring a reduce accumulates dust: each
+    partially-closing slice of a floored entry loses its own sub-contract
+    remainder, and the base value of the final remainder — just under one
+    contract — floors to ZERO, leaving a stranded venue contract no close
+    can ever take back (measured on the inverse lane, 2026-08-21: a 305-
+    contract entry closed 152+152, and the 1-contract residue's close
+    converted to zero contracts forever). Rounding half-up makes the
+    sequence self-correcting; the caller caps the result at the venue's
+    current contract count, and the order is reduce-only besides, so the
+    round-up can never grow exposure.
+    """
+    qty_d = qty if isinstance(qty, Decimal) else Decimal(str(qty))
+    price_d = price if isinstance(price, Decimal) else Decimal(str(price))
+    step = Decimal(step_str)
+    if step <= 0:
+        return qty_d * price_d
+    return (qty_d * price_d / step).to_integral_value(ROUND_HALF_UP) * step
+
+
 def contracts_to_base(contracts: float | Decimal, price: float | Decimal) -> float:
     """Value of an inverse-contract quantity in base coin at ``price``.
 

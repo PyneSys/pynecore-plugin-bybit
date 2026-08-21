@@ -1662,6 +1662,95 @@ def __test_bybit_inverse_reduce_and_mirror__():
     assert legs[0].qty == pytest.approx(0.0015)
 
 
+def __test_bybit_inverse_reduce_rounds_to_the_nearest_contract__():
+    """A base slice of a floored entry rounds to its true contract share.
+
+    Replays the 2026-08-21 incident shape: a 0.004-base entry floored to
+    305 contracts makes each 0.002 slice worth 152.91 contracts — flooring
+    the slices (152+152) stranded 1 contract on the venue forever.
+    """
+    plugin = _inverse_plugin(responses=[{'orderId': '931'}])
+    plugin._inverse_net_contracts = 305.0
+    plugin._inverse_net_base = 0.003989264301185531
+    asyncio.run(plugin.execute_close(DispatchEnvelope(
+        intent=CloseIntent(pine_id='Long', symbol='BTCUSD', side='sell',
+                           qty=0.002),
+        run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['qty'] == '153'
+    assert body['reduceOnly'] is True
+
+
+def __test_bybit_inverse_subcontract_residue_still_closes__():
+    """A residue worth a hair under one contract closes the last contract.
+
+    The full-cover snap compares two independently accumulated float sums
+    and can miss by more than its 1e-9 slack; the floored fallback then
+    converted the residue to ZERO contracts and the close-then-open
+    protocol livelocked on the skip (measured: 41 syncs, cycle 2).
+    """
+    plugin = _inverse_plugin(responses=[{'orderId': '932'}])
+    net_b = 1.3079540983607156e-05
+    plugin._inverse_net_contracts = 1.0
+    plugin._inverse_net_base = net_b
+    asyncio.run(plugin.execute_close(DispatchEnvelope(
+        intent=CloseIntent(pine_id='Short', symbol='BTCUSD', side='sell',
+                           qty=net_b * (1.0 - 1e-6)),
+        run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['qty'] == '1'
+
+
+def __test_bybit_one_way_close_fill_nets_the_entry_rows__(tmp_path):
+    """A one-way derivative close fill shrinks the consumed entry row.
+
+    Previously hedge-only: a one-way cycle ending mid-position after
+    partial closes read a book that still owned the closed exposure
+    (measured: book 305 contracts vs venue 1 at the cycle-2 verdict).
+    """
+    plugin = _inverse_plugin()
+    market = plugin._market
+    assert market is not None
+    _attach_store(plugin, tmp_path, "oneway-net")
+    plugin.store_ctx.upsert_order(
+        'coid-entry', symbol='BTCUSD', side='buy', qty=305.0,
+        filled_qty=305.0, state='confirmed', pine_entry_id='L',
+        extras={'kind': 'position', 'anchor': '76455.2'},
+    )
+    plugin._record_identity('coid-x1', pine_id=None, from_entry='L',
+                            leg_type=LegType.CLOSE, qty=153.0)
+    plugin._wire_anchor['coid-x1'] = Decimal('76455.2')
+    plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'category': 'inverse', 'symbol': 'BTCUSD', 'execType': 'Trade',
+            'execId': 'nx-1', 'orderId': '941', 'orderLinkId': 'coid-x1',
+            'side': 'Sell', 'execQty': '153', 'execPrice': '76455.2',
+            'execTime': '1752600000000',
+        }],
+    }, market)
+    row = plugin.store_ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is None
+    assert row.filled_qty == pytest.approx(152.0)
+
+    plugin._record_identity('coid-x2', pine_id=None, from_entry='L',
+                            leg_type=LegType.CLOSE, qty=152.0)
+    plugin._wire_anchor['coid-x2'] = Decimal('76455.2')
+    plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'category': 'inverse', 'symbol': 'BTCUSD', 'execType': 'Trade',
+            'execId': 'nx-2', 'orderId': '942', 'orderLinkId': 'coid-x2',
+            'side': 'Sell', 'execQty': '152', 'execPrice': '76455.2',
+            'execTime': '1752600001000',
+        }],
+    }, market)
+    row = plugin.store_ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is not None
+
+
 def __test_bybit_inverse_amend_anchor__():
     """In-place amends keep the dispatched anchor pinned per coid"""
     # Unfilled LIMIT amend: the price moves, the anchor does not — a

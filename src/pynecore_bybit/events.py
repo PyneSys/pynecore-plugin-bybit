@@ -78,7 +78,6 @@ from .helpers import (
     PRIVATE_WS_TOPICS,
     RECONCILE_CADENCE_S,
 )
-from .positions import POSITION_MODE_HEDGE
 from .state import parse_exchange_order
 from .ws import BybitWebSocket
 
@@ -676,15 +675,20 @@ class _EventStreamMixin(_BybitBase, ABC):
                 if row.intent_key:
                     self.store_ctx.record_complete(row.intent_key)
 
-    def _reduce_hedge_entry_ownership(self, side: str, qty: float) -> None:
-        """Apply one filled hedge close to this run's durable entry rows.
+    def _reduce_entry_ownership(self, side: str, qty: float) -> None:
+        """Apply one filled derivative close to this run's durable entry rows.
 
-        Hedge-mode ownership cannot be reconstructed from Bybit's two
-        account-wide aggregate legs. Entry rows therefore carry the run-owned
-        slice across restart. A reversal is non-flat after its residual opens,
-        so the ordinary flat sweep cannot retire the entry rows consumed by
-        its close leg; leaving them live would cancel the new opposite entry
-        out of the durable signed sum on the next restart.
+        Entry rows carry the run-owned slice across restart (hedge-mode
+        ownership cannot be reconstructed from Bybit's two account-wide
+        aggregate legs at all, and one-way adoption/K3 read the live rows'
+        signed sum). The flat sweep only retires rows on a genuine flat: a
+        reversal is non-flat after its residual opens, and a partially
+        closed position holds live entry rows whose consumed exposure would
+        otherwise keep counting — a cycle ending mid-position then reads a
+        book that owns closes the venue already executed (measured on the
+        inverse lane, 2026-08-21: book 305 contracts vs venue 1). Netting
+        every close fill keeps the rows truthful in all modes; quantities
+        are wire-domain on both sides, so no anchor conversion is involved.
 
         Consume the opposite-side entry rows FIFO. A partial reduction shrinks
         the row to its residual owned quantity; a full reduction retires only
@@ -692,9 +696,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         key because a same-ID reversal may already own a fresh residual entry
         envelope under that key.
         """
-        if (self.store_ctx is None
-                or self._position_mode != POSITION_MODE_HEDGE
-                or qty <= 0.0):
+        if self.store_ctx is None or qty <= 0.0:
             return
         entry_side = 'buy' if side == 'sell' else 'sell'
         remaining = qty
@@ -820,13 +822,15 @@ class _EventStreamMixin(_BybitBase, ABC):
             # :meth:`_close_entry_rows_when_flat` closes them once the
             # ledger position is gone.
             self.store_ctx.close_order(coid)
-        if leg_type is LegType.CLOSE or venue_bracket:
-            # A venue-materialised trading-stop fill reduces the hedge leg it
-            # protected exactly like a fanned close leg does — without this
-            # the durable entry-row ownership would keep counting exposure
-            # the bracket already closed, and the next restart's adoption
-            # would over-adopt.
-            self._reduce_hedge_entry_ownership(side, exec_qty)
+        if ((leg_type is LegType.CLOSE or venue_bracket)
+                and market.category != CATEGORY_SPOT):
+            # Every derivative close fill — fanned close leg or a venue-
+            # materialised trading-stop — nets the entry rows it consumed;
+            # without this the durable entry-row ownership keeps counting
+            # exposure the venue already closed, and the next restart's
+            # adoption (or a cycle-end book read) over-counts. Spot stays
+            # out: its rows belong to the inventory-ledger machinery.
+            self._reduce_entry_ownership(side, exec_qty)
         order = ExchangeOrder(
             id=order_id,
             symbol=self.symbol or market.symbol,

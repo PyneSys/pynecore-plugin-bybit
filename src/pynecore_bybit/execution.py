@@ -134,6 +134,7 @@ from .helpers import (
     TRIGGER_DIRECTION_FALL,
     TRIGGER_DIRECTION_RISE,
     base_to_contracts,
+    base_to_contracts_reduce,
     contracts_to_base,
     format_decimal,
     quantize_qty,
@@ -372,9 +373,17 @@ class _ExecutionMixin(_BybitBase, ABC):
     def _preflight_order(
             self, market: InstrumentInfo, qty: Decimal, *,
             is_market: bool, price: Decimal | None,
-            intent_key: str, label: str,
+            intent_key: str, label: str, reduce_only: bool = False,
     ) -> None:
         """Enforce the venue's per-order bounds without clamping.
+
+        ``reduce_only`` skips the LOWER bounds (``minOrderQty`` / minimum
+        notional): a position can legitimately shrink below every venue
+        minimum — its close must always be dispatchable, or the residue
+        is stranded forever (measured on the inverse lane, 2026-08-21: a
+        1-contract remainder sat under the $5 ``minNotionalValue`` and no
+        close could ever take it back). The venue-side reject is the
+        backstop if it disagrees. The per-order maximums always apply.
 
         ``qty`` arrives in the WIRE domain (base units on spot/linear,
         whole USD contracts on inverse), which is the domain every venue
@@ -398,6 +407,8 @@ class _ExecutionMixin(_BybitBase, ABC):
                 context={'symbol': market.symbol, 'qty': float(qty),
                          'max_qty': cap},
             )
+        if reduce_only:
+            return
         if 0 < float(qty) < market.min_order_qty:
             raise OrderSkippedByPlugin(
                 f"Skipping {label}: size {qty} below the {market.symbol} "
@@ -545,13 +556,21 @@ class _ExecutionMixin(_BybitBase, ABC):
             if qty >= net_b * (1.0 - 1e-9):
                 contracts = quantize_qty(net_c, market.qty_step_str)
             else:
+                # Reduce side rounds to the NEAREST contract (capped at the
+                # mirrored count): a floored entry makes every base slice
+                # worth a hair under its contract share, so flooring here
+                # loses one contract per slice and the final sub-contract
+                # residue converts to zero forever — while the full-cover
+                # snap above sits on a knife edge between two independently
+                # accumulated float sums and cannot be relied on to catch
+                # that residue.
                 contracts = min(
-                    base_to_contracts(qty, anchor, market.qty_step_str),
+                    base_to_contracts_reduce(qty, anchor, market.qty_step_str),
                     quantize_qty(net_c, market.qty_step_str),
                 )
         else:
             anchor = await self._inverse_ref_price(market, None)
-            contracts = base_to_contracts(qty, anchor, market.qty_step_str)
+            contracts = base_to_contracts_reduce(qty, anchor, market.qty_step_str)
         if contracts <= 0:
             raise OrderSkippedByPlugin(
                 f"Skipping {label}: size {qty} converts to zero contracts "
@@ -1493,6 +1512,10 @@ class _ExecutionMixin(_BybitBase, ABC):
         self._preflight_order(
             market, qty, is_market=True, price=None,
             intent_key=intent.intent_key, label=label,
+            # Spot has no reduce-only concept — its sells stay behind the
+            # venue minimums (the inventory machinery owns sub-minimum
+            # dust); a derivative close must always be dispatchable.
+            reduce_only=market.category != CATEGORY_SPOT,
         )
         body: dict[str, _JsonScalar] = {
             'category': market.category,
