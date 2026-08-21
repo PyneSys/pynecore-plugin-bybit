@@ -270,10 +270,12 @@ def __test_baseline_covers_exit_rows_too__(tmp_path):
 
 
 def __test_baseline_flat_adoption_still_seeds_live_rows__(tmp_path):
-    # A flat venue at adoption: the pre-restart fills netted out, but a live
-    # partially filled row still holds real executions — they must be
-    # seeded (cursor + de-dup) so nothing re-emits them, and the guard
-    # latches so later live-trading fills are never clamped.
+    # A flat venue at adoption: the pre-restart fills netted out (a close
+    # consumed them), so the ownership clamp nets the seeded cursor back to
+    # zero — the run owns no exposure on a flat venue — while the execIds
+    # still seed the de-dup frontier so nothing re-emits them, the resting
+    # unfilled residual keeps the row alive, and the guard latches so later
+    # live-trading fills are never clamped.
     broker = _AdoptionFake(
         market=_linear_instrument(),
         positions=[],
@@ -286,7 +288,9 @@ def __test_baseline_flat_adoption_still_seeds_live_rows__(tmp_path):
     _seed(broker, 'c6', qty=0.01, filled_qty=0.0)
     _adopt(broker)
     assert broker._adoption_baselined is True
-    assert broker.store_ctx.get_order('c6').filled_qty == 0.004
+    row = broker.store_ctx.get_order('c6')
+    assert row.filled_qty == 0.0            # owned exposure on a flat venue
+    assert row.qty == pytest.approx(0.006)  # the resting residual survives
     assert 'e1' in broker._seen_exec_ids
 
 
@@ -577,6 +581,73 @@ def __test_baseline_inverse_uses_wire_contract_domain__(tmp_path):
     # The returned position size IS base-converted (core-facing), proving the
     # cursor stayed in the wire domain while the report did not.
     assert pos is not None and pos.size != 200.0
+
+
+# === Ownership clamp: entry cursors vs the venue position ===================
+
+def _clamp_events(broker) -> list:
+    import json as _json
+    cur = broker.store_ctx._store._conn.execute(
+        "SELECT client_order_id, payload FROM events "
+        "WHERE kind = 'adoption_baseline_clamped' ORDER BY id",
+    )
+    return [(coid, _json.loads(payload) if payload else {})
+            for coid, payload in cur.fetchall()]
+
+
+def __test_baseline_clamps_inherited_ownership_to_venue__(tmp_path):
+    # The 2026-08-21 inverse incident: rows inherited from a prior run own
+    # closes the venue already executed (the closes filled before the
+    # fill-time netting existed / while the bot was down), so the adopted
+    # book vastly overstates the venue (305 contracts vs 1). The clamp nets
+    # the per-side excess FIFO: the oldest row is consumed whole, the newer
+    # row keeps exactly the venue's live size.
+    broker = _AdoptionFake(
+        market=_inverse_instrument(),
+        positions=[_inv_pos(side='Buy', size='1', avg='76455')],
+    )
+    _open(tmp_path, broker)
+    _seed(broker, 'a', qty=300.0, filled_qty=300.0, side='buy',
+          exchange_order_id='', extras={'anchor': '76455'})
+    _seed(broker, 'b', qty=5.0, filled_qty=5.0, side='buy',
+          exchange_order_id='', extras={'anchor': '76455'})
+    broker.store_ctx._store._conn.execute(
+        "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
+        (1_700_000_000_000, 'a'),
+    )
+    broker.store_ctx._store._conn.execute(
+        "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
+        (1_700_000_001_000, 'b'),
+    )
+    _adopt(broker)
+    live = [r.client_order_id
+            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSD')]
+    assert live == ['b']                    # 'a' consumed whole (FIFO)
+    row = broker.store_ctx.get_order('b')
+    assert row.filled_qty == 1.0            # exactly the venue's live size
+    assert row.qty == 1.0
+    assert [coid for coid, _ in _clamp_events(broker)] == ['a', 'b']
+
+
+def __test_baseline_clamp_is_per_side_and_noop_when_covered__(tmp_path):
+    # The clamp compares per side: a buy entry fully covered by the venue's
+    # long leg is untouched (and emits no event), while a sell entry whose
+    # short leg is gone from the venue is netted away.
+    broker = _AdoptionFake(
+        market=_inverse_instrument(),
+        positions=[_inv_pos(side='Buy', size='2', avg='76455')],
+    )
+    _open(tmp_path, broker)
+    _seed(broker, 'long1', qty=2.0, filled_qty=2.0, side='buy',
+          exchange_order_id='', extras={'anchor': '76455'})
+    _seed(broker, 'short1', qty=3.0, filled_qty=3.0, side='sell',
+          exchange_order_id='', extras={'anchor': '76455'})
+    _adopt(broker)
+    live = [r.client_order_id
+            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSD')]
+    assert live == ['long1']
+    assert broker.store_ctx.get_order('long1').filled_qty == 2.0
+    assert [coid for coid, _ in _clamp_events(broker)] == ['short1']
 
 
 # === Startup gate: fills racing the adoption baseline (F9) =================

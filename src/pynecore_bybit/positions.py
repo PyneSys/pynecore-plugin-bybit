@@ -37,6 +37,7 @@ inverse hedge account is refused at broker startup with instructions to
 switch to one-way mode.
 """
 import asyncio
+import logging
 import math
 from abc import ABC
 from decimal import ROUND_DOWN, Decimal
@@ -79,6 +80,8 @@ from .helpers import (
     wire_link_id,
 )
 from .models import InstrumentInfo
+
+logger = logging.getLogger(__name__)
 
 POSITION_MODE_ONE_WAY = 'one_way'
 POSITION_MODE_HEDGE = 'hedge'
@@ -735,6 +738,7 @@ class _PositionsMixin(_BybitBase, ABC):
                         payload={'filled_qty': cumulative,
                                  'kind': (row.extras or {}).get('kind')},
                     )
+            self._clamp_entry_ownership_to_venue(market, verify)
             return verify
         if last_index_lag is not None:
             raise BybitAdoptionBaselineError(
@@ -746,6 +750,90 @@ class _PositionsMixin(_BybitBase, ABC):
             "adoption baseline: position snapshot kept changing across "
             f"{_ADOPTION_STABLE_ATTEMPTS} attempts",
         )
+
+    def _clamp_entry_ownership_to_venue(
+            self, market: InstrumentInfo, rows: list[dict],
+    ) -> None:
+        """Clamp the live entry rows' owned exposure to the venue position.
+
+        The per-order baseline can only RAISE a cursor: an entry's own
+        executions are venue truth for what it FILLED, not for what the
+        run still OWNS. Closes net the entry rows at fill time
+        (``_reduce_entry_ownership``), but a close that filled while the
+        bot was down — or a row inherited from a run that predates the
+        fill-time netting — leaves the durable cursors above the venue's
+        live size, and the cycle-end book then owns closes the venue
+        already executed (measured on the inverse lane, 2026-08-21:
+        adopted book 305 contracts vs venue 1, zero trades in the cycle).
+        The verified snapshot at this barrier is stable and authoritative,
+        so any per-side excess of the summed entry cursors over the venue
+        size is consumed FIFO, mirroring the fill-time netting. The venue
+        exceeding the rows is NOT raised here — untracked-exposure
+        adoption owns that surplus. Wire domain on both sides; no anchor
+        conversion. Rows in a pending-dispatch state stay untouched —
+        F1 recovery owns their resolution and their cursors are zero.
+        """
+        if self.store_ctx is None:
+            return
+        venue: dict[str, float] = {'buy': 0.0, 'sell': 0.0}
+        for row in rows:
+            size = self._position_row_size(row)
+            if size <= 0.0:
+                continue
+            side = str(row.get('side') or '').lower()
+            if side in venue:
+                venue[side] += size
+        for side in ('buy', 'sell'):
+            live = sorted(
+                (
+                    row for row in self.store_ctx.iter_live_orders(
+                        symbol=market.symbol)
+                    if row.side == side
+                    and row.state not in PENDING_DISPATCH_STATES
+                    and (row.extras or {}).get('kind')
+                    in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)
+                    and row.filled_qty > _FILL_EPS
+                ),
+                key=lambda entry_row: entry_row.created_ts_ms,
+            )
+            excess = sum(row.filled_qty for row in live) - venue[side]
+            if excess <= _FILL_EPS:
+                continue
+            logger.warning(
+                "Bybit adoption baseline: %s entry rows own %s beyond the "
+                "venue position — netting the excess (a close landed while "
+                "the bot was down, or the rows predate fill-time netting)",
+                side, excess,
+            )
+            for row in live:
+                if excess <= _FILL_EPS:
+                    break
+                consumed = min(excess, row.filled_qty)
+                owned = row.filled_qty - consumed
+                # A working entry's unfilled residual can still fill on the
+                # venue — the netting consumes only the OWNED (filled)
+                # exposure and must keep the row alive for the resting
+                # remainder; de-dup lives in the seeded exec frontier, so a
+                # lowered cursor never re-books history.
+                unfilled = max(0.0, row.qty - row.filled_qty)
+                self.store_ctx.log_event(
+                    'adoption_baseline_clamped',
+                    client_order_id=row.client_order_id,
+                    intent_key=row.intent_key,
+                    payload={'from_filled_qty': row.filled_qty,
+                             'filled_qty': owned, 'consumed': consumed},
+                )
+                if owned <= _FILL_EPS and unfilled <= _FILL_EPS:
+                    # Retire only the physical row — the shared intent key
+                    # may already own a fresh envelope, exactly like the
+                    # fill-time netting.
+                    self.store_ctx.close_order(row.client_order_id)
+                else:
+                    self.store_ctx.upsert_order(
+                        row.client_order_id, qty=owned + unfilled,
+                        filled_qty=owned,
+                    )
+                excess -= consumed
 
     # --- inverse net-position mirror --------------------------------------------
 
