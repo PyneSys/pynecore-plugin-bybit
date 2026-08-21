@@ -1020,6 +1020,33 @@ def __test_bybit_cancel_close_order_idempotent__(tmp_path):
     assert _closed_count() == 1
 
 
+def __test_bybit_spot_port_min_sellable_floor__():
+    """min_sellable_base folds the grid, min-qty and min-notional floors.
+
+    The notional leg needs a price; without one the port must answer
+    "unknown" (the manager then skips dust compaction) rather than guess.
+    """
+    plugin = _FakeBrokerBybit()
+    market = _instrument(qty_step_str='0.00001', qty_step=0.00001,
+                         min_order_qty=0.00001, min_order_amt=5.0)
+
+    plugin._last_price = None
+    assert asyncio.run(spot_port_for(plugin, market).min_sellable_base()) is None
+
+    # Price 4000: the 5-USD minimum notional dominates the grid floors.
+    plugin._last_price = 4000.0
+    assert (asyncio.run(spot_port_for(plugin, market).min_sellable_base())
+            == Decimal('0.00125'))
+
+    # No notional minimum: the larger of grid step and min qty rules, and
+    # no price is needed for it.
+    plugin._last_price = None
+    no_amt = _instrument(qty_step_str='0.00001', qty_step=0.00001,
+                         min_order_qty=0.0002, min_order_amt=0.0)
+    assert (asyncio.run(spot_port_for(plugin, no_amt).min_sellable_base())
+            == Decimal('0.0002'))
+
+
 def __test_bybit_spot_port_execution_mapping__():
     """Inventory port: canonical deltas, fee inference and attribution"""
     plugin = _FakeBrokerBybit()

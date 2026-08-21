@@ -445,10 +445,13 @@ class _StateMixin(_BybitBase, ABC):
         ``basePrecision`` that can never be sold — reporting it as a live
         micro-long would keep ``strategy.position_size`` non-zero forever
         and block flat-gated re-entries. The exact ledger (and the
-        balance invariant) keeps carrying the dust; only the engine-facing
-        view snaps to flat. The residue is self-draining: each round trip
-        sells the floor of the fee-adjusted inventory, so the dust stays
-        bounded below one quantity-grid step.
+        balance invariant) keeps carrying the dust until the manager's
+        dust compaction retires it into the epoch baseline
+        (``SpotInventoryManager._maybe_compact_dust``); the residues DO
+        accumulate across round trips — close orders are sized from the
+        engine's FIFO exposure, not the wallet — so without the
+        compaction the fold of a flat book climbs multiple grid steps
+        above zero.
 
         Without a store-backed inventory manager (persistence off) there
         is no ledger to synthesize from, so the plugin reports flat —

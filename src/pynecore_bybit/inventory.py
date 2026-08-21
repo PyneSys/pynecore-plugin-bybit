@@ -64,6 +64,7 @@ class _BybitSpotHost(Protocol):
     """Plugin capabilities required by the standalone inventory port."""
 
     store_ctx: 'RunContext | None'
+    _last_price: float | None
 
     async def fetch_wallet_coin(self, coin: str) -> dict: ...
 
@@ -127,6 +128,33 @@ class _BybitSpotPort:
         self.position_dust_threshold = Decimal(market.qty_step_str)
 
     # --- SpotInventoryPort surface -----------------------------------------
+
+    async def min_sellable_base(self) -> Decimal | None:
+        """Smallest base quantity a spot sell would be accepted at NOW.
+
+        ``max(basePrecision, minOrderQty, minOrderAmt / price)`` — a net
+        below every one of these cannot be sold in any combination of
+        orders. The notional leg needs a price: the plugin's last traded
+        price is authoritative enough for a LOWER bound (the manager only
+        compacts strictly below the returned value, and the bound errs
+        low by construction — a stale price moves the notional floor, but
+        anything below the qty-grid legs stays unsellable regardless).
+        ``None`` before the first observed price — the manager skips the
+        pass.
+        """
+        market = self._market
+        floor = Decimal(market.qty_step_str)
+        min_qty = Decimal(str(market.min_order_qty))
+        if min_qty > floor:
+            floor = min_qty
+        if market.min_order_amt > 0:
+            price = self._plugin._last_price
+            if price is None or price <= 0:
+                return None
+            notional_floor = Decimal(str(market.min_order_amt)) / Decimal(str(price))
+            if notional_floor > floor:
+                floor = notional_floor
+        return floor if floor > 0 else None
 
     async def fetch_executions(self, cursor: str | None) -> SpotExecutionBatch:
         """Read the bot's spot executions from the time cursor.
