@@ -171,6 +171,20 @@ def is_trading_stop_zero_position_reject(exc: BybitAPIError) -> bool:
     return exc.ret_code == 10001 and "zero position" in str(exc)
 
 
+def is_order_amend_unchanged_reject(exc: BybitAPIError) -> bool:
+    """Whether a ``/v5/order/amend`` reject means the order already matches.
+
+    Re-sending an order's current price/qty rejects with the GENERIC
+    parameter code 10001 and ``retMsg`` "order not modified" (measured
+    live on the global demo, 2026-08-21, BTCUSD inverse exit amend) —
+    the order-amend equivalent of the trading-stop path's 34040. The
+    amend's goal state already holds, so it is an idempotent success.
+    The code alone is not safe to swallow (10001 also covers genuinely
+    malformed requests), so the message is matched too.
+    """
+    return exc.ret_code == 10001 and "order not modified" in str(exc).lower()
+
+
 def is_reduce_only_zero_position_reject(exc: BybitAPIError) -> bool:
     """Whether a reduce-only order-create reject proves the position is flat.
 

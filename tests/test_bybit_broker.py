@@ -423,6 +423,36 @@ def __test_bybit_both_set_stop_limit_amend_keeps_trigger__():
     assert body['triggerPrice'] == '2070'
 
 
+def __test_bybit_amend_to_current_values_is_an_idempotent_success__():
+    """``retCode=10001 'order not modified'`` means the goal state holds.
+
+    The engine diffs unrounded engine-domain values, so a tick-rounded /
+    anchor-converted leg can legitimately amend onto its live values —
+    the venue rejects that with the generic parameter code and this
+    specific message (measured live, BTCUSD inverse exit amend; the raw
+    reject crashed the run). Any other 10001 stays a real reject.
+    """
+    from pynecore_bybit.exceptions import BybitAPIError
+
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("Bybit API error on /v5/order/amend: retCode=10001 "
+                      "retMsg='order not modified'", ret_code=10001),
+    ])
+    result = asyncio.run(plugin._amend_or_none(
+        {'category': 'linear', 'symbol': 'ETHUSDT', 'orderLinkId': 'c-1',
+         'qty': '0.01'}, coid='c-1'))
+    assert result == {}
+
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("Bybit API error on /v5/order/amend: retCode=10001 "
+                      "retMsg='params error'", ret_code=10001),
+    ])
+    with pytest.raises(BybitAPIError):
+        asyncio.run(plugin._amend_or_none(
+            {'category': 'linear', 'symbol': 'ETHUSDT', 'orderLinkId': 'c-2',
+             'qty': '0.01'}, coid='c-2'))
+
+
 def __test_bybit_execute_exit_and_close__():
     """SOFTWARE bracket legs and the market close"""
     plugin = _FakeBrokerBybit(responses=[

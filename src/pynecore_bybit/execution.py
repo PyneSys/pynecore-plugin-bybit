@@ -123,6 +123,7 @@ from .exceptions import (
     DUPLICATE_COID_CODES,
     ORDER_NOT_FOUND_CODES,
     is_benign_trading_stop_reject,
+    is_order_amend_unchanged_reject,
     is_reduce_only_zero_position_reject,
     is_trading_stop_zero_position_reject,
     map_broker_error,
@@ -2188,6 +2189,13 @@ class _ExecutionMixin(_BybitBase, ABC):
             return await self._call('/v5/order/amend', method='post',
                                     body=body, auth=True)
         except BybitAPIError as e:
+            if is_order_amend_unchanged_reject(e):
+                # The order already carries the requested price/qty — the
+                # amend's goal state holds, an idempotent success (the
+                # engine's diff works in unrounded engine-domain values,
+                # so a tick-rounded / anchor-converted leg can land on
+                # its live values legitimately).
+                return {}
             if e.ret_code in ORDER_NOT_FOUND_CODES:
                 return None
             if e.ret_code in AMBIGUOUS_DISPOSITION_CODES:
