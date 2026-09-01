@@ -431,7 +431,6 @@ class _EventStreamMixin(_BybitBase, ABC):
             pine_id, from_entry, leg_type = self._resolve_identity(
                 coid or None, str(entry.get('orderId') or '') or None,
             )
-            venue_bracket = False
             claims: list[tuple[str, str | None, LegType, float]] = []
             if leg_type is None:
                 # Second chance: a venue-materialised trading-stop close
@@ -440,7 +439,6 @@ class _EventStreamMixin(_BybitBase, ABC):
                 # shared 'Full' stop closes several exits in one order and
                 # arrives as multiple claims.
                 claims = self._attribute_venue_bracket_execution(entry, market)
-                venue_bracket = bool(claims)
             if leg_type is None and not claims:
                 # External activity (manual trade, another bot): it must
                 # not move this strategy's position. The balance invariant
@@ -466,7 +464,6 @@ class _EventStreamMixin(_BybitBase, ABC):
                     event = self._fill_event(
                         slice_entry, market, coid=coid, pine_id=s_pine,
                         from_entry=s_from, leg_type=s_leg,
-                        venue_bracket=True,
                     )
                     if event is not None:
                         events.append(event)
@@ -475,7 +472,6 @@ class _EventStreamMixin(_BybitBase, ABC):
             event = self._fill_event(
                 entry, market, coid=coid, pine_id=pine_id,
                 from_entry=from_entry, leg_type=leg_type,
-                venue_bracket=venue_bracket,
             )
             if event is not None:
                 events.append(event)
@@ -676,7 +672,7 @@ class _EventStreamMixin(_BybitBase, ABC):
                     self.store_ctx.record_complete(row.intent_key)
 
     def _reduce_entry_ownership(self, side: str, qty: float) -> None:
-        """Apply one filled derivative close to this run's durable entry rows.
+        """Apply one reducing derivative fill to this run's durable entry rows.
 
         Entry rows carry the run-owned slice across restart (hedge-mode
         ownership cannot be reconstructed from Bybit's two account-wide
@@ -687,7 +683,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         otherwise keep counting — a cycle ending mid-position then reads a
         book that owns closes the venue already executed (measured on the
         inverse lane, 2026-08-21: book 305 contracts vs venue 1). Netting
-        every close fill keeps the rows truthful in all modes; quantities
+        every reducing fill keeps the rows truthful in all modes; quantities
         are wire-domain on both sides, so no anchor conversion is involved.
 
         Consume the opposite-side entry rows FIFO. A partial reduction shrinks
@@ -728,7 +724,7 @@ class _EventStreamMixin(_BybitBase, ABC):
     def _fill_event(
             self, entry: dict, market: 'InstrumentInfo', *,
             coid: str, pine_id: str | None, from_entry: str | None,
-            leg_type: LegType, venue_bracket: bool = False,
+            leg_type: LegType,
     ) -> OrderEvent | None:
         """Build the OrderEvent of one execution slice.
 
@@ -822,14 +818,19 @@ class _EventStreamMixin(_BybitBase, ABC):
             # :meth:`_close_entry_rows_when_flat` closes them once the
             # ledger position is gone.
             self.store_ctx.close_order(coid)
-        if ((leg_type is LegType.CLOSE or venue_bracket)
+        if (leg_type is not LegType.ENTRY
                 and market.category != CATEGORY_SPOT):
-            # Every derivative close fill — fanned close leg or a venue-
-            # materialised trading-stop — nets the entry rows it consumed;
-            # without this the durable entry-row ownership keeps counting
-            # exposure the venue already closed, and the next restart's
-            # adoption (or a cycle-end book read) over-counts. Spot stays
-            # out: its rows belong to the inventory-ledger machinery.
+            # Every derivative reducing fill — fanned close leg, venue-
+            # materialised trading-stop or dispatched TP/SL exit leg — nets
+            # the entry rows it consumed; without this the durable
+            # entry-row ownership keeps counting exposure the venue already
+            # closed, and the next restart's adoption (or a cycle-end book
+            # read) over-counts. Exit legs matter when the position never
+            # returns to flat afterwards, so the flat sweep cannot retire
+            # the rows: inverse contract quantization strands a sub-entry
+            # residue (measured on the inverse lane, cycle 47: book 465
+            # contracts vs venue 2). Spot stays out: its rows belong to the
+            # inventory-ledger machinery.
             self._reduce_entry_ownership(side, exec_qty)
         order = ExchangeOrder(
             id=order_id,
@@ -1261,7 +1262,7 @@ class _EventStreamMixin(_BybitBase, ABC):
                     self._venue_bracket_claim_slices(entry, claims):
                 event = self._fill_event(
                     slice_entry, market, coid=coid, pine_id=s_pine,
-                    from_entry=s_from, leg_type=s_leg, venue_bracket=True,
+                    from_entry=s_from, leg_type=s_leg,
                 )
                 if event is not None:
                     events.append(event)

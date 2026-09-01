@@ -962,6 +962,63 @@ def __test_bybit_event_stream_translation__():
     assert events[0].leg_type is LegType.TAKE_PROFIT
 
 
+def __test_bybit_exit_leg_fill_nets_entry_ownership__(tmp_path):
+    """A dispatched TP/SL exit fill nets the durable entry rows it consumed.
+
+    The flat sweep only retires entry rows on a genuine flat, but an exit
+    leg's fill can leave the position non-flat (inverse contract
+    quantization strands a sub-entry residue, measured on the inverse lane,
+    cycle 47: book 465 contracts vs venue 2). Without per-fill netting the
+    cycle-end book read and the next restart's adoption then over-count
+    exposure the venue already closed.
+    """
+    from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION
+
+    plugin = _linear_plugin()
+    _attach_store(plugin, tmp_path, "exitnet")
+    market = plugin._market
+    for coid, pine_id in (('e1', 'S1'), ('e2', 'S2')):
+        plugin.store_ctx.upsert_order(
+            coid, symbol=market.symbol, side='sell', qty=0.3, filled_qty=0.3,
+            state='confirmed', intent_key=coid, pine_entry_id=pine_id,
+            exchange_order_id=f'x-{coid}',
+            extras={'kind': ENTRY_KIND_POSITION, 'order_type': 'market'},
+        )
+    plugin.store_ctx.upsert_order(
+        'coid-tp', symbol=market.symbol, side='buy', qty=0.4, filled_qty=0.0,
+        state='confirmed', intent_key='coid-tp', pine_entry_id='S1-X',
+        exchange_order_id='501',
+        extras={'kind': 'exit_leg', 'order_type': 'limit'},
+    )
+    plugin._record_identity('coid-tp', pine_id='S1-X', from_entry='S1',
+                            leg_type=LegType.TAKE_PROFIT, qty=0.4)
+
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'symbol': market.symbol, 'execType': 'Trade', 'execId': 'tp-1',
+            'orderId': '501', 'orderLinkId': 'coid-tp', 'side': 'Buy',
+            'execQty': '0.4', 'execPrice': '100000', 'execFee': '0',
+            'execTime': '1752600002000',
+        }],
+    }, market)
+
+    assert len(events) == 1
+    assert events[0].event_type == 'filled'
+    assert events[0].leg_type is LegType.TAKE_PROFIT
+    # FIFO consumption: the oldest entry is fully retired, the second keeps
+    # only its unconsumed residual — the live-row signed sum equals the
+    # venue's remaining short in the wire domain.
+    live = {row.client_order_id: row
+            for row in plugin.store_ctx.iter_live_orders()}
+    assert 'e1' not in live
+    assert 'coid-tp' not in live
+    assert live['e2'].filled_qty == pytest.approx(0.2)
+    signed = sum(row.filled_qty if row.side == 'buy' else -row.filled_qty
+                 for row in live.values())
+    assert signed == pytest.approx(-0.2)
+
+
 def __test_bybit_amend_relabels_repeated_new_push__():
     """A re-pushed ``New`` on a known order id becomes ``amended``, not ``created``.
 
