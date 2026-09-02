@@ -2,6 +2,7 @@
 @pyne
 """
 import asyncio
+import threading
 from decimal import Decimal
 from time import time as epoch_time
 
@@ -2475,3 +2476,54 @@ def __test_bybit_pyramid_shared_stop_splits_in_backfill__(tmp_path):
     assert [e.fill_qty for e in events] == pytest.approx([0.02, 0.02])
     assert list(plugin.store_ctx.iter_events_by_kind_for_run_id(
         'external_activity_ignored')) == []
+
+
+def __test_bybit_hung_read_resolves_as_connection_error_within_deadline__(monkeypatch):
+    """A transport-hung GET must resolve as a retryable connection error.
+
+    The sync engine serializes reads behind the in-flight one, so a GET that
+    outlives the bridge timeout parks every later read (measured live: bybit
+    cycle 94 and inverse cycle 49 — a venue REST outage left the first read
+    in flight for 90 s while nothing fresh could go out). ``_READ_DEADLINE_S``
+    must abandon the wait and surface ``BybitConnectionError`` (the state
+    reads map it to ``ExchangeConnectionError``) so the engine parks the
+    cycle and retries with a fresh read.
+    """
+    from pynecore_bybit import rest as rest_mod
+
+    release = threading.Event()
+
+    class _HungGet(_FakeBrokerBybit):
+        def __call__(self, endpoint, params=None, *, method='get', body=None, auth=False):
+            release.wait(1.0)
+            raise AssertionError("released after the deadline fired")
+
+    plugin = _HungGet()
+    monkeypatch.setattr(rest_mod, '_READ_DEADLINE_S', 0.1)
+    try:
+        with pytest.raises(BybitConnectionError, match="did not complete"):
+            asyncio.run(plugin._call('/v5/position/list', {'category': 'linear'}, auth=True))
+    finally:
+        release.set()
+
+
+def __test_bybit_write_call_is_not_deadline_bounded__(monkeypatch):
+    """Writes must NOT inherit the read deadline.
+
+    Abandoning a slow POST mid-flight manufactures disposition-unknown
+    ambiguity; the dispatch sites own write timeouts. A POST slower than
+    ``_READ_DEADLINE_S`` must still complete normally.
+    """
+    from pynecore_bybit import rest as rest_mod
+
+    class _SlowPost(_FakeBrokerBybit):
+        def __call__(self, endpoint, params=None, *, method='get', body=None, auth=False):
+            threading.Event().wait(0.3)
+            return {'orderId': '1'}
+
+    plugin = _SlowPost()
+    monkeypatch.setattr(rest_mod, '_READ_DEADLINE_S', 0.1)
+    result = asyncio.run(
+        plugin._call('/v5/order/create', method='post', body={'symbol': 'BTCUSDT'}, auth=True)
+    )
+    assert result == {'orderId': '1'}

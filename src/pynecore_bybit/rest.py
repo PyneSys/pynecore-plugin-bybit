@@ -35,6 +35,17 @@ logger = logging.getLogger(__name__)
 
 _TIMESTAMP_RETRY_COUNT = 2
 _TIMESTAMP_RECV_WINDOW_STEP_MS = 2_500
+# Bound for one async READ (GET) round trip. ``REST_TIMEOUT_S`` is a per-phase
+# httpx timeout, so connect + read can stack past the sync engine's 30 s
+# execute timeout; a read that outruns it is retained by the engine and parks
+# every later read behind it, so no fresh read can go out until the wedge
+# clears (measured live: bybit cycle 94 / inverse cycle 49 — a ~2.5 min venue
+# REST outage left the first read in flight for 90 s). Reads are idempotent,
+# so abandoning the wait and letting the engine park-and-retry is always
+# safe. Must stay well below the engine's 30 s execute timeout. Writes are
+# deliberately NOT bounded: abandoning a mid-flight order write manufactures
+# disposition-unknown ambiguity, which the dispatch sites own.
+_READ_DEADLINE_S = 20.0
 
 
 def _epoch_ms() -> int:
@@ -145,9 +156,14 @@ class _RestMixin(_BybitBase, ABC):
         Offloading to a thread keeps the network call off the event loop
         without duplicating the signing / envelope logic in a second async
         client — the request rate of a single plugin instance is orders of
-        magnitude below what :func:`asyncio.to_thread` can sustain.
+        magnitude below what :func:`asyncio.to_thread` can sustain. A GET is
+        bounded by ``_READ_DEADLINE_S``: the orphaned worker thread finishes
+        on its own request timeout and a concurrent fresh GET is safe.
+
+        :raises BybitConnectionError: When a GET does not complete within
+            ``_READ_DEADLINE_S``.
         """
-        return await asyncio.to_thread(
+        worker = asyncio.to_thread(
             self,
             endpoint,
             params,
@@ -155,6 +171,14 @@ class _RestMixin(_BybitBase, ABC):
             body=body,
             auth=auth,
         )
+        if method.lower() != "get":
+            return await worker
+        try:
+            return await asyncio.wait_for(worker, _READ_DEADLINE_S)
+        except TimeoutError:
+            raise BybitConnectionError(
+                f"Bybit read {endpoint} did not complete within {_READ_DEADLINE_S:.0f}s"
+            )
 
     def _sign_headers(
         self,
