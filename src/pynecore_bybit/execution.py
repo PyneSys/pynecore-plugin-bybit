@@ -531,30 +531,51 @@ class _ExecutionMixin(_BybitBase, ABC):
 
     async def _inverse_reduce_contracts(
             self, market: InstrumentInfo, qty: float, *,
-            intent_key: str, label: str,
+            intent_key: str, label: str, parent_entry: str | None = None,
     ) -> tuple[Decimal, Decimal]:
         """Convert a reduce-side base quantity (exit leg / close) to contracts.
 
-        Converts through the net-position mirror's effective anchor
-        (venue contracts over the base reported to the core), so the
-        proportions the engine computes in base land on the same
-        proportions in contracts. A request covering the whole mirrored
-        base snaps onto the venue's exact contract count — this is what
-        makes a core full-close leave zero residue even after the
-        reversal auto-flip repriced part of the position. With no known
-        position (defensive orders on a flat book) the last-price entry
-        anchor applies and the venue's reduce-only handling is the
-        backstop.
+        An exit leg protecting one entry (``parent_entry``) converts at THAT
+        entry's own dispatch anchor with the entry's floor: the engine sizes
+        the bracket in the base the entry reported (contracts / anchor), so
+        the same anchor and rounding land exactly on the entry's contract
+        count, and the leg's fills convert back to exactly the entry's base.
+        Converting a per-entry leg through the net mirror instead puts it on
+        the position's average price — on a pyramid the legs sit at
+        different prices, the leg lands a contract short of its entry and the
+        residual keeps the intent alive after the leg fills (measured live:
+        bybit-inverse cycles 41, 47 and 53).
+
+        Everything else converts through the net-position mirror's effective
+        anchor (venue contracts over the base reported to the core), so the
+        proportions the engine computes in base land on the same proportions
+        in contracts. A request covering the whole mirrored base snaps onto
+        the venue's exact contract count — this is what makes a core
+        full-close leave zero residue even after the reversal auto-flip
+        repriced part of the position. With no known position (defensive
+        orders on a flat book) the last-price entry anchor applies and the
+        venue's reduce-only handling is the backstop.
 
         :return: ``(contracts, anchor)`` — the anchor is recorded per coid
             so the fills convert back to exactly the requested base.
         """
+        entry_anchor: Decimal | None = None
+        if parent_entry is not None:
+            entry_coid = self._entry_coid_for(parent_entry)
+            if entry_coid is not None:
+                entry_anchor = self._inverse_anchor_for(entry_coid)
         net_c = abs(self._inverse_net_contracts)
         net_b = abs(self._inverse_net_base)
         if net_c > 0.0 and net_b > 0.0:
             anchor = Decimal(str(net_c)) / Decimal(str(net_b))
             if qty >= net_b * (1.0 - 1e-9):
                 contracts = quantize_qty(net_c, market.qty_step_str)
+            elif entry_anchor is not None:
+                anchor = entry_anchor
+                contracts = min(
+                    base_to_contracts(qty, anchor, market.qty_step_str),
+                    quantize_qty(net_c, market.qty_step_str),
+                )
             else:
                 # Reduce side rounds to the NEAREST contract (capped at the
                 # mirrored count): a floored entry makes every base slice
@@ -568,6 +589,9 @@ class _ExecutionMixin(_BybitBase, ABC):
                     base_to_contracts_reduce(qty, anchor, market.qty_step_str),
                     quantize_qty(net_c, market.qty_step_str),
                 )
+        elif entry_anchor is not None:
+            anchor = entry_anchor
+            contracts = base_to_contracts(qty, anchor, market.qty_step_str)
         else:
             anchor = await self._inverse_ref_price(market, None)
             contracts = base_to_contracts_reduce(qty, anchor, market.qty_step_str)
@@ -582,6 +606,37 @@ class _ExecutionMixin(_BybitBase, ABC):
                          'qty_step': market.qty_step_str},
             )
         return contracts, anchor
+
+    def _inverse_amend_contracts(
+            self, market: InstrumentInfo, qty: float, anchor: Decimal, *,
+            intent_key: str, label: str,
+    ) -> Decimal:
+        """Convert an amended reduce-side base quantity at its pinned anchor.
+
+        The amend target is the base the parent entry actually filled
+        (contracts / entry anchor), so at the leg's own anchor the product
+        is a whole contract count up to float noise — nearest wins it back;
+        flooring here lost one contract per amend whenever the pinned anchor
+        sat below the entry's price (measured live: bybit-inverse cycle 53,
+        153 filled, bracket amended to 152, the residual kept the bracket
+        alive and the venue's reduce-only cap cancelled its TP). Capped at
+        the mirrored net count; the order is reduce-only besides.
+        """
+        contracts = base_to_contracts_reduce(qty, anchor, market.qty_step_str)
+        net_c = abs(self._inverse_net_contracts)
+        if net_c > 0.0:
+            contracts = min(contracts, quantize_qty(net_c, market.qty_step_str))
+        if contracts <= 0:
+            raise OrderSkippedByPlugin(
+                f"Skipping {label}: size {qty} converts to zero contracts "
+                f"at {anchor} on the {market.symbol} grid "
+                f"({market.qty_step_str}). No order sent.",
+                intent_key=intent_key, reason="below_min_size",
+                context={'symbol': market.symbol, 'qty': qty,
+                         'anchor': float(anchor),
+                         'qty_step': market.qty_step_str},
+            )
+        return contracts
 
     def _record_anchor(self, coid: str, anchor: Decimal | None,
                        extras: dict) -> dict:
@@ -916,6 +971,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         if market.is_inverse:
             qty, anchor = await self._inverse_reduce_contracts(
                 market, intent.qty, intent_key=intent.intent_key, label=label,
+                parent_entry=intent.from_entry,
             )
         else:
             qty = self._quantize_or_skip(
@@ -2081,7 +2137,7 @@ class _ExecutionMixin(_BybitBase, ABC):
                 # No recorded anchor (restart crash window) — resolve
                 # through the base cancel+recreate.
                 return await super().modify_exit(old, new)
-            qty = self._inverse_entry_contracts(
+            qty = self._inverse_amend_contracts(
                 market, new_intent.qty, anchor,
                 intent_key=new_intent.intent_key, label=label,
             )

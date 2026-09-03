@@ -2527,3 +2527,151 @@ def __test_bybit_write_call_is_not_deadline_bounded__(monkeypatch):
         plugin._call('/v5/order/create', method='post', body={'symbol': 'BTCUSDT'}, auth=True)
     )
     assert result == {'orderId': '1'}
+
+
+def __test_bybit_cancel_type_maps_to_venue_driven_cancel_reason__():
+    """``cancelType`` rides on the cancelled event as the engine's cancel reason.
+
+    ``CancelByReduceOnly`` (the venue squeezed a reduce-only order after the
+    net position shrank — measured live on the inverse pyramid) and the OCO
+    sibling-trigger types are venue-driven; a user cancel or a missing field
+    carries no reason, so the engine's unexpected-cancel policy still applies.
+    """
+    from pynecore.core.broker.models import (
+        CANCEL_REASON_VENUE_OCA, CANCEL_REASON_VENUE_REDUCE_ONLY,
+    )
+    plugin = _FakeBrokerBybit()
+    market = plugin._market
+    assert market is not None
+    plugin._record_identity('coid-tp', pine_id='TP/SL', from_entry='Long',
+                            leg_type=LegType.TAKE_PROFIT, qty=0.002)
+
+    def cancelled(cancel_type: str | None) -> dict:
+        row = {'symbol': 'BTCUSDT', 'orderId': '403', 'orderLinkId': 'coid-tp',
+               'orderStatus': 'Cancelled', 'side': 'Sell', 'orderType': 'Limit',
+               'qty': '0.002', 'cumExecQty': '0', 'price': '110000',
+               'reduceOnly': True, 'createdTime': '1752600000000'}
+        if cancel_type is not None:
+            row['cancelType'] = cancel_type
+        return {'topic': 'order', 'data': [row]}
+
+    reduce_only = plugin._translate_order_rows(cancelled('CancelByReduceOnly'), market)
+    assert reduce_only[0].event_type == 'cancelled'
+    assert reduce_only[0].cancel_reason == CANCEL_REASON_VENUE_REDUCE_ONLY
+    oco = plugin._translate_order_rows(
+        cancelled('CancelByOCOTpCanceledBySlTriggered'), market,
+    )
+    assert oco[0].cancel_reason == CANCEL_REASON_VENUE_OCA
+    assert plugin._translate_order_rows(cancelled('CancelByUser'), market)[0].cancel_reason is None
+    assert plugin._translate_order_rows(cancelled(None), market)[0].cancel_reason is None
+
+
+def _inverse_entry_and_fill(plugin, *, pine_id: str, price: float, qty: float = 0.002,
+                            exec_id: str) -> str:
+    """Dispatch a LIMIT entry anchored at ``price`` and fill it whole; returns the coid."""
+    market = plugin._market
+    asyncio.run(plugin.execute_entry(_entry_envelope(
+        symbol='BTCUSD', pine_id=pine_id, qty=qty,
+        order_type=OrderType.LIMIT, limit=price,
+    )))
+    _, _, body = plugin.calls[-1]
+    coid = body['orderLinkId']
+    plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'category': 'inverse', 'symbol': 'BTCUSD', 'execType': 'Trade',
+            'execId': exec_id, 'orderId': exec_id, 'orderLinkId': coid,
+            'side': 'Buy', 'execQty': body['qty'], 'execPrice': str(price),
+            'execTime': '1752600000000',
+        }],
+    }, market)
+    return coid
+
+
+def _inverse_exit_envelope(*, exit_id: str, from_entry: str, qty: float) -> DispatchEnvelope:
+    return DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id=exit_id, from_entry=from_entry, symbol='BTCUSD', side='sell',
+            qty=qty, tp_price=78000.0, sl_price=76000.0,
+        ),
+        run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+    )
+
+
+def __test_bybit_inverse_exit_leg_anchors_on_its_parent_entry__():
+    """A per-entry bracket converts at ITS entry's anchor, not the position average.
+
+    Replays the 2026-09-02 pyramid shape: L1 at 76713.2 and L2 at 76819.8, both
+    0.002 base -> 153 contracts each. L2's bracket must land on 153 at L2's
+    anchor (the mirror average would put it a contract short after the amend),
+    and the amend to the entry's filled base (153 / 76819.8) must stay at 153.
+    """
+    plugin = _inverse_plugin(responses=[{'orderId': str(n)} for n in range(1, 7)])
+    _inverse_entry_and_fill(plugin, pine_id='L1', price=76713.2, exec_id='x1')
+    l2_coid = _inverse_entry_and_fill(plugin, pine_id='L2', price=76819.8, exec_id='x2')
+    assert plugin._inverse_net_contracts == 306.0
+
+    old = _inverse_exit_envelope(exit_id='L2-X', from_entry='L2', qty=0.002)
+    legs = asyncio.run(plugin.execute_exit(old))
+    _, _, tp_body = plugin.calls[-2]
+    _, _, sl_body = plugin.calls[-1]
+    assert tp_body['qty'] == '153' and sl_body['qty'] == '153'
+    tp_coid = tp_body['orderLinkId']
+    assert plugin._wire_anchor[tp_coid] == plugin._wire_anchor[l2_coid] == Decimal('76819.8')
+    # The core-facing base is exactly the entry's reported base.
+    assert legs[0].qty == pytest.approx(153 / 76819.8)
+
+    filled_base = 153 / 76819.8
+    new = _inverse_exit_envelope(exit_id='L2-X', from_entry='L2', qty=filled_base)
+    asyncio.run(plugin.modify_exit(old, new))
+    _, _, tp_amend = plugin.calls[-2]
+    _, _, sl_amend = plugin.calls[-1]
+    assert tp_amend['qty'] == '153' and sl_amend['qty'] == '153'
+
+
+def __test_bybit_inverse_exit_amend_rounds_to_the_nearest_contract__():
+    """An amend at a pinned anchor below the entry price must not drop a contract.
+
+    Replays bybit-inverse cycle 53 exactly: the L2-X legs were pinned at the
+    mirror anchor 76713.2 while L2 had filled 153 contracts at 76819.8; the
+    engine amended the bracket to the filled base (0.00199167) and the floor
+    at the pinned anchor produced 152 — one contract short, the bracket
+    outlived its SL fill and the venue's reduce-only cap cancelled its TP.
+    """
+    plugin = _inverse_plugin(responses=[{'orderId': str(n)} for n in range(1, 6)])
+    _inverse_entry_and_fill(plugin, pine_id='L', price=76713.2, exec_id='x1')
+    old = _inverse_exit_envelope(exit_id='L-X', from_entry='L', qty=0.002)
+    asyncio.run(plugin.execute_exit(old))
+    _, _, tp_body = plugin.calls[-1]
+    # Pin the legacy (mirror) anchor the live legs carried.
+    for kind_coid in (plugin.calls[-2][2]['orderLinkId'], tp_body['orderLinkId']):
+        plugin._wire_anchor[kind_coid] = Decimal('76713.2')
+    plugin._inverse_net_contracts = 306.0
+    plugin._inverse_net_base = 153 / 76713.2 + 153 / 76819.8
+
+    new = _inverse_exit_envelope(exit_id='L-X', from_entry='L', qty=153 / 76819.8)
+    asyncio.run(plugin.modify_exit(old, new))
+    _, _, tp_amend = plugin.calls[-2]
+    _, _, sl_amend = plugin.calls[-1]
+    assert tp_amend['qty'] == '153' and sl_amend['qty'] == '153'
+
+
+def __test_bybit_inverse_exit_amend_is_capped_at_the_mirrored_position__():
+    """An amend can never ask for more contracts than the venue nets.
+
+    The pinned anchor is a per-leg conversion rate, not a position fact; if the
+    mirrored net count is below the converted amend the order would exceed the
+    reduce-only position and the venue would shrink or cancel it.
+    """
+    plugin = _inverse_plugin(responses=[{'orderId': str(n)} for n in range(1, 6)])
+    _inverse_entry_and_fill(plugin, pine_id='L', price=76713.2, exec_id='x1')
+    old = _inverse_exit_envelope(exit_id='L-X', from_entry='L', qty=0.002)
+    asyncio.run(plugin.execute_exit(old))
+    plugin._inverse_net_contracts = 100.0
+    plugin._inverse_net_base = 100 / 76713.2
+
+    new = _inverse_exit_envelope(exit_id='L-X', from_entry='L', qty=0.002)
+    asyncio.run(plugin.modify_exit(old, new))
+    _, _, tp_amend = plugin.calls[-2]
+    _, _, sl_amend = plugin.calls[-1]
+    assert tp_amend['qty'] == '100' and sl_amend['qty'] == '100'

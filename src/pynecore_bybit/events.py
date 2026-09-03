@@ -52,6 +52,9 @@ from typing import TYPE_CHECKING
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_OCA,
+    CANCEL_REASON_VENUE_POSITION_CLEARED,
+    CANCEL_REASON_VENUE_REDUCE_ONLY,
     ExchangeOrder,
     LegType,
     OrderEvent,
@@ -97,6 +100,20 @@ _ORDER_STATUS_EVENTS = {
     'PartiallyFilledCanceled': 'cancelled',
     'Deactivated': 'cancelled',
     'Rejected': 'rejected',
+}
+
+#: ``cancelType`` values that mean the VENUE terminated the order as a
+#: consequence of the position / sibling orders it protects (never a user or
+#: operator action), mapped onto the engine's venue-driven cancel reasons.
+#: ``CancelByReduceOnly``: a reduce-only order squeezed to nothing after the
+#: net position fell below the summed reduce-only quantity (measured live:
+#: a sibling bracket's SL fill shrank the shared inverse position and the
+#: venue amended this TP to the residual, then cancelled it).
+_CANCEL_TYPE_REASONS = {
+    'CancelByReduceOnly': CANCEL_REASON_VENUE_REDUCE_ONLY,
+    'CancelByOCOTpCanceledBySlTriggered': CANCEL_REASON_VENUE_OCA,
+    'CancelByOCOSlCanceledByTpTriggered': CANCEL_REASON_VENUE_OCA,
+    'CancelByTpSlTsClear': CANCEL_REASON_VENUE_POSITION_CLEARED,
 }
 
 #: Small float slack when comparing cumulative fills against the dispatch
@@ -914,6 +931,10 @@ class _EventStreamMixin(_BybitBase, ABC):
             order = parse_exchange_order(entry)
             if market.is_inverse:
                 order = self._inverse_order_to_base(order)
+            cancel_reason = (
+                _CANCEL_TYPE_REASONS.get(str(entry.get('cancelType') or ''))
+                if event_type == 'cancelled' else None
+            )
             events.append(OrderEvent(
                 order=order,
                 event_type=event_type,
@@ -923,6 +944,7 @@ class _EventStreamMixin(_BybitBase, ABC):
                 pine_id=pine_id,
                 from_entry=from_entry,
                 leg_type=leg_type,
+                cancel_reason=cancel_reason,
             ))
         return events
 
