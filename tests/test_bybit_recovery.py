@@ -579,3 +579,64 @@ def __test_startup_keeps_orphaned_envelope_while_exposure__(tmp_path):
     broker.store_ctx.record_envelope('Long', 1_784_292_600_000, 0)
     _recover(broker)
     assert 'Long' in broker.store_ctx.replay()[0]                # exposure -> kept
+
+
+# === Inconclusive snapshot diagnostics =====================================
+
+class _NoOpenOrdersFake(_RecoveryFake):
+    """Open-orders snapshot read raises ``error``; the id-filtered lookups work."""
+
+    error: Exception = RuntimeError("unset")
+
+    def __call__(self, endpoint, params=None, *, method='get', body=None,
+                 auth=False):
+        if endpoint == '/v5/order/realtime' and 'orderLinkId' not in (params or {}):
+            raise self.error
+        return super().__call__(endpoint, params, method=method, body=body, auth=auth)
+
+
+def _inconclusive_snapshot_records(caplog) -> list:
+    return [r for r in caplog.records if 'snapshot inconclusive' in r.getMessage()]
+
+
+def __test_transient_snapshot_failure_is_one_warning_line__(tmp_path, caplog):
+    # A connection reset on the open-orders read is a retryable transport
+    # failure: the pass is skipped (the row stays live), and the log is ONE
+    # WARNING naming the endpoint — no HTTP-stack traceback, no "startup"
+    # wording (the runtime disappearance reconcile shares this reader).
+    import logging
+    from pynecore_bybit.exceptions import BybitConnectionError
+    broker = _NoOpenOrdersFake(market=_linear_instrument())
+    broker.error = BybitConnectionError(
+        "Bybit HTTP transport error on /v5/order/realtime: [Errno 54] Connection reset by peer")
+    _open(tmp_path, broker)
+    _seed(broker, 'g5', qty=0.01, state='confirmed', exchange_order_id='og5')
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        _recover(broker)
+    assert 'g5' in _live_coids(broker)       # pass skipped, nothing retired
+    records = _inconclusive_snapshot_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.WARNING
+    assert not record.exc_info
+    assert '/v5/order/realtime' in record.getMessage()
+    assert 'orphan retirement skipped' in record.getMessage()
+    assert 'startup' not in record.getMessage()
+
+
+def __test_unexpected_snapshot_failure_keeps_the_traceback__(tmp_path, caplog):
+    # A non-retryable venue error on the same read is still inconclusive
+    # (pass skipped) but keeps its traceback — that one is worth debugging.
+    import logging
+    from pynecore_bybit.exceptions import BybitError
+    broker = _NoOpenOrdersFake(market=_linear_instrument())
+    broker.error = BybitError("venue answered nonsense")
+    _open(tmp_path, broker)
+    _seed(broker, 'g6', qty=0.01, state='confirmed', exchange_order_id='og6')
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        _recover(broker)
+    assert 'g6' in _live_coids(broker)
+    records = _inconclusive_snapshot_records(caplog)
+    assert len(records) == 1
+    assert records[0].exc_info               # traceback attached
+    assert 'venue answered nonsense' in records[0].getMessage()

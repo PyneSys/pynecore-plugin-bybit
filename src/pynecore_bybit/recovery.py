@@ -89,6 +89,25 @@ from .models import InstrumentInfo
 logger = logging.getLogger(__name__)
 
 
+def _log_inconclusive_snapshot(what: str, exc: BybitError) -> None:
+    """Log a venue snapshot read that could not be trusted.
+
+    Both the startup pass and the runtime disappearance reconcile share the
+    snapshot readers, so the line names the consequence (orphan retirement
+    skipped for this pass) rather than a phase. A retryable transport failure
+    is one line — the endpoint and errno already travel in the message and the
+    HTTP-stack frames add nothing — while an unexpected venue error keeps its
+    traceback.
+
+    :param what: Which snapshot failed and how.
+    :param exc: The venue error that made the read inconclusive.
+    """
+    logger.warning(
+        "Bybit venue snapshot inconclusive — orphan retirement skipped for this "
+        "pass (%s): %s", what, exc, exc_info=not exc.retryable,
+    )
+
+
 class _RecoveryMixin(_BybitBase, ABC):
     """Persist-first crash recovery + startup-orphan retirement."""
 
@@ -311,11 +330,8 @@ class _RecoveryMixin(_BybitBase, ABC):
                 cursor = result.get('nextPageCursor') or None
                 if not cursor:
                     break
-        except BybitError:
-            logger.warning(
-                "Bybit recovery: open-orders snapshot read failed; "
-                "skipping the startup orphan pass", exc_info=True,
-            )
+        except BybitError as exc:
+            _log_inconclusive_snapshot("open-orders snapshot read failed", exc)
             return ids, False
         return ids, True
 
@@ -333,21 +349,15 @@ class _RecoveryMixin(_BybitBase, ABC):
         if market.category != CATEGORY_SPOT:
             try:
                 rows = await self._fetch_position_rows(market)
-            except BybitError:
-                logger.warning(
-                    "Bybit recovery: position snapshot read failed; "
-                    "skipping the startup orphan pass", exc_info=True,
-                )
+            except BybitError as exc:
+                _log_inconclusive_snapshot("position snapshot read failed", exc)
                 return False, False
             try:
                 for row in rows:
                     if self._position_row_size(row) > 0.0:
                         return True, True
-            except BybitError:
-                logger.warning(
-                    "Bybit recovery: position snapshot was invalid; "
-                    "skipping the startup orphan pass", exc_info=True,
-                )
+            except BybitError as exc:
+                _log_inconclusive_snapshot("position snapshot was invalid", exc)
                 return False, False
             return False, True
         manager = self._spot_manager
