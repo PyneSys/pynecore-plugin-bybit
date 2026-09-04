@@ -75,7 +75,7 @@ from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.store_helpers import find_pending_dispatch
 
 from ._base import _BybitBase
-from .exceptions import BybitError
+from .exceptions import BybitError, traceback_wanted
 from .execution import _DEAD_ORDER_STATUSES
 from .helpers import (
     CATEGORY_SPOT,
@@ -104,7 +104,7 @@ def _log_inconclusive_snapshot(what: str, exc: BybitError) -> None:
     """
     logger.warning(
         "Bybit venue snapshot inconclusive — orphan retirement skipped for this "
-        "pass (%s): %s", what, exc, exc_info=not exc.retryable,
+        "pass (%s): %s", what, exc, exc_info=traceback_wanted(exc),
     )
 
 
@@ -429,10 +429,11 @@ class _RecoveryMixin(_BybitBase, ABC):
                     if not cursor:
                         break
                 start = end
-        except BybitError:
+        except BybitError as exc:
             logger.warning(
                 "Bybit recovery: execution read failed for order %s; "
-                "leaving the row parked", order_id, exc_info=True,
+                "leaving the row parked: %s", order_id, exc,
+                exc_info=traceback_wanted(exc),
             )
             return ids, qty_sum, False
         return ids, qty_sum, True

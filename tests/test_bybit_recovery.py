@@ -188,9 +188,11 @@ def __test_recover_confirmed_partial_fill_seeds_cursor_and_dedup__(tmp_path):
     assert {'e1', 'e2'} <= broker._seen_exec_ids
 
 
-def __test_recover_confirmed_fill_left_pending_when_exec_read_fails__(tmp_path):
+def __test_recover_confirmed_fill_left_pending_when_exec_read_fails__(tmp_path, caplog):
     # cumExecQty > 0 but the execution read fails: confirming would advance
-    # the cursor with no de-dup anchor, so the row stays PARKED instead.
+    # the cursor with no de-dup anchor, so the row stays PARKED instead. The
+    # transport failure is logged as ONE WARNING line, without a traceback.
+    import logging
     from pynecore_bybit.exceptions import BybitConnectionError
 
     class _NoExecFake(_RecoveryFake):
@@ -210,11 +212,16 @@ def __test_recover_confirmed_fill_left_pending_when_exec_read_fails__(tmp_path):
     )
     _open(tmp_path, broker)
     _seed(broker, 'c9', qty=0.01)
-    _recover(broker)
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        _recover(broker)
     row = broker.store_ctx.get_order('c9')
     assert row.state == 'submitted'          # left parked
     assert row.filled_qty == 0.0             # cursor NOT advanced
     assert 'c9' in _live_coids(broker)
+    records = [r for r in caplog.records if 'execution read failed' in r.getMessage()]
+    assert len(records) == 1
+    assert 'execution list down' in records[0].getMessage()
+    assert not records[0].exc_info
 
 
 # === Verdict: rejected =====================================================

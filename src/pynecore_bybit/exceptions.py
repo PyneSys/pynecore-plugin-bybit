@@ -23,7 +23,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeRateLimitError,
     InsufficientMarginError,
 )
-from pynecore.core.plugin import ProviderError
+from pynecore.core.plugin import ProviderError, is_retryable_provider_error
 
 
 class BybitError(ProviderError):
@@ -226,3 +226,18 @@ def map_broker_error(exc: BybitAPIError) -> BrokerError | None:
 def reject_error(exc: BybitAPIError) -> ExchangeOrderRejectedError:
     """Build the definitive order-reject for an unmapped trade ``retCode``."""
     return ExchangeOrderRejectedError(str(exc))
+
+
+def traceback_wanted(exc: BaseException) -> bool:
+    """Whether a swallowed venue-read failure should be logged with its traceback.
+
+    A retryable transport fault (a dropped socket, a DNS miss, a venue 5xx) is
+    fully described by its message — the endpoint and errno are in it, the
+    HTTP-stack frames add nothing, and every traceback line inflates a live
+    log's error count. An unclassified failure keeps the traceback that makes
+    it debuggable.
+
+    :param exc: The caught exception.
+    :return: ``True`` when the log line should carry ``exc_info``.
+    """
+    return not is_retryable_provider_error(exc)

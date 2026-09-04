@@ -2,6 +2,8 @@
 @pyne
 """
 import asyncio
+import logging
+import time
 import threading
 from decimal import Decimal
 from time import time as epoch_time
@@ -30,7 +32,9 @@ from pynecore.core.broker.storage import BrokerStore
 
 import pynecore_bybit.events as events_module
 from pynecore_bybit import Bybit, BybitConfig
-from pynecore_bybit.exceptions import BybitAPIError, BybitConnectionError
+from pynecore_bybit.exceptions import (
+    BybitAPIError, BybitConnectionError, BybitError, traceback_wanted,
+)
 from pynecore_bybit.helpers import (
     base_to_contracts,
     contracts_to_base,
@@ -2675,3 +2679,29 @@ def __test_bybit_inverse_exit_amend_is_capped_at_the_mirrored_position__():
     _, _, tp_amend = plugin.calls[-2]
     _, _, sl_amend = plugin.calls[-1]
     assert tp_amend['qty'] == '100' and sl_amend['qty'] == '100'
+
+
+def __test_traceback_wanted_only_for_unclassified_failures__():
+    """Retryable venue faults log without a traceback; everything else keeps it"""
+    assert traceback_wanted(BybitConnectionError("reset")) is False
+    assert traceback_wanted(BybitError("unclassified")) is True
+    assert traceback_wanted(RuntimeError("boom")) is True
+    wrapped = RuntimeError("wrapped")
+    wrapped.__cause__ = BybitConnectionError("dns miss")
+    assert traceback_wanted(wrapped) is False
+
+
+def __test_bybit_spot_port_transient_execution_read_is_one_warning_line__(caplog):
+    """Spot port: a transport failure mid-read is one WARNING, no traceback"""
+    plugin = _FakeBrokerBybit(responses=[BybitConnectionError("execution list down")])
+    market = plugin._market
+    assert market is not None
+    port = spot_port_for(plugin, market)
+    cursor = str(int(time.time() * 1000) - 60_000)
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        batch = asyncio.run(port.fetch_executions(cursor))
+    assert batch.conclusive is False
+    records = [r for r in caplog.records if 'execution/list read failed' in r.getMessage()]
+    assert len(records) == 1
+    assert 'execution list down' in records[0].getMessage()
+    assert not records[0].exc_info

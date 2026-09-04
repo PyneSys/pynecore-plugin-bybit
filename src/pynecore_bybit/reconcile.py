@@ -67,7 +67,7 @@ from pynecore.core.broker.store_helpers import (
 )
 
 from ._base import _BybitBase
-from .exceptions import BybitError
+from .exceptions import BybitError, traceback_wanted
 from .execution import _DEAD_ORDER_STATUSES
 from .helpers import CATEGORY_SPOT
 
@@ -225,7 +225,7 @@ class _ReconcileMixin(_BybitBase, ABC):
         except Exception as exc:  # noqa: BLE001 - the reconcile pass must not kill the stream
             logger.warning(
                 "Bybit disappearance reconcile pass failed (transient): %s",
-                exc, exc_info=True,
+                exc, exc_info=traceback_wanted(exc),
             )
         return events
 

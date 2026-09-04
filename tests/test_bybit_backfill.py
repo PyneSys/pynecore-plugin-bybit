@@ -2,6 +2,7 @@
 @pyne
 """
 import asyncio
+import logging
 import time
 from decimal import Decimal
 
@@ -319,3 +320,103 @@ def __test_backfill_deferred_until_adoption_baselined__(tmp_path):
     # F4) and touches neither the watermark nor the execution endpoint.
     assert _backfill(broker) == []
     assert broker.exec_calls == []
+
+
+# === Transient read failures log one line, not a traceback ================
+
+def _records_containing(caplog, needle: str) -> list:
+    return [r for r in caplog.records if needle in r.getMessage()]
+
+
+def __test_transient_window_read_failure_is_one_warning_line__(tmp_path, caplog):
+    # The execution/list read drops mid-drain: the pass is inconclusive and
+    # the log is ONE WARNING naming the transport error — no HTTP-stack
+    # traceback (the runner counts every traceback line as an error).
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument(), fail_once=True)
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    broker._deriv_exec_watermark = now - 120_000
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        assert _backfill(broker) == []
+    records = _records_containing(caplog, 'execution/list read failed')
+    assert len(records) == 1
+    assert 'execution list down' in records[0].getMessage()
+    assert not records[0].exc_info
+
+
+def __test_transient_backfill_pass_failure_is_one_warning_line__(tmp_path, caplog,
+                                                                  monkeypatch):
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    broker._deriv_exec_watermark = now - 120_000
+
+    async def _drain_down(*_args):
+        raise BybitConnectionError("drain down")
+
+    monkeypatch.setattr(broker, '_drain_deriv_exec_window', _drain_down)
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        assert _backfill(broker) == []
+    records = _records_containing(caplog, 'fill backfill failed')
+    assert len(records) == 1
+    assert 'drain down' in records[0].getMessage()
+    assert not records[0].exc_info
+
+
+def __test_unexpected_backfill_pass_failure_keeps_the_traceback__(tmp_path, caplog,
+                                                                   monkeypatch):
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    broker._deriv_exec_watermark = now - 120_000
+
+    async def _drain_broken(*_args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(broker, '_drain_deriv_exec_window', _drain_broken)
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        assert _backfill(broker) == []
+    records = _records_containing(caplog, 'fill backfill failed')
+    assert len(records) == 1
+    assert records[0].exc_info
+
+
+class _SpotManagerDown:
+    """Spot inventory manager whose reconcile pass raises ``exc``."""
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+
+    async def reconcile(self, _now_ms: int) -> list:
+        raise self.exc
+
+
+def __test_transient_spot_reconcile_failure_is_one_warning_line__(tmp_path, caplog,
+                                                                   monkeypatch):
+    market = _linear_instrument()
+    broker = _BackfillFake(market=market)
+    _open(tmp_path, broker)
+    monkeypatch.setattr(broker, '_spot_manager',
+                        _SpotManagerDown(BybitConnectionError("wallet down")))
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        assert asyncio.run(broker._run_spot_reconcile(market)) == []
+    records = _records_containing(caplog, 'spot inventory reconcile pass failed')
+    assert len(records) == 1
+    assert 'wallet down' in records[0].getMessage()
+    assert not records[0].exc_info
+
+
+def __test_unexpected_spot_reconcile_failure_keeps_the_traceback__(tmp_path, caplog,
+                                                                    monkeypatch):
+    market = _linear_instrument()
+    broker = _BackfillFake(market=market)
+    _open(tmp_path, broker)
+    monkeypatch.setattr(broker, '_spot_manager', _SpotManagerDown(RuntimeError("boom")))
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        assert asyncio.run(broker._run_spot_reconcile(market)) == []
+    records = _records_containing(caplog, 'spot inventory reconcile pass failed')
+    assert len(records) == 1
+    assert records[0].exc_info

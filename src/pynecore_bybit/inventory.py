@@ -33,7 +33,7 @@ from pynecore.core.broker.spot_inventory import (
     SpotInventoryManager,
 )
 
-from .exceptions import BybitError
+from .exceptions import BybitError, traceback_wanted
 from .helpers import (
     EXECUTION_CURSOR_OVERLAP_MS,
     EXECUTION_PAGE_LIMIT,
@@ -226,13 +226,13 @@ class _BybitSpotPort:
                     'limit': EXECUTION_PAGE_LIMIT,
                     'cursor': cursor,
                 }, auth=True)
-            except BybitError:
+            except BybitError as exc:
                 # Transient read trouble: the manager treats a raised
                 # error as "abort the read"; inconclusive is the safe
                 # in-band equivalent mid-pagination.
                 logger.warning(
-                    "Bybit spot port: execution/list read failed for %s",
-                    self.product_id, exc_info=True,
+                    "Bybit spot port: execution/list read failed for %s: %s",
+                    self.product_id, exc, exc_info=traceback_wanted(exc),
                 )
                 return rows, False
             for entry in result.get('list') or []:

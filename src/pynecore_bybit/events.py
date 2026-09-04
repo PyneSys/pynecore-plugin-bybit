@@ -70,7 +70,7 @@ from pynecore.core.broker.store_helpers import (
 from pynecore.core.plugin import override
 
 from ._base import _BybitBase
-from .exceptions import BybitError
+from .exceptions import BybitError, traceback_wanted
 from .helpers import (
     CATEGORY_SPOT,
     EXECUTION_CURSOR_OVERLAP_MS,
@@ -973,7 +973,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         except Exception as exc:  # noqa: BLE001 - the reconcile pass must not kill the stream
             logger.warning(
                 "Bybit derivative position reconcile pass failed (transient): %s",
-                exc, exc_info=True,
+                exc, exc_info=traceback_wanted(exc),
             )
             rows = None
         if rows is not None:
@@ -1002,7 +1002,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         except Exception as exc:  # noqa: BLE001 - the reconcile pass must not kill the stream
             logger.warning(
                 "Bybit spot inventory reconcile pass failed (transient): %s",
-                exc, exc_info=True,
+                exc, exc_info=traceback_wanted(exc),
             )
             return []
         self._raise_pending_halt()
@@ -1170,7 +1170,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         except Exception as exc:  # noqa: BLE001 - the backfill must not kill the stream
             logger.warning(
                 "Bybit derivative fill backfill failed (transient): %s",
-                exc, exc_info=True,
+                exc, exc_info=traceback_wanted(exc),
             )
         if events:
             self._close_entry_rows_when_flat(market)
@@ -1201,10 +1201,11 @@ class _EventStreamMixin(_BybitBase, ABC):
                     'limit': EXECUTION_PAGE_LIMIT,
                     'cursor': cursor,
                 }, auth=True)
-            except BybitError:
+            except BybitError as exc:
                 logger.warning(
                     "Bybit derivative fill backfill: execution/list read "
-                    "failed for %s", market.symbol, exc_info=True,
+                    "failed for %s: %s", market.symbol, exc,
+                    exc_info=traceback_wanted(exc),
                 )
                 return entries, False
             for entry in result.get('list') or []:

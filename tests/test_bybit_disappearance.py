@@ -2,6 +2,7 @@
 @pyne
 """
 import asyncio
+import logging
 from time import time as epoch_time
 
 import pytest
@@ -338,3 +339,68 @@ def __test_flat_sweep_genuine_flat_clears_envelope__(tmp_path):
     _position_push(broker, size='0', side='', updated='3000')
     assert 'e1' not in _live_coids(broker)            # swept on genuine flat
     assert 'e1' not in broker.store_ctx.replay()[0]   # envelope cleared
+
+
+# === Transient reconcile failures log one line, not a traceback ===========
+
+class _PositionsDownFake(_DisappearanceFake):
+    def __call__(self, endpoint, params=None, *, method='get', body=None, auth=False):
+        if endpoint == '/v5/position/list':
+            raise BybitConnectionError("position list down")
+        return super().__call__(endpoint, params, method=method, body=body, auth=auth)
+
+
+def _records_containing(caplog, needle: str) -> list:
+    return [r for r in caplog.records if needle in r.getMessage()]
+
+
+def __test_transient_position_read_failure_is_one_warning_line__(tmp_path, caplog):
+    # The position/list read drops (DNS miss, reset): the pass carries on
+    # without the position view and logs ONE WARNING naming the transport
+    # error — no HTTP-stack traceback.
+    market = _linear_instrument()
+    broker = _PositionsDownFake(market=market)
+    _open(tmp_path, broker)
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        assert asyncio.run(broker._run_deriv_reconcile(market)) == []
+    records = _records_containing(caplog, 'position reconcile pass failed')
+    assert len(records) == 1
+    assert 'position list down' in records[0].getMessage()
+    assert not records[0].exc_info
+
+
+class _RaisingTracker:
+    """Disappearance tracker whose observe() raises ``exc`` before any verdict."""
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+
+    async def observe(self, _present, _now_s):
+        for event in ():
+            yield event
+        raise self.exc
+
+
+def __test_transient_tracker_failure_is_one_warning_line__(tmp_path, caplog, monkeypatch):
+    broker = _DisappearanceFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    monkeypatch.setattr(broker, '_disappearance_tracker',
+                        lambda: _RaisingTracker(BybitConnectionError("history down")))
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        assert _run_reconcile(broker, []) == []
+    records = _records_containing(caplog, 'disappearance reconcile pass failed')
+    assert len(records) == 1
+    assert 'history down' in records[0].getMessage()
+    assert not records[0].exc_info
+
+
+def __test_unexpected_tracker_failure_keeps_the_traceback__(tmp_path, caplog, monkeypatch):
+    broker = _DisappearanceFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    monkeypatch.setattr(broker, '_disappearance_tracker',
+                        lambda: _RaisingTracker(RuntimeError("boom")))
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        assert _run_reconcile(broker, []) == []
+    records = _records_containing(caplog, 'disappearance reconcile pass failed')
+    assert len(records) == 1
+    assert records[0].exc_info
