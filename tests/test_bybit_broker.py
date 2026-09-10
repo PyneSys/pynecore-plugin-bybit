@@ -27,6 +27,7 @@ from pynecore.core.broker.models import (
     LegType,
     OrderType,
 )
+from pynecore.core.broker.idempotency import KIND_ENTRY
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 
@@ -605,6 +606,46 @@ def __test_bybit_duplicate_coid_prior_instance_spent__(tmp_path):
     _attach_store(plugin, tmp_path, "retry")
     orders = asyncio.run(plugin.execute_entry(_entry_envelope()))
     assert orders[0].id == '778'
+
+
+def __test_bybit_duplicate_coid_reopened_row_anchors_on_the_fresh_dispatch__(tmp_path):
+    """A dispatch row reopened for a fresh send anchors the guard on that send.
+
+    The persist-first path reuses a CLOSED row when the engine rebuilds the
+    same coid (bybit-inverse cycle 85: a consumed entry anchor replayed
+    across a restart). The reopen restarts the row's creation instant, so
+    the venue's already-filled original from the FIRST lifecycle predates
+    this dispatch by far more than the skew margin and is spent — adopting
+    it would report the dead order as the new entry (no fill, no position).
+    """
+    envelope = _entry_envelope()
+    coid = envelope.client_order_id(KIND_ENTRY)
+    first_lifecycle_ms = int(epoch_time() * 1000) - 1_800_000
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("duplicate", ret_code=170141),
+        {'list': [{'orderId': '760', 'orderLinkId': coid,
+                   'symbol': 'BTCUSDT', 'side': 'Buy', 'orderType': 'Market',
+                   'qty': '0.0015', 'cumExecQty': '0.0015',
+                   'orderStatus': 'Filled',
+                   'createdTime': str(first_lifecycle_ms + 200)}]},
+    ])
+    _attach_store(plugin, tmp_path, "reopen")
+    ctx = plugin.store_ctx
+    assert ctx is not None
+    ctx.upsert_order(
+        coid, symbol='BTCUSDT', side='buy', qty=0.0015, filled_qty=0.0015,
+        state='confirmed', intent_key='Long', pine_entry_id='Long',
+        exchange_order_id='760',
+    )
+    ctx.close_order(coid)
+    ctx._store._conn.execute(  # noqa: SLF001 - age the first lifecycle
+        "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
+        (first_lifecycle_ms, coid),
+    )
+    ctx._store._conn.commit()  # noqa: SLF001
+
+    with pytest.raises(ClientOrderIdSpentError):
+        asyncio.run(plugin.execute_entry(envelope))
 
 
 def __test_bybit_exit_leg_spent_rolls_back_sibling__():
