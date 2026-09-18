@@ -16,6 +16,7 @@ core spot-inventory integration on spot and the venue position model
 maps the Pine base denomination onto whole-USD contracts at dispatch.
 """
 import asyncio
+import os
 from pathlib import Path
 
 from ._base import _BybitBase
@@ -86,12 +87,15 @@ class Bybit(
             raise TypeError(
                 f"BybitConfig is required, got {type(self.config).__name__}"
             )
+        # Per-process endpoint overrides (a proxy in front of the venue):
+        # the environment wins over the config file so one bot process can
+        # be redirected without touching the shared plugin config.
         self._hosts = resolve_hosts(
             self.config.region,
             demo=self.config.demo,
-            rest_host=self.config.rest_host,
-            ws_public_host=self.config.ws_public_host,
-            ws_private_host=self.config.ws_private_host,
+            rest_host=os.environ.get("PYNE_BYBIT_REST_HOST") or self.config.rest_host,
+            ws_public_host=os.environ.get("PYNE_BYBIT_WS_PUBLIC_HOST") or self.config.ws_public_host,
+            ws_private_host=os.environ.get("PYNE_BYBIT_WS_PRIVATE_HOST") or self.config.ws_private_host,
         )
 
         # REST state (built lazily by ``_RestMixin``).
