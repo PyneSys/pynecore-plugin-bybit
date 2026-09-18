@@ -747,9 +747,9 @@ class _EventStreamMixin(_BybitBase, ABC):
 
         Quantities compare in the wire domain (exact against the
         dispatched value); on inverse the core-facing event converts to
-        base at the dispatch's recorded anchor (falling back to the
-        execution price when the anchor is unresolvable — a restart crash
-        window) and the slice folds into the net-position mirror. The
+        base through :meth:`_inverse_fill_anchor` (full-cover snap, the
+        dispatch's recorded anchor, the parent entry's anchor, the
+        execution price) and the slice folds into the net-position mirror. The
         settle-coin fee normalizes to the quote currency at the execution
         price — the core books the numeric fee in the quote P&L domain.
         """
@@ -812,9 +812,10 @@ class _EventStreamMixin(_BybitBase, ABC):
             if spot_fee_ccy == market.base_coin:
                 fill_qty = exec_qty - fee if side == 'buy' else exec_qty + fee
         if market.is_inverse:
-            anchor = self._inverse_anchor_for(coid, fallback=exec_price)
-            assert anchor is not None  # exec_price > 0 guarantees a fallback
-            factor = float(anchor)
+            factor = float(self._inverse_fill_anchor(
+                coid, from_entry=from_entry, side=side, contracts=exec_qty,
+                exec_price=exec_price, reducing=leg_type is not LegType.ENTRY,
+            ))
             fill_qty = exec_qty / factor
             total_qty = total_qty / factor
             cumulative = cumulative / factor

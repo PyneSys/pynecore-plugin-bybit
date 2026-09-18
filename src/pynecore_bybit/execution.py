@@ -472,6 +472,39 @@ class _ExecutionMixin(_BybitBase, ABC):
             return Decimal(str(fallback))
         return None
 
+    def _inverse_fill_anchor(
+            self, coid: str, *, from_entry: str | None, side: str,
+            contracts: float, exec_price: float, reducing: bool,
+    ) -> Decimal:
+        """Pick the base<->contract factor of one execution slice.
+
+        A reducing slice that covers the whole mirrored position converts
+        to exactly the base the core was told it holds, whatever the
+        slice's own anchor: the venue closed every contract, so the book
+        must land on exactly flat. Otherwise the dispatch's recorded
+        anchor applies, then the parent entry's anchor for a coid-less
+        venue-materialised leg (a trading-stop close carries no
+        ``orderLinkId``, so its slice has no anchor of its own — measured
+        live: bybit-inverse cycle 119, a trailing stop on an adopted 155-
+        contract position converted at its 78155.6 fill price against a
+        77772.98 average, leaving a 9.8e-06 base phantom the reversal
+        then tried to close on a flat venue), and last the execution
+        price (degrades the exact summation to a per-slice approximation,
+        but never drops a fill).
+        """
+        net_c = self._inverse_net_contracts
+        net_b = abs(self._inverse_net_base)
+        if (reducing and net_c != 0.0 and net_b > 0.0
+                and (side == 'sell') == (net_c > 0.0)
+                and abs(net_c) * (1.0 - 1e-9) <= contracts <= abs(net_c) * (1.0 + 1e-9)):
+            return Decimal(str(contracts)) / Decimal(str(net_b))
+        anchor = self._inverse_anchor_for(coid)
+        if anchor is None and from_entry is not None:
+            entry_coid = self._entry_coid_for(from_entry)
+            if entry_coid is not None:
+                anchor = self._inverse_anchor_for(entry_coid)
+        return anchor if anchor is not None else Decimal(str(exec_price))
+
     async def _inverse_ref_price(
             self, market: InstrumentInfo, price: Decimal | None,
     ) -> Decimal:

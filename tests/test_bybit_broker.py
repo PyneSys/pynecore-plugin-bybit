@@ -2746,3 +2746,66 @@ def __test_bybit_spot_port_transient_execution_read_is_one_warning_line__(caplog
     assert len(records) == 1
     assert 'execution list down' in records[0].getMessage()
     assert not records[0].exc_info
+
+
+def __test_bybit_inverse_coidless_full_close_snaps_to_the_mirrored_base__():
+    """A venue trading-stop closing the whole position lands the book on exactly flat.
+
+    Replays bybit-inverse cycle 119: an adopted 155-contract long (average
+    77772.98) was closed by its trailing stop at 78155.6. The execution
+    carries no ``orderLinkId``, so it has no anchor of its own; converting
+    at the fill price reported 155 / 78155.6 base against a book of
+    155 / 77772.98 and left a 9.8e-06 phantom the reversal then tried to
+    close on a flat venue (rejected 110017 twice).
+    """
+    plugin = _inverse_plugin()
+    market = plugin._market
+    assert market is not None
+    plugin._inverse_seed_net([_position_row(
+        symbol='BTCUSD', size='155', side='Buy', avgPrice='77772.98',
+    )])
+    adopted_base = plugin._inverse_net_base
+    event = plugin._fill_event({
+        'execId': 'ts-1', 'orderId': 'venue-ts', 'orderLinkId': '',
+        'side': 'Sell', 'execQty': '155', 'execPrice': '78155.6',
+        'closedSize': '155', 'stopOrderType': 'TrailingStop',
+        'execTime': '1758187500000',
+    }, market, coid='', pine_id='L-X', from_entry='L', leg_type=LegType.TRAILING_STOP)
+    assert event is not None
+    assert event.fill_qty == pytest.approx(adopted_base, rel=1e-12)
+    assert event.fill_qty != pytest.approx(155 / 78155.6, rel=1e-9)
+    assert plugin._inverse_net_contracts == 0.0
+    assert plugin._inverse_net_base == 0.0
+
+
+def __test_bybit_inverse_coidless_partial_close_anchors_on_its_parent_entry__():
+    """A partial coid-less reducing slice converts at the parent entry's anchor."""
+    plugin = _inverse_plugin(responses=[{'orderId': '1'}])
+    market = plugin._market
+    assert market is not None
+    _inverse_entry_and_fill(plugin, pine_id='L1', price=76713.2, exec_id='x1')
+    assert plugin._inverse_net_contracts == 153.0
+    event = plugin._fill_event({
+        'execId': 'ts-2', 'orderId': 'venue-ts', 'orderLinkId': '',
+        'side': 'Sell', 'execQty': '100', 'execPrice': '77000',
+        'closedSize': '100', 'stopOrderType': 'PartialTakeProfit',
+        'execTime': '1758187500000',
+    }, market, coid='', pine_id='L1-X', from_entry='L1', leg_type=LegType.TAKE_PROFIT)
+    assert event is not None
+    assert event.fill_qty == pytest.approx(100 / 76713.2, rel=1e-12)
+    assert plugin._inverse_net_contracts == 53.0
+
+    # A slice larger than the mirrored position is not a full cover: it
+    # keeps the anchor path rather than squeezing the excess into the snap.
+    plugin = _inverse_plugin()
+    plugin._inverse_seed_net([_position_row(
+        symbol='BTCUSD', size='155', side='Buy', avgPrice='77772.98',
+    )])
+    event = plugin._fill_event({
+        'execId': 'ts-3', 'orderId': 'venue-ts', 'orderLinkId': '',
+        'side': 'Sell', 'execQty': '200', 'execPrice': '78000',
+        'closedSize': '155', 'stopOrderType': 'StopLoss',
+        'execTime': '1758187500000',
+    }, market, coid='', pine_id='L-X', from_entry=None, leg_type=LegType.STOP_LOSS)
+    assert event is not None
+    assert event.fill_qty == pytest.approx(200 / 78000, rel=1e-12)

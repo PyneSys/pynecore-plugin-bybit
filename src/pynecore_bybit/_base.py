@@ -477,6 +477,12 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     def _inverse_anchor_for(self, coid: str, *,
                             fallback: 'float | None' = None) -> 'Decimal | None': ...
 
+    @abstractmethod
+    def _inverse_fill_anchor(
+            self, coid: str, *, from_entry: 'str | None', side: str,
+            contracts: float, exec_price: float, reducing: bool,
+    ) -> 'Decimal': ...
+
     @staticmethod
     @abstractmethod
     def _quantize_or_skip(market: 'InstrumentInfo', qty: float, *,
