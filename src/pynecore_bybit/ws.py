@@ -81,7 +81,11 @@ class BybitWebSocket:
             # disable the library's protocol pings so a middlebox that
             # strips control frames cannot kill an otherwise healthy feed.
             self._ws = await connect(self.url, ping_interval=None)
-        except (OSError, WebSocketException) as e:
+        except (OSError, WebSocketException, EOFError, ValueError) as e:
+            # websockets re-raises its HTTP response parser's own errors
+            # as the handshake failure: EOFError for a connection cut or
+            # non-CRLF bytes mid status line, ValueError for a malformed
+            # status line or header.
             raise BybitConnectionError(
                 f"Bybit WS connect failed ({self.url}): {e}"
             ) from e

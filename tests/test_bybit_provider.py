@@ -411,6 +411,35 @@ def __test_bybit_ws_close_awaits_tasks__():
     asyncio.run(scenario())
 
 
+def __test_bybit_ws_open_maps_handshake_parser_errors__(monkeypatch):
+    """A garbage HTTP response on connect is a BybitConnectionError, not a raw parser error.
+
+    websockets surfaces its HTTP response parser's own EOFError / ValueError
+    as the handshake failure. The private-stream reconnect loop only
+    retries on BybitError, so an unmapped parser error killed the whole
+    order-event stream (bybit-spot cycle 186 traded blind for four hours
+    after one garbage handshake response)."""
+    from pynecore_bybit import ws as ws_module
+    from pynecore_bybit.exceptions import BybitConnectionError
+
+    async def scenario(exc: BaseException):
+        async def _connect(*_a, **_k):
+            raise exc
+
+        monkeypatch.setattr(ws_module, "connect", _connect)
+        ws = BybitWebSocket('wss://example/v5/private', on_message=lambda _d: None)
+        try:
+            await ws.open()
+        except BybitConnectionError as e:
+            assert e.__cause__ is exc
+            assert ws._ws is None
+            return
+        raise AssertionError("open() did not map the handshake error")
+
+    asyncio.run(scenario(EOFError("connection closed while reading HTTP status line")))
+    asyncio.run(scenario(ValueError("invalid HTTP status line: garbage")))
+
+
 def __test_bybit_reconnect_backfill__(monkeypatch):
     """Backfill pages beyond one kline request; a REST failure keeps the gap"""
     # Freeze the backfill clock mid-minute so a wall-clock minute boundary
