@@ -130,6 +130,7 @@ class Bybit(
         self._broker_start_lock = asyncio.Lock()
         self._order_identity = {}
         self._seen_exec_ids = set()
+        self._parked_lookup_misses = {}
         self._created_order_ids = set()
         self._dispatch_qty = {}
         self._filled_cum = {}

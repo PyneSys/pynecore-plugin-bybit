@@ -199,6 +199,11 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # the private execution stream (the ledger dedups durably; this saves
     # the store round-trip on the common echo).
     _seen_exec_ids: 'set[str]'
+    # Consecutive conclusive not-found ``orderLinkId`` lookups per parked
+    # ``disposition_unknown`` dispatch (:meth:`_resolve_parked_dispatches`).
+    # In-memory only: a restart re-counts from zero, its startup recovery
+    # pass owns the parked rows there.
+    _parked_lookup_misses: 'dict[str, int]'
     # Exchange order ids for which a ``created`` OrderEvent has already been
     # emitted. Bybit re-pushes ``orderStatus='New'`` (or ``'Untriggered'``)
     # after an in-place amend (``POST /v5/order/amend``) on the SAME order id;
@@ -523,3 +528,6 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     async def _reconcile_disappearance(
             self, market: 'InstrumentInfo', position_rows: list[dict] | None,
     ) -> 'list[OrderEvent]': ...
+
+    @abstractmethod
+    async def _resolve_parked_dispatches(self, market: 'InstrumentInfo') -> None: ...

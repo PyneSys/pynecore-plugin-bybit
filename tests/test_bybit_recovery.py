@@ -647,3 +647,185 @@ def __test_unexpected_snapshot_failure_keeps_the_traceback__(tmp_path, caplog):
     assert len(records) == 1
     assert records[0].exc_info               # traceback attached
     assert 'venue answered nonsense' in records[0].getMessage()
+
+
+# === In-run parked dispatch resolution =====================================
+
+def _resolve(broker, *, passes=1) -> None:
+    for _ in range(passes):
+        asyncio.run(broker._resolve_parked_dispatches(broker._market))
+
+
+def _resolution_of(store_ctx, coid):
+    for rec in store_ctx.iter_pending_resolutions():
+        if rec.coid == coid:
+            return rec.resolution
+    return None
+
+
+def _lookup_calls(broker) -> list:
+    return [c for c in broker.calls if 'orderLinkId' in c[1]]
+
+
+def _park_unknown(broker, coid, *, aged=True) -> None:
+    """Seed a ``disposition_unknown`` row + its engine park, aged past the grace."""
+    _seed(broker, coid, qty=0.01, state='disposition_unknown')
+    broker.store_ctx.record_park(coid, coid)
+    if aged:
+        broker.store_ctx._store._conn.execute(
+            "UPDATE orders SET created_ts_ms = created_ts_ms - 120000 "
+            "WHERE client_order_id = ?", (coid,),
+        )
+        broker.store_ctx._store._conn.commit()
+
+
+def __test_parked_not_found_is_rejected_after_consecutive_misses__(tmp_path, caplog):
+    # The POST never reached the venue (lost behind a gateway 5xx): the
+    # orderLinkId is absent from realtime AND history on every pass. Two
+    # conclusive misses keep the row parked; the third rejects it — the row is
+    # closed, the 'rejected' resolution is recorded for the engine, and the
+    # park row is left for the engine's consumer (record_complete on drop).
+    import logging
+    broker = _RecoveryFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    _park_unknown(broker, 'p1')
+    _resolve(broker, passes=2)
+    assert broker.store_ctx.get_order('p1').state == 'disposition_unknown'
+    assert broker._parked_lookup_misses == {'p1': 2}
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        _resolve(broker)
+    row = broker.store_ctx.get_order('p1')
+    assert row.state == 'rejected'
+    assert row.closed_ts_ms is not None
+    assert 'p1' not in _live_coids(broker)
+    assert _resolution_of(broker.store_ctx, 'p1') == 'rejected'
+    assert 'p1' in _parked_coids(broker.store_ctx)     # engine consumes + drops it
+    assert broker._parked_lookup_misses == {}
+    records = [r for r in caplog.records if 'resolved as rejected' in r.getMessage()]
+    assert len(records) == 1
+    assert 'not found on the venue' in records[0].getMessage()
+
+
+def __test_parked_transport_failure_keeps_the_miss_streak__(tmp_path):
+    # A transport failure is inconclusive: it neither advances nor resets the
+    # streak, so a flapping venue cannot fake a "never landed" verdict.
+    from pynecore_bybit.exceptions import BybitConnectionError
+
+    class _RealtimeDownFake(_RecoveryFake):
+        down = False
+
+        def __call__(self, endpoint, params=None, *, method='get', body=None,
+                     auth=False):
+            if self.down and endpoint == '/v5/order/realtime':
+                raise BybitConnectionError("realtime down")
+            return super().__call__(endpoint, params, method=method, body=body,
+                                    auth=auth)
+
+    broker = _RealtimeDownFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    _park_unknown(broker, 'p2')
+    _resolve(broker, passes=2)
+    broker.down = True
+    _resolve(broker, passes=5)
+    assert broker.store_ctx.get_order('p2').state == 'disposition_unknown'
+    assert broker._parked_lookup_misses == {'p2': 2}
+    assert _resolution_of(broker.store_ctx, 'p2') is None
+
+
+def __test_parked_found_live_resets_the_streak_and_stays_parked__(tmp_path):
+    # The order DID land (late ack): the resolver leaves it to the engine's
+    # open-orders verification / the fill path and clears the miss streak.
+    broker = _RecoveryFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    _park_unknown(broker, 'p3')
+    _resolve(broker, passes=2)
+    broker.realtime_by_coid['p3'] = _order(order_id='o3', coid='p3', status='New')
+    _resolve(broker, passes=3)
+    row = broker.store_ctx.get_order('p3')
+    assert row.state == 'disposition_unknown'
+    assert row.exchange_order_id is None
+    assert broker._parked_lookup_misses == {}
+    assert _resolution_of(broker.store_ctx, 'p3') is None
+
+
+def __test_parked_found_dead_with_zero_fills_is_rejected_at_once__(tmp_path, caplog):
+    # The venue refused the order: no miss streak needed, reject immediately.
+    import logging
+    broker = _RecoveryFake(
+        market=_linear_instrument(),
+        history_by_coid={'p4': _order(order_id='o4', coid='p4', status='Rejected')},
+    )
+    _open(tmp_path, broker)
+    _park_unknown(broker, 'p4')
+    with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
+        _resolve(broker)
+    assert broker.store_ctx.get_order('p4').state == 'rejected'
+    assert 'p4' not in _live_coids(broker)
+    assert _resolution_of(broker.store_ctx, 'p4') == 'rejected'
+    records = [r for r in caplog.records if 'resolved as rejected' in r.getMessage()]
+    assert len(records) == 1
+    assert 'venue reports Rejected' in records[0].getMessage()
+
+
+def __test_parked_found_dead_with_fills_is_left_to_the_fill_path__(tmp_path):
+    # PartiallyFilledCanceled with executed qty: the fill is real exposure —
+    # never reject; the execution stream / backfill books it and unparks.
+    broker = _RecoveryFake(
+        market=_linear_instrument(),
+        history_by_coid={'p5': _order(order_id='o5', coid='p5',
+                                      status='PartiallyFilledCanceled', cum='0.004')},
+    )
+    _open(tmp_path, broker)
+    _park_unknown(broker, 'p5')
+    _resolve(broker, passes=3)
+    assert broker.store_ctx.get_order('p5').state == 'disposition_unknown'
+    assert _resolution_of(broker.store_ctx, 'p5') is None
+
+
+def __test_parked_within_grace_is_not_looked_up__(tmp_path):
+    # A row younger than the grace is not even queried (venue indexing lag of
+    # a POST that landed a moment ago).
+    broker = _RecoveryFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    _park_unknown(broker, 'p6', aged=False)
+    _resolve(broker, passes=3)
+    assert _lookup_calls(broker) == []
+    assert broker.store_ctx.get_order('p6').state == 'disposition_unknown'
+
+
+def __test_submitted_row_is_mid_flight_and_untouched__(tmp_path):
+    # ``submitted`` = the wire send is in progress; only ``disposition_unknown``
+    # rows (a failed POST with an unknown outcome) are resolved here.
+    broker = _RecoveryFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    _seed(broker, 'p7', qty=0.01, state='submitted')
+    broker.store_ctx._store._conn.execute(
+        "UPDATE orders SET created_ts_ms = created_ts_ms - 120000 "
+        "WHERE client_order_id = ?", ('p7',),
+    )
+    broker.store_ctx._store._conn.commit()
+    _resolve(broker, passes=3)
+    assert _lookup_calls(broker) == []
+    assert broker.store_ctx.get_order('p7').state == 'submitted'
+
+
+def __test_parked_resolver_runs_inside_both_reconcile_passes__(tmp_path, monkeypatch):
+    # The pass is wired into the deriv AND the spot cadence entry points.
+    broker = _RecoveryFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    seen: list = []
+
+    async def _spy(market):
+        seen.append(market.category)
+
+    monkeypatch.setattr(broker, '_resolve_parked_dispatches', _spy)
+
+    async def _empty(*_args):
+        return []
+
+    monkeypatch.setattr(broker, '_fetch_position_rows', _empty)
+    monkeypatch.setattr(broker, '_reconcile_disappearance', _empty)
+    monkeypatch.setattr(broker, '_run_deriv_fill_backfill', _empty)
+    asyncio.run(broker._run_deriv_reconcile(broker._market))
+    asyncio.run(broker._run_spot_reconcile(broker._market))
+    assert seen == ['linear', 'linear']

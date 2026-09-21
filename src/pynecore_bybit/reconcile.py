@@ -53,6 +53,7 @@ from pynecore.core.broker.disappearance import (
     MissingResolution,
 )
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
+from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
     ExchangeOrder,
@@ -64,6 +65,8 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    STATE_DISPOSITION_UNKNOWN,
+    find_pending_dispatch,
 )
 
 from ._base import _BybitBase
@@ -98,6 +101,16 @@ _FILL_EPS = 1e-9
 _LIVE_ORDER_STATUSES = frozenset({
     'New', 'PartiallyFilled', 'Untriggered', 'Triggered',
 })
+
+#: Age (seconds since the persist-first row was written) a
+#: ``disposition_unknown`` dispatch must reach before the parked-dispatch
+#: resolver starts looking it up by ``orderLinkId``. Covers the venue's own
+#: indexing lag of a POST that DID land moments before its reply was lost.
+_PARKED_DISPATCH_GRACE_S = 30.0
+
+#: Consecutive conclusive not-found lookups (one per reconcile pass) after
+#: which a parked dispatch is judged never to have reached the venue.
+_PARKED_DISPATCH_MISSES_TO_REJECT = 3
 
 
 class _ReconcileMixin(_BybitBase, ABC):
@@ -228,6 +241,111 @@ class _ReconcileMixin(_BybitBase, ABC):
                 exc, exc_info=traceback_wanted(exc),
             )
         return events
+
+    async def _resolve_parked_dispatches(self, market: 'InstrumentInfo') -> None:
+        """Resolve the dispatches parked with an unknown disposition in-run.
+
+        A POST whose reply was lost (timeout, gateway 5xx) leaves its
+        persist-first row in ``disposition_unknown`` and the engine's
+        dispatch parked. The engine's own verification only promotes an
+        order that ``get_open_orders`` echoes back and the fill path only
+        unparks an order that executes, so a dispatch that never reached the
+        venue would stay parked for the rest of the run — the strategy's
+        entry never re-dispatches and every exit depending on it is skipped
+        sync after sync. This pass runs at the reconcile cadence and asks the
+        venue by ``orderLinkId`` (:meth:`_confirm_lookup`):
+
+        * found live or with fills — nothing to do here; the engine
+          verification / the fill path unpark it.
+        * found dead with zero fills — the venue refused it: rejected.
+        * conclusively not found on :data:`_PARKED_DISPATCH_MISSES_TO_REJECT`
+          consecutive passes, the row older than
+          :data:`_PARKED_DISPATCH_GRACE_S` — never landed: rejected.
+        * transport failure — inconclusive; the miss streak is kept as is.
+
+        A rejected row is closed through the journal with a
+        ``'rejected'`` plugin resolution, which the engine consumes on its
+        next sync: it drops the parked envelope and re-dispatches the Pine
+        intent (the same-bar identical ``orderLinkId`` is safe — the venue
+        never saw it and the persist-first write reopens the closed row).
+        Rows still ``submitted`` are mid-flight and left alone. A no-op
+        without persistence.
+        """
+        if self.store_ctx is None:
+            return
+        misses = self._parked_lookup_misses
+        now_ms = int(epoch_time() * 1000)
+        seen: set[str] = set()
+        try:
+            for row in list(find_pending_dispatch(self.store_ctx)):
+                if row.state != STATE_DISPOSITION_UNKNOWN or row.exchange_order_id:
+                    continue
+                coid = row.client_order_id
+                seen.add(coid)
+                if now_ms - row.created_ts_ms < _PARKED_DISPATCH_GRACE_S * 1000:
+                    continue
+                existing, conclusive = await self._confirm_lookup(market, coid)
+                if not conclusive:
+                    continue
+                if existing is None:
+                    misses[coid] = misses.get(coid, 0) + 1
+                    if misses[coid] < _PARKED_DISPATCH_MISSES_TO_REJECT:
+                        continue
+                    self._reject_parked_dispatch(row, existing=None)
+                    continue
+                misses.pop(coid, None)
+                status = str(existing.get('orderStatus') or '')
+                try:
+                    cum_exec = Decimal(str(existing.get('cumExecQty') or '0') or '0')
+                except (InvalidOperation, TypeError, ValueError):
+                    cum_exec = Decimal(0)
+                if status in _DEAD_ORDER_STATUSES and cum_exec <= 0:
+                    self._reject_parked_dispatch(row, existing=existing)
+        except Exception as exc:  # noqa: BLE001 - the reconcile pass must not kill the stream
+            logger.warning(
+                "Bybit parked dispatch resolution pass failed (transient): %s",
+                exc, exc_info=traceback_wanted(exc),
+            )
+        for coid in [c for c in misses if c not in seen]:
+            misses.pop(coid, None)
+
+    def _reject_parked_dispatch(self, row: 'OrderRow', *, existing: dict | None) -> None:
+        """Retire a parked dispatch the venue never accepted.
+
+        Closes the row through the journal (terminal ``rejected``) and
+        records the ``'rejected'`` plugin resolution for the engine. The
+        envelope anchor and the park row are deliberately NOT deleted here:
+        the engine's resolution consumer drops them itself once it has
+        cleared its in-memory intent, so the two sides retire in lockstep.
+        """
+        if self.store_ctx is None:
+            return
+        coid = row.client_order_id
+        order_id = str((existing or {}).get('orderId') or '')
+        status = str((existing or {}).get('orderStatus') or '')
+        self._parked_lookup_misses.pop(coid, None)
+        DispatchJournal(self.store_ctx).apply_reconcile_outcome(
+            coid,
+            ReconcileOutcome(
+                kind='terminal_close',
+                reason='missing_pending_grace_expired',
+                new_state='rejected',
+                audit_event='parked_dispatch_rejected',
+                close_row=True,
+                audit_payload={'order_id': order_id, 'order_status': status,
+                               'found': existing is not None},
+                exchange_order_id=order_id or None,
+            ),
+        )
+        self.store_ctx.record_resolution(coid, 'rejected')
+        logger.warning(
+            "Bybit parked dispatch %s (intent %s) resolved as rejected: %s — "
+            "the engine re-dispatches the intent on its next sync",
+            coid, row.intent_key,
+            f"venue reports {status}" if existing is not None
+            else "not found on the venue after "
+                 f"{_PARKED_DISPATCH_MISSES_TO_REJECT} consecutive lookups",
+        )
 
     async def _disappearance_present(
             self, market: 'InstrumentInfo', position_rows: list[dict] | None,

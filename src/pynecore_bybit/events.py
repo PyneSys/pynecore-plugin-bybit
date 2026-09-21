@@ -968,6 +968,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         slice (:meth:`_confirm_vanished_order`) and relies on this pass to
         deliver the missed fill event.
         """
+        await self._resolve_parked_dispatches(market)
         rows: list[dict] | None
         try:
             rows = await self._fetch_position_rows(market)
@@ -993,6 +994,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         skips its cycle on a failed balance read); a deliberate halt
         propagates so the engine performs its graceful stop.
         """
+        await self._resolve_parked_dispatches(market)
         manager = self._spot_manager
         if manager is None:
             return []
