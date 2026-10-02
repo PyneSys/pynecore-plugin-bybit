@@ -619,6 +619,18 @@ class _EventStreamMixin(_BybitBase, ABC):
         slice so the total is exact) replaced by its share, ready for the
         shared :meth:`_fill_event` builder. A single whole-slice claim
         passes the original row through untouched.
+
+        Every slice also gets its OWN ``execId`` (the venue id suffixed
+        with the owning exit and entry): the core's duplicate-fill gate
+        keys on :attr:`~pynecore.core.broker.models.OrderEvent.fill_id`,
+        so slices sharing the venue execution id would book only the
+        first one — measured live on cycle 219, where a three-exit
+        pyramid stop left the book two legs short of flat, the reversal
+        close no-op'd against the already-flat venue and the position
+        state was finally cleared as an "external close". The suffix is
+        derived from the ownership rows, so the live stream and the
+        reconnect backfill produce the same ids for the same execution
+        and a replay still dedups.
         """
         if len(claims) == 1:
             pine_id, from_entry, leg, _ = claims[0]
@@ -628,6 +640,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         except (TypeError, ValueError):
             total_fee = 0.0
         total_qty = sum(claim[3] for claim in claims)
+        exec_id = str(entry.get('execId') or '')
         slices: list[tuple[dict, str, str | None, LegType]] = []
         fee_left = total_fee
         for index, (pine_id, from_entry, leg, qty) in enumerate(claims):
@@ -637,7 +650,8 @@ class _EventStreamMixin(_BybitBase, ABC):
                 fee = total_fee * (qty / total_qty) if total_qty > 0 else 0.0
                 fee_left -= fee
             slices.append((
-                {**entry, 'execQty': repr(qty), 'execFee': repr(fee)},
+                {**entry, 'execQty': repr(qty), 'execFee': repr(fee),
+                 'execId': f"{exec_id}#{pine_id}#{from_entry or ''}"},
                 pine_id, from_entry, leg,
             ))
         return slices

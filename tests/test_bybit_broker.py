@@ -2446,6 +2446,11 @@ def __test_bybit_pyramid_shared_stop_fill_splits_across_owners__(tmp_path):
     assert [e.from_entry for e in events] == ['L1', 'L2', 'L3']
     assert all(e.leg_type is LegType.STOP_LOSS for e in events)
     assert [e.fill_qty for e in events] == pytest.approx([0.02, 0.02, 0.02])
+    # The core dedups fills on ``fill_id``: slices sharing the venue id would
+    # book only the first exit (cycle 219: book stuck two legs short of flat).
+    assert [e.fill_id for e in events] == [
+        'vs-split#L1-X#L1', 'vs-split#L2-X#L2', 'vs-split#L3-X#L3',
+    ]
     attributed = list(plugin.store_ctx.iter_events_by_kind_for_run_id(
         'venue_bracket_fill_attributed'))
     assert len(attributed) == 3
@@ -2519,6 +2524,9 @@ def __test_bybit_pyramid_shared_stop_splits_in_backfill__(tmp_path):
 
     assert [e.pine_id for e in events] == ['S1-X', 'S2-X']
     assert [e.fill_qty for e in events] == pytest.approx([0.02, 0.02])
+    assert [e.fill_id for e in events] == [
+        'vs-split-bf#S1-X#S1', 'vs-split-bf#S2-X#S2',
+    ]
     assert list(plugin.store_ctx.iter_events_by_kind_for_run_id(
         'external_activity_ignored')) == []
 
