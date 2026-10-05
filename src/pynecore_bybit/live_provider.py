@@ -404,6 +404,17 @@ class _LiveProviderMixin(_BybitBase, ABC):
                 )
             except (KeyError, ValueError, TypeError):
                 continue
+            # Bybit occasionally re-pushes a ``confirm: false`` snapshot of
+            # a slot it already closed (measured live 2026-10-05, linear
+            # ETHUSDT: once for the bar closed a minute earlier, once for a
+            # bar nine minutes old). The bar is settled, so the snapshot
+            # refines nothing, and its close is not the latest trade. Drop
+            # it here: forwarded, it would reach the core as an intra-bar
+            # update under a closed bar's timestamp.
+            if (not bar.is_closed
+                    and self._last_closed_bar_ts is not None
+                    and bar.timestamp <= self._last_closed_bar_ts):
+                continue
             # Every push carries the instrument's latest trade price —
             # feeds the spot position mark and the market-order
             # minimum-notional pre-check.

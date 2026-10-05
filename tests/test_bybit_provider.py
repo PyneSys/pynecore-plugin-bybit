@@ -374,6 +374,46 @@ def __test_bybit_ws_dispatch__():
     asyncio.run(scenario())
 
 
+def __test_bybit_ws_stale_forming_repush_is_dropped__():
+    """A ``confirm: false`` re-push of an already-closed slot never becomes a snapshot.
+
+    Measured live (linear ETHUSDT, 2026-10-05): the venue re-pushed a
+    forming snapshot for the bar it had closed a minute earlier, and later
+    one for a bar nine minutes old. Forwarded, either reaches the core as
+    an intra-bar update under a closed bar's timestamp; the provider drops
+    them at the door and does not take their close as the latest trade.
+    """
+
+    def _push(ts, confirm, close='101'):
+        return {
+            'topic': 'kline.1.BTCUSDT',
+            'data': [{'start': str(ts), 'open': '100', 'high': '102',
+                      'low': '99', 'close': close, 'volume': '3',
+                      'confirm': confirm}],
+        }
+
+    plugin = _FakeRestBybit(symbol='BTCUSDT', timeframe='1')
+    plugin._update_queue = asyncio.Queue()
+    plugin._data_ready = asyncio.Event()
+
+    plugin._on_ws_message(_push(120_000, True, close='100.5'))
+    assert plugin._update_queue.get_nowait().timestamp == 120_000
+    assert plugin._last_price == 100.5
+
+    # The just-closed slot and a much older one: both dropped whole.
+    plugin._on_ws_message(_push(120_000, False, close='107'))
+    plugin._on_ws_message(_push(0, False, close='93'))
+    assert plugin._latest_snapshot is None
+    assert plugin._update_queue.empty()
+    assert plugin._last_price == 100.5
+
+    # The genuinely forming next bar still lands in the snapshot slot.
+    plugin._on_ws_message(_push(180_000, False, close='101.2'))
+    assert plugin._latest_snapshot is not None
+    assert plugin._latest_snapshot.timestamp == 180_000
+    assert plugin._last_price == 101.2
+
+
 def __test_bybit_ws_close_awaits_tasks__():
     """close() cancels AND awaits the loops so none are left pending"""
 
