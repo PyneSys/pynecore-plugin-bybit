@@ -1893,7 +1893,14 @@ class _ExecutionMixin(_BybitBase, ABC):
     async def _cancel_outcome_for(
             self, market: InstrumentInfo, coid: str,
     ) -> CancelDispositionOutcome:
-        """Cancel one order and classify its terminal disposition."""
+        """Cancel one order and classify its terminal disposition.
+
+        Only an answer from the venue yields an outcome: an ambiguous
+        server-side reply is ``UNKNOWN``, while a transport failure (the
+        request never reached the venue or its answer was lost) raises
+        :class:`OrderDispositionUnknownError`, so the sync engine's
+        cancel-retry loop does not count it as a probe the venue answered.
+        """
         try:
             await self._call('/v5/order/cancel', method='post', body={
                 'category': market.category,
@@ -1920,8 +1927,11 @@ class _ExecutionMixin(_BybitBase, ABC):
                     self.store_ctx.close_order(coid)
                 return CancelDispositionOutcome.CANCEL_CONFIRMED
             return CancelDispositionOutcome.UNKNOWN
-        except BybitError:
-            return CancelDispositionOutcome.UNKNOWN
+        except BybitError as e:
+            raise OrderDispositionUnknownError(
+                f"Bybit cancel transport failure for {coid}; disposition unknown",
+                client_order_id=coid, cause=e,
+            ) from e
         if self.store_ctx is not None:
             self.store_ctx.close_order(coid)
         return CancelDispositionOutcome.CANCEL_CONFIRMED

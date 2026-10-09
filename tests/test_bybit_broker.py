@@ -15,9 +15,11 @@ from pynecore.core.broker.exceptions import (
     ClientOrderIdSpentError,
     ExchangeCapabilityError,
     ExchangeOrderRejectedError,
+    OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
 from pynecore.core.broker.models import (
+    CancelDispositionOutcome,
     CancelIntent,
     CapabilityLevel,
     CloseIntent,
@@ -2817,3 +2819,35 @@ def __test_bybit_inverse_coidless_partial_close_anchors_on_its_parent_entry__():
     }, market, coid='', pine_id='L-X', from_entry=None, leg_type=LegType.STOP_LOSS)
     assert event is not None
     assert event.fill_qty == pytest.approx(200 / 78000, rel=1e-12)
+
+
+def _cancel_outcome_envelope() -> DispatchEnvelope:
+    return DispatchEnvelope(
+        intent=CancelIntent(pine_id='Long', symbol='BTCUSDT'), run_tag='t3st',
+        bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+    )
+
+
+def __test_cancel_with_outcome_transport_failure_raises_unknown__():
+    """A cancel the venue never answered is not an UNKNOWN outcome.
+
+    The sync engine's cancel-retry loop counts a returned ``UNKNOWN`` as a
+    probe the venue answered; a refused connection must surface as
+    ``OrderDispositionUnknownError`` instead so the probe is not evidence
+    for the stale-grace halt.
+    """
+    plugin = _FakeBrokerBybit(responses=[BybitConnectionError("connection refused")])
+    plugin._order_identity['coid-long'] = ('Long', None, LegType.ENTRY)
+    with pytest.raises(OrderDispositionUnknownError) as exc:
+        asyncio.run(plugin.execute_cancel_with_outcome(_cancel_outcome_envelope()))
+    assert exc.value.client_order_id == 'coid-long'
+    assert isinstance(exc.value.__cause__, BybitConnectionError)
+    assert plugin.calls[-1][0] == '/v5/order/cancel'
+
+
+def __test_cancel_with_outcome_server_side_failure_stays_unknown__():
+    """An ambiguous server-side reply is a venue answer: UNKNOWN is returned."""
+    plugin = _FakeBrokerBybit(responses=[BybitAPIError("server error", ret_code=10016)])
+    plugin._order_identity['coid-long'] = ('Long', None, LegType.ENTRY)
+    outcome = asyncio.run(plugin.execute_cancel_with_outcome(_cancel_outcome_envelope()))
+    assert outcome is CancelDispositionOutcome.UNKNOWN
