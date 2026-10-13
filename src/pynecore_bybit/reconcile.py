@@ -65,6 +65,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    PENDING_DISPATCH_STATES,
     STATE_DISPOSITION_UNKNOWN,
     find_pending_dispatch,
 )
@@ -72,7 +73,13 @@ from pynecore.core.broker.store_helpers import (
 from ._base import _BybitBase
 from .exceptions import BybitError, traceback_wanted
 from .execution import _DEAD_ORDER_STATUSES
-from .helpers import CATEGORY_SPOT
+from .helpers import (
+    CATEGORY_SPOT,
+    ENTRY_CANCEL_CUM_EXEC_EXTRA,
+    ENTRY_REMAINDER_CANCELLED_EXTRA,
+    EXECUTION_CURSOR_OVERLAP_MS,
+    venue_filled_qty,
+)
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
@@ -107,6 +114,13 @@ _LIVE_ORDER_STATUSES = frozenset({
 #: resolver starts looking it up by ``orderLinkId``. Covers the venue's own
 #: indexing lag of a POST that DID land moments before its reply was lost.
 _PARKED_DISPATCH_GRACE_S = 30.0
+
+#: Age (milliseconds since the persist-first row was written) a confirmed
+#: derivative MARKET entry with an unbooked remainder must reach before its
+#: order truth is looked up (:meth:`_ReconcileMixin._note_unbooked_market_entries`).
+#: By then the private stream and the windowed backfill's overlap re-read
+#: have both had their chance; only a fill neither delivered costs a lookup.
+_MARKET_ENTRY_LOOKUP_GRACE_MS = EXECUTION_CURSOR_OVERLAP_MS
 
 #: Consecutive conclusive not-found lookups (one per reconcile pass) after
 #: which a parked dispatch is judged never to have reached the venue.
@@ -178,6 +192,13 @@ class _ReconcileMixin(_BybitBase, ABC):
                 market = self._market
                 if market is not None and market.category != CATEGORY_SPOT:
                     return {('positions', row.symbol)}
+                return set()
+            if extras.get(ENTRY_REMAINDER_CANCELLED_EXTRA):
+                # Our own cancel retired the working remainder: nothing is
+                # left to vanish. The cancel settlement
+                # (:meth:`_settle_cancelled_entries`) and the per-order fill
+                # recovery own the row until its cursor covers the executed
+                # quantity, when it is tracked as a settled position.
                 return set()
             if kind == ENTRY_KIND_WORKING:
                 ref = row.exchange_order_id or extras.get('order_id')
@@ -358,11 +379,12 @@ class _ReconcileMixin(_BybitBase, ABC):
         the derivative position snapshot shows exposure (``None`` on a
         failed read), and is omitted entirely on spot.
         """
-        order_ids, orders_ok = await self._recovery_open_order_ids(market)
+        open_orders, orders_ok = await self._recovery_open_orders(market)
         present: dict[str, set[str] | None] = {
-            'orders': order_ids if orders_ok else None,
+            'orders': set(open_orders) if orders_ok else None,
         }
         if market.category != CATEGORY_SPOT:
+            self._note_open_order_fill_progress(open_orders)
             if position_rows is None:
                 present['positions'] = None
             else:
@@ -374,6 +396,129 @@ class _ReconcileMixin(_BybitBase, ABC):
                 except BybitError:
                     present['positions'] = None
         return present
+
+    def _note_open_order_fill_progress(self, open_orders: dict[str, Decimal]) -> None:
+        """Note the live rows whose resting order carries unbooked fills.
+
+        A partially filled resting order stays in the open set, so no
+        disappearance confirmation ever looks at it; its ``cumExecQty`` in
+        the open-orders snapshot is the evidence instead.
+
+        :param open_orders: The open-orders snapshot, ``orderId`` →
+            ``cumExecQty`` (wire domain).
+        """
+        if self.store_ctx is None or not open_orders:
+            return
+        for row in list(self.store_ctx.iter_live_orders()):
+            order_id = row.exchange_order_id or ''
+            cum_exec = open_orders.get(order_id)
+            if cum_exec is not None:
+                self._note_unbooked_fills(row, order_id, cum_exec)
+
+    def _note_unbooked_fills(
+            self, row: 'OrderRow', order_id: str, cum_exec: Decimal,
+    ) -> None:
+        """Queue a derivative row for the per-order fill recovery.
+
+        The venue's ``cumExecQty`` is durable evidence that executions exist;
+        a row whose ``filled_qty`` cursor stays below it has a fill the
+        stream dropped and the time-windowed backfill did not reach. The
+        reconcile cadence reads that order's executions by ``orderId`` until
+        the cursor covers the figure (:meth:`_recover_unbooked_order_fills`).
+        Spot stays out: its fills recover through the inventory ledger.
+        """
+        if not order_id or venue_filled_qty(row) >= float(cum_exec) - _FILL_EPS:
+            return
+        self._unbooked_fill_orders[row.client_order_id] = (order_id, cum_exec)
+
+    async def _note_unbooked_market_entries(self, market: 'InstrumentInfo') -> None:
+        """Queue the MARKET entries whose terminal order shows unbooked fills.
+
+        A market entry leaves the open set at once and the disappearance
+        pass never tracks it (:meth:`_tracked_refs`), so neither
+        :meth:`_note_open_order_fill_progress` nor
+        :meth:`_confirm_vanished_order` ever sees its ``cumExecQty``. A
+        confirmed derivative market entry whose cursor still lags its size
+        once :data:`_MARKET_ENTRY_LOOKUP_GRACE_MS` has passed (the stream and
+        the windowed backfill had their chance) is looked up ONCE by
+        ``orderLinkId``: a terminal order queues its unbooked fills through
+        :meth:`_note_unbooked_fills`, a still-live one is re-checked next
+        pass, a transport failure retries. A conclusive not-found ends the
+        checks too — nothing proves a fill. Spot stays out (the inventory
+        ledger owns its fills).
+        """
+        if self.store_ctx is None or market.category == CATEGORY_SPOT:
+            return
+        checked = self._market_entries_checked
+        now_ms = int(epoch_time() * 1000)
+        candidates: set[str] = set()
+        for row in list(self.store_ctx.iter_live_orders(symbol=market.symbol)):
+            if ((row.extras or {}).get('kind') != ENTRY_KIND_POSITION
+                    or (row.extras or {}).get(ENTRY_REMAINDER_CANCELLED_EXTRA)
+                    or row.state in PENDING_DISPATCH_STATES
+                    or row.filled_qty >= row.qty - _FILL_EPS):
+                continue
+            coid = row.client_order_id
+            candidates.add(coid)
+            if (coid in checked or coid in self._unbooked_fill_orders
+                    or now_ms - row.created_ts_ms < _MARKET_ENTRY_LOOKUP_GRACE_MS):
+                continue
+            existing, conclusive = await self._confirm_lookup(market, coid)
+            if not conclusive:
+                continue
+            if existing is None:
+                checked.add(coid)
+                continue
+            if str(existing.get('orderStatus') or '') in _LIVE_ORDER_STATUSES:
+                continue
+            try:
+                cum_exec = Decimal(str(existing.get('cumExecQty') or '0') or '0')
+            except (InvalidOperation, TypeError, ValueError):
+                cum_exec = Decimal(0)
+            order_id = str(existing.get('orderId') or '') or row.exchange_order_id or ''
+            self._note_unbooked_fills(row, order_id, cum_exec)
+            checked.add(coid)
+        checked.intersection_update(candidates)
+
+    async def _settle_cancelled_entries(self, market: 'InstrumentInfo') -> None:
+        """Settle the remainder-cancelled entries whose executed quantity is unknown.
+
+        A REST cancel ACK carries no fill figure, so the entry row stays
+        live and unnormalized (:meth:`_retire_cancelled_row`) until the
+        venue's terminal ``cumExecQty`` arrives. The private ``order`` push
+        normally delivers it; this pass is the backstop for a dropped push:
+        each such row is read once per reconcile pass by ``orderLinkId``
+        (:meth:`_confirm_lookup`), and a terminal order settles it — closed
+        on zero fills, otherwise normalized to the executed quantity with a
+        lagging cursor queued for the per-order fill recovery. A still-live
+        order (the cancel is not processed yet), a not-found order and a
+        transport failure are retried on the next pass.
+        """
+        if self.store_ctx is None:
+            return
+        for row in list(self.store_ctx.iter_live_orders(symbol=market.symbol)):
+            extras = row.extras or {}
+            if (not extras.get(ENTRY_REMAINDER_CANCELLED_EXTRA)
+                    or ENTRY_CANCEL_CUM_EXEC_EXTRA in extras
+                    or row.filled_qty >= row.qty - _FILL_EPS):
+                continue
+            existing, conclusive = await self._confirm_lookup(market, row.client_order_id)
+            if not conclusive or existing is None:
+                continue
+            status = str(existing.get('orderStatus') or '')
+            if status != 'Filled' and status not in _DEAD_ORDER_STATUSES:
+                continue
+            raw = existing.get('cumExecQty')
+            try:
+                cum_exec = float(raw) if raw not in (None, '') else None
+            except (TypeError, ValueError):
+                cum_exec = None
+            if cum_exec is None:
+                continue
+            self._retire_cancelled_row(
+                row.client_order_id, cum_exec,
+                str(existing.get('orderId') or '') or None,
+            )
 
     def _rows_have_exposure(self, position_rows: list[dict]) -> bool:
         """Whether any position row carries a non-zero size."""
@@ -433,11 +578,13 @@ class _ReconcileMixin(_BybitBase, ABC):
           fills) → FILLED with NO fill slice: the false stamp is cleared and
           the row stays live for the PUSH / catch-up path to book the fill
           (this pass never books it, so a stream-gap fill is never
-          double-applied).
+          double-applied). A derivative row whose cursor lags the venue's
+          ``cumExecQty`` is queued for the per-order recovery, which books
+          the missing executions by ``execId``.
         * A found dead order carrying fills (``PartiallyFilledCanceled``:
           the fill is real, the residual was cancelled) → CANCELLED, but
           only once the row's persisted cursor already covers the reported
-          fills — the F4 backfill books the slice on the same cadence, and
+          fills — the per-order recovery books the slice on the same cadence, and
           concluding earlier would retire the row with a stale cursor.
           Until then INCONCLUSIVE, so the stamp is kept and re-checked
           instead of looping a FILLED verdict forever (which would clear
@@ -461,11 +608,14 @@ class _ReconcileMixin(_BybitBase, ABC):
             cum_exec = Decimal(str(existing.get('cumExecQty') or '0') or '0')
         except (InvalidOperation, TypeError, ValueError):
             cum_exec = Decimal(0)
+        if market.category != CATEGORY_SPOT:
+            self._note_unbooked_fills(row, str(existing.get('orderId') or ''), cum_exec)
         if status in _DEAD_ORDER_STATUSES:
-            if cum_exec > 0 and row.filled_qty < float(cum_exec) - _FILL_EPS:
+            if cum_exec > 0 and venue_filled_qty(row) < float(cum_exec) - _FILL_EPS:
                 # The fills are real but the row's cursor has not caught up
-                # (the backfill books them on this same cadence): keep the
-                # stamp and re-check, never retire with a stale cursor.
+                # (the per-order recovery books them on this same cadence):
+                # keep the stamp and re-check, never retire with a stale
+                # cursor.
                 return MissingConfirmation(MissingResolution.INCONCLUSIVE)
             # Zero-fill dead order, or the fills are fully booked: the
             # residual is a genuine cancellation — dual signal + policy.
@@ -598,7 +748,7 @@ class _ReconcileMixin(_BybitBase, ABC):
                 # ALREADY_FILLED / UNKNOWN: the order may have filled or its
                 # cancel is unconfirmed — keep the row live.
                 continue
-            # ``_cancel_outcome_for`` already closed the row on a confirmed
+            # ``_cancel_outcome_for`` already retired the row on a confirmed
             # cancel; record the cascade for the forensic audit.
             self.store_ctx.log_event(
                 'unexpected_cancel_cascade',

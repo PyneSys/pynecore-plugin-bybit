@@ -32,6 +32,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.idempotency import KIND_ENTRY
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
+from pynecore.core.broker.store_helpers import ENTRY_KIND_WORKING
 
 import pynecore_bybit.events as events_module
 from pynecore_bybit import Bybit, BybitConfig
@@ -39,6 +40,8 @@ from pynecore_bybit.exceptions import (
     BybitAPIError, BybitConnectionError, BybitError, traceback_wanted,
 )
 from pynecore_bybit.helpers import (
+    ENTRY_CANCEL_CUM_EXEC_EXTRA,
+    ENTRY_REMAINDER_CANCELLED_EXTRA,
     base_to_contracts,
     contracts_to_base,
     format_decimal,
@@ -1153,6 +1156,198 @@ def __test_bybit_cancel_close_order_idempotent__(tmp_path):
     events = plugin._translate_order_rows(push, market)
     assert len(events) == 1 and events[0].event_type == 'cancelled'
     assert _closed_count() == 1
+
+
+def _partial_entry_plugin(tmp_path, name: str, *, filled: float, responses=None):
+    """Linear plugin with one store-backed working LIMIT entry row."""
+    plugin = _linear_plugin(responses=responses)
+    _attach_store(plugin, tmp_path, name)
+    coid = 'coid-partial'
+    plugin._record_identity(coid, pine_id='Long', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.01)
+    plugin.store_ctx.upsert_order(
+        coid, symbol='BTCUSDT', side='buy', qty=0.01, filled_qty=filled,
+        state='confirmed', pine_entry_id='Long', exchange_order_id='601',
+        extras={'kind': ENTRY_KIND_WORKING, 'order_id': '601'},
+    )
+    return plugin, coid
+
+
+def _entry_cancel_envelope() -> DispatchEnvelope:
+    return DispatchEnvelope(
+        intent=CancelIntent(pine_id='Long', symbol='BTCUSDT'),
+        run_tag='t3st', bar_ts_ms=1_752_600_060_000, coid_max_len=36,
+    )
+
+
+def _execution_push(coid: str, exec_id: str, qty: str) -> dict:
+    return {
+        'topic': 'execution',
+        'data': [{
+            'symbol': 'BTCUSDT', 'execType': 'Trade', 'execId': exec_id,
+            'orderId': '601', 'orderLinkId': coid, 'side': 'Buy',
+            'execQty': qty, 'execPrice': '100000', 'execFee': '0',
+            'execTime': '1752600000500',
+        }],
+    }
+
+
+def __test_bybit_partial_entry_cancel_keeps_the_filled_exposure_owned__(tmp_path):
+    """Cancelling a partially filled entry retires only its unfilled remainder.
+
+    The filled slice is live exposure the entry row owns (hedge-mode run
+    scoping and restart adoption read the live rows), so the row stays live.
+    The REST cancel ACK carries no fill figure: the row keeps its size, so an
+    execution that landed before the cancel but is delivered after it still
+    books into it, and the venue's terminal echo then normalizes the row to
+    the executed quantity — a settled position row.
+    """
+    plugin, coid = _partial_entry_plugin(
+        tmp_path, "partial-cancel", filled=0.004, responses=[{}],
+    )
+    market = plugin._market
+    assert market is not None
+
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is True
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.qty == pytest.approx(0.01)
+    assert row.filled_qty == pytest.approx(0.004)
+    assert (row.extras or {}).get(ENTRY_REMAINDER_CANCELLED_EXTRA) is True
+    assert plugin._tracked_refs(row) == set()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    assert plugin._run_owned_hedge_signed_size() == pytest.approx(0.004)
+
+    events = plugin._translate_executions(
+        _execution_push(coid, 'e-late', '0.001'), market,
+    )
+    assert len(events) == 1 and events[0].fill_qty == pytest.approx(0.001)
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.filled_qty == pytest.approx(0.005)
+
+    events = plugin._translate_order_rows({
+        'topic': 'order',
+        'data': [{'symbol': 'BTCUSDT', 'orderId': '601', 'orderLinkId': coid,
+                  'orderStatus': 'PartiallyFilledCanceled', 'side': 'Buy',
+                  'orderType': 'Limit', 'qty': '0.01', 'cumExecQty': '0.005',
+                  'price': '90000', 'createdTime': '1752600000000'}],
+    }, market)
+    assert len(events) == 1 and events[0].event_type == 'cancelled'
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.qty == pytest.approx(0.005)
+    assert (row.extras or {}).get(ENTRY_CANCEL_CUM_EXEC_EXTRA) == pytest.approx(0.005)
+    assert plugin._tracked_refs(row) == {('positions', 'BTCUSDT')}
+    assert plugin._run_owned_hedge_signed_size() == pytest.approx(0.005)
+
+
+def __test_bybit_entry_cancelled_before_its_first_fill_is_delivered_stays_owned__(
+        tmp_path):
+    """A cancel ACK that races the entry's first execution never drops it.
+
+    The cancel ACK arrives while the row has booked nothing; the venue's
+    terminal push then reports the fill and the execution follows. The row
+    must survive the ACK, take the pushed executed quantity as its size, queue
+    the per-order recovery for the not-yet-booked execution, and own the
+    exposure once the execution books.
+    """
+    plugin, coid = _partial_entry_plugin(
+        tmp_path, "cancel-first-fill", filled=0.0, responses=[{}],
+    )
+    market = plugin._market
+    assert market is not None
+
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is True
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.qty == pytest.approx(0.01)
+
+    plugin._translate_order_rows({
+        'topic': 'order',
+        'data': [{'symbol': 'BTCUSDT', 'orderId': '601', 'orderLinkId': coid,
+                  'orderStatus': 'PartiallyFilledCanceled', 'side': 'Buy',
+                  'orderType': 'Limit', 'qty': '0.01', 'cumExecQty': '0.004',
+                  'price': '90000', 'createdTime': '1752600000000'}],
+    }, market)
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.qty == pytest.approx(0.004)
+    assert row.filled_qty == pytest.approx(0.0)
+    assert plugin._unbooked_fill_orders[coid] == ('601', Decimal('0.004'))
+
+    events = plugin._translate_executions(
+        _execution_push(coid, 'e-first', '0.004'), market,
+    )
+    assert len(events) == 1 and events[0].event_type == 'filled'
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.filled_qty == pytest.approx(0.004)
+    plugin._position_mode = POSITION_MODE_HEDGE
+    assert plugin._run_owned_hedge_signed_size() == pytest.approx(0.004)
+
+
+def __test_bybit_partial_entry_cancel_push_normalizes_to_cum_exec__(tmp_path):
+    """A missed REST ACK: the terminal ``order`` push alone settles the row.
+
+    The push's ``cumExecQty`` is ahead of the booked cursor (an execution not
+    yet delivered), so the row keeps that executed quantity as its size and
+    the pending execution books into it.
+    """
+    plugin, coid = _partial_entry_plugin(tmp_path, "partial-push", filled=0.004)
+    market = plugin._market
+    assert market is not None
+    plugin._translate_order_rows({
+        'topic': 'order',
+        'data': [{'symbol': 'BTCUSDT', 'orderId': '601', 'orderLinkId': coid,
+                  'orderStatus': 'PartiallyFilledCanceled', 'side': 'Buy',
+                  'orderType': 'Limit', 'qty': '0.01', 'cumExecQty': '0.006',
+                  'price': '90000', 'createdTime': '1752600000000'}],
+    }, market)
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.qty == pytest.approx(0.006)
+    assert row.filled_qty == pytest.approx(0.004)
+
+    plugin._translate_executions(_execution_push(coid, 'e-pending', '0.002'), market)
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.filled_qty == pytest.approx(0.006)
+    assert row.qty == pytest.approx(0.006)
+
+
+def __test_bybit_cancel_of_a_filled_entry_keeps_its_row__(tmp_path):
+    """``strategy.cancel`` after the entry filled must not drop its ownership.
+
+    The venue answers order-not-found (the order is done); the fully filled
+    entry row is the position's ownership record and stays live for the
+    flat sweep. A zero-fill entry is retired once the venue's terminal order
+    truth confirms it never executed.
+    """
+    plugin, coid = _partial_entry_plugin(
+        tmp_path, "filled-cancel", filled=0.01,
+        responses=[BybitAPIError("gone", ret_code=170213)],
+    )
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is True
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.qty == pytest.approx(0.01)
+
+    plugin, coid = _partial_entry_plugin(
+        tmp_path, "unfilled-cancel", filled=0.0, responses=[{}],
+    )
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is True
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    plugin._translate_order_rows({
+        'topic': 'order',
+        'data': [{'symbol': 'BTCUSDT', 'orderId': '601', 'orderLinkId': coid,
+                  'orderStatus': 'Cancelled', 'side': 'Buy',
+                  'orderType': 'Limit', 'qty': '0.01', 'cumExecQty': '0',
+                  'price': '90000', 'createdTime': '1752600000000'}],
+    }, plugin._market)
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is not None
 
 
 def __test_bybit_spot_port_min_sellable_floor__():

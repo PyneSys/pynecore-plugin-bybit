@@ -235,7 +235,9 @@ def __test_reappearance_clears_stamp__(tmp_path):
 
 def __test_sibling_sweep_skips_filled_exposure__(tmp_path):
     # The zero-fill sibling sweep cancels resting siblings but LEAVES a
-    # settled position row (live exposure) for the operator.
+    # settled position row (live exposure) for the operator. The cancelled
+    # sibling's row is retired once the venue confirms it never executed (a
+    # fill may race the cancel ACK, which carries no fill figure).
     broker = _DisappearanceFake(market=_linear_instrument())
     _open(tmp_path, broker)
     _seed(broker, 'orig', exchange_order_id='oo')
@@ -244,6 +246,10 @@ def __test_sibling_sweep_skips_filled_exposure__(tmp_path):
     _seed(broker, 'sr', kind=ENTRY_KIND_WORKING, exchange_order_id='osr')  # resting
     origin = broker.store_ctx.get_order('orig')
     asyncio.run(broker._cancel_sibling_working_orders(origin))
+    assert [e for e, _ in broker.calls].count('/v5/order/cancel') == 1  # 'sr' only
+    assert 'sr' in _live_coids(broker)                # awaiting the fill settlement
+    broker.history_by_coid['sr'] = _order(order_id='osr', coid='sr', status='Cancelled')
+    asyncio.run(broker._settle_cancelled_entries(broker._market))
     live = _live_coids(broker)
     assert 'sf' in live                               # filled sibling kept
     assert 'sr' not in live                           # zero-fill sibling swept

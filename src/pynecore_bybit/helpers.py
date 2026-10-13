@@ -10,6 +10,10 @@ import re
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from hashlib import sha256
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pynecore.core.broker.storage import OrderRow
 
 # TradingView timeframe -> Bybit kline ``interval`` value. Bybit v5 serves
 # minute intervals as plain numbers plus D/W/M; there is no 45-minute or
@@ -106,6 +110,28 @@ EXECUTION_CURSOR_OVERLAP_MS: int = 60_000
 # span cap) up to the present, so even a GTC order that filled long after
 # its creation has every ``execId`` collected.
 EXECUTION_SINCE_SKEW_MS: int = 60_000
+
+# Row ``extras`` key holding the wire-domain quantity this run's reducing
+# fills (and the startup adoption clamp) netted out of an entry row. Netting
+# lowers ``qty`` and ``filled_qty`` together: ``filled_qty`` stays the OWNED
+# exposure and ``qty - filled_qty`` the working order's unfilled remainder,
+# so a later execution of a still-working entry is booked, not dropped as
+# already covered. Adding the offset back to ``filled_qty`` restores the
+# venue order's cumulative executed quantity (:func:`venue_filled_qty`).
+ENTRY_NETTED_QTY_EXTRA: str = 'netted_qty'
+
+# Row ``extras`` flag of an entry row whose unfilled remainder was cancelled.
+# The row has no working order left, so it is never tracked as one; it stays
+# live and owns whatever the order executed until the venue's terminal order
+# truth settles it (:data:`ENTRY_CANCEL_CUM_EXEC_EXTRA`).
+ENTRY_REMAINDER_CANCELLED_EXTRA: str = 'remainder_cancelled'
+
+# Row ``extras`` key of a remainder-cancelled entry: the venue's terminal
+# ``cumExecQty`` (wire domain) the row's ``qty`` was normalized to. Absent
+# while the executed quantity is unconfirmed (a REST cancel ACK carries no
+# fill figure, and an execution may still be undelivered); the reconcile
+# cadence then reads the order by ``orderLinkId`` until it is settled.
+ENTRY_CANCEL_CUM_EXEC_EXTRA: str = 'cancel_cum_exec'
 
 # ``GET /v5/order/realtime`` page size (server maximum for one page).
 OPEN_ORDERS_PAGE_LIMIT: int = 50
@@ -312,3 +338,23 @@ def bar_close_ts(bar_start: int, interval: str) -> int:
     :return: Epoch milliseconds at which the bar closes (== next bar's open).
     """
     return add_interval(bar_start, interval, 1)
+
+
+def venue_filled_qty(row: 'OrderRow') -> float:
+    """The venue-domain fill cursor of a store row.
+
+    The row's ``filled_qty`` plus the quantity netted out of it
+    (:data:`ENTRY_NETTED_QTY_EXTRA`) — the figure comparable with the venue
+    order's ``cumExecQty`` or its summed ``execQty``. Equal to
+    ``filled_qty`` for a row nothing was netted from.
+
+    :param row: The store row.
+    :return: The order's cumulative executed quantity this run has booked
+        (wire domain).
+    """
+    raw = (row.extras or {}).get(ENTRY_NETTED_QTY_EXTRA)
+    try:
+        netted = float(raw) if raw is not None else 0.0
+    except (TypeError, ValueError):
+        netted = 0.0
+    return float(row.filled_qty) + netted

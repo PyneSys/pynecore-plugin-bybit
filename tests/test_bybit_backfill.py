@@ -6,13 +6,19 @@ import logging
 import time
 from decimal import Decimal
 
+from pynecore.core.broker import storage
+from pynecore.core.broker.disappearance import MissingResolution
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
-from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION
+from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, ENTRY_KIND_WORKING
 
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import BybitAPIError, BybitConnectionError
-from pynecore_bybit.helpers import EXECUTION_WINDOW_MS
+from pynecore_bybit.helpers import (
+    ENTRY_CANCEL_CUM_EXEC_EXTRA,
+    EXECUTION_WINDOW_MS,
+    venue_filled_qty,
+)
 from pynecore_bybit.models import InstrumentInfo
 
 
@@ -70,6 +76,8 @@ class _BackfillFake(Bybit):
         self.fail_once = fail_once
         self.exec_calls: list = []
         self._exec_failures = 0
+        self.orders: list[dict] = []
+        self.lookups: list[str] = []
 
     def __call__(self, endpoint, params=None, *, method='get', body=None, auth=False):
         params = dict(params or {})
@@ -84,11 +92,24 @@ class _BackfillFake(Bybit):
                 raise BybitAPIError(
                     "startTime/endTime exceeds 7 days", ret_code=10001,
                 )
+            order_id = params.get('orderId')
             rows = [
                 row for row in self.executions
                 if start <= int(row.get('execTime') or 0) <= end
+                and (order_id is None or row.get('orderId') == order_id)
             ]
             rows.sort(key=lambda r: int(r.get('execTime') or 0), reverse=True)
+            return {'list': rows, 'nextPageCursor': ''}
+        if endpoint in ('/v5/order/realtime', '/v5/order/history'):
+            live = endpoint == '/v5/order/realtime'
+            link_id = params.get('orderLinkId')
+            if link_id is not None and live:
+                self.lookups.append(link_id)
+            rows = [
+                row for row in self.orders
+                if (row['orderStatus'] in ('New', 'PartiallyFilled')) == live
+                and (link_id is None or row['orderLinkId'] == link_id)
+            ]
             return {'list': rows, 'nextPageCursor': ''}
         raise AssertionError(f"unexpected REST endpoint {endpoint} {params}")
 
@@ -420,3 +441,321 @@ def __test_unexpected_spot_reconcile_failure_keeps_the_traceback__(tmp_path, cap
     records = _records_containing(caplog, 'spot inventory reconcile pass failed')
     assert len(records) == 1
     assert records[0].exc_info
+
+
+# === Late-indexed execution: recovered per order, never by the window ======
+
+def _seed_created_at(monkeypatch, broker, coid, created_ms: int, **kwargs) -> None:
+    """Seed a row whose dispatch lies ``created_ms`` in the past."""
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, '_now_ms', lambda: created_ms)
+        _seed(broker, coid, **kwargs)
+
+
+def _venue_order(coid: str, *, status: str, cum_exec: str) -> dict:
+    return {'orderId': f"x-{coid}", 'orderLinkId': coid, 'orderStatus': status,
+            'cumExecQty': cum_exec}
+
+
+def __test_fill_indexed_after_the_window_overlap_is_recovered_per_order__(
+        tmp_path, monkeypatch):
+    """A fill the venue indexes later than the read overlap is still booked.
+
+    The windowed backfill re-reads only ``EXECUTION_CURSOR_OVERLAP_MS`` behind
+    its watermark: an execution the stream dropped and the venue indexes later
+    than that is never returned by it. The vanished order's ``cumExecQty`` is
+    the proof the execution exists; the per-order read by ``orderId`` books it
+    once, whatever the watermark says.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_created_at(monkeypatch, broker, 'c1', now - 600_000, qty=0.01)
+    broker._deriv_exec_watermark = now - 120_000
+    assert _backfill(broker) == []
+
+    # The venue indexes the execution only now, five minutes after it ran.
+    broker.executions.append(_exec(exec_id='e1', order_id='x-c1', coid='c1',
+                                   qty=0.01, price=30000, ts_ms=now - 300_000,
+                                   symbol='BTCUSDT'))
+    assert _backfill(broker) == [], "the window cannot reach the late execution"
+
+    broker.orders.append(_venue_order('c1', status='Filled', cum_exec='0.01'))
+    row = broker.store_ctx.get_order('c1')
+    verdict = asyncio.run(broker._confirm_vanished_order(broker._market, row))
+    assert verdict.resolution is MissingResolution.FILLED
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [e.fill_id for e in events] == ['e1']
+    assert events[0].event_type == 'filled'
+    assert broker.store_ctx.get_order('c1').filled_qty == 0.01
+    assert broker._unbooked_fill_orders == {}
+    assert asyncio.run(broker._recover_unbooked_order_fills(broker._market)) == []
+
+
+def __test_unindexed_execution_stays_queued_until_the_venue_lists_it__(
+        tmp_path, monkeypatch):
+    """Proof of a fill the execution list does not show yet is kept, not dropped."""
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_created_at(monkeypatch, broker, 'c2', now - 600_000, qty=0.01)
+    broker.orders.append(_venue_order('c2', status='Filled', cum_exec='0.01'))
+    row = broker.store_ctx.get_order('c2')
+    asyncio.run(broker._confirm_vanished_order(broker._market, row))
+
+    assert asyncio.run(broker._recover_unbooked_order_fills(broker._market)) == []
+    assert 'c2' in broker._unbooked_fill_orders
+
+    broker.executions.append(_exec(exec_id='e2', order_id='x-c2', coid='c2',
+                                   qty=0.01, price=30000, ts_ms=now - 200_000,
+                                   symbol='BTCUSDT'))
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [e.fill_id for e in events] == ['e2']
+    assert broker._unbooked_fill_orders == {}
+
+
+def __test_resting_order_partial_fill_is_recovered_from_the_open_orders_snapshot__(
+        tmp_path, monkeypatch):
+    """A partially filled resting order never vanishes; its snapshot is the proof."""
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_created_at(monkeypatch, broker, 'c3', now - 600_000, qty=0.01)
+    broker.executions.append(_exec(exec_id='e3', order_id='x-c3', coid='c3',
+                                   qty=0.004, price=30000, ts_ms=now - 300_000,
+                                   symbol='BTCUSDT'))
+    broker.orders.append(_venue_order('c3', status='PartiallyFilled', cum_exec='0.004'))
+
+    present = asyncio.run(broker._disappearance_present(broker._market, []))
+    assert present['orders'] == {'x-c3'}
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [e.fill_id for e in events] == ['e3']
+    assert events[0].event_type == 'partial'
+    assert broker.store_ctx.get_order('c3').filled_qty == 0.004
+    assert broker._unbooked_fill_orders == {}
+
+    # The WS already delivered the fill: nothing is queued, nothing is read.
+    calls = len(broker.exec_calls)
+    asyncio.run(broker._disappearance_present(broker._market, []))
+    assert asyncio.run(broker._recover_unbooked_order_fills(broker._market)) == []
+    assert len(broker.exec_calls) == calls
+
+
+def __test_per_order_recovery_waits_for_the_adoption_baseline__(tmp_path, monkeypatch):
+    """No per-order fill escapes before the adoption baseline has latched.
+
+    The baseline may be folding the very same execution into the adopted
+    position; the queue is kept and drained once the barrier lifts.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    _seed_created_at(monkeypatch, broker, 'c4', now - 600_000, qty=0.01)
+    broker.executions.append(_exec(exec_id='e4', order_id='x-c4', coid='c4',
+                                   qty=0.01, price=30000, ts_ms=now - 300_000,
+                                   symbol='BTCUSDT'))
+    broker.orders.append(_venue_order('c4', status='Filled', cum_exec='0.01'))
+    row = broker.store_ctx.get_order('c4')
+    asyncio.run(broker._confirm_vanished_order(broker._market, row))
+
+    calls = len(broker.exec_calls)
+    assert asyncio.run(broker._recover_unbooked_order_fills(broker._market)) == []
+    assert len(broker.exec_calls) == calls
+    assert 'c4' in broker._unbooked_fill_orders
+
+    broker._adoption_baselined = True
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [e.fill_id for e in events] == ['e4']
+    assert broker._unbooked_fill_orders == {}
+
+
+def __test_market_entry_fill_indexed_late_is_recovered__(tmp_path, monkeypatch):
+    """A market entry never tracked by disappearance still gets its late fill.
+
+    It leaves the open set at once, so only its terminal order truth, read
+    once by ``orderLinkId`` after the grace, can prove the fill.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_created_at(monkeypatch, broker, 'm1', now - 600_000, qty=0.01)
+    broker._deriv_exec_watermark = now - 120_000
+    broker.executions.append(_exec(exec_id='em1', order_id='x-m1', coid='m1',
+                                   qty=0.01, price=30000, ts_ms=now - 300_000,
+                                   symbol='BTCUSDT'))
+    assert _backfill(broker) == [], "the window cannot reach the late execution"
+    broker.orders.append(_venue_order('m1', status='Filled', cum_exec='0.01'))
+
+    asyncio.run(broker._note_unbooked_market_entries(broker._market))
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [e.fill_id for e in events] == ['em1']
+    assert events[0].event_type == 'filled'
+    assert broker.store_ctx.get_order('m1').filled_qty == 0.01
+    assert broker._unbooked_fill_orders == {}
+
+
+def __test_market_entry_order_truth_is_read_once__(tmp_path, monkeypatch):
+    """A residual-cancelled market entry is looked up once, a fresh one not yet."""
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_created_at(monkeypatch, broker, 'm2', now - 600_000, qty=0.01, filled=0.004)
+    _seed(broker, 'm3', qty=0.01)
+    broker.orders.append(_venue_order('m2', status='PartiallyFilledCanceled',
+                                      cum_exec='0.004'))
+
+    asyncio.run(broker._note_unbooked_market_entries(broker._market))
+    asyncio.run(broker._note_unbooked_market_entries(broker._market))
+    assert broker.lookups == ['m2']
+    assert broker._unbooked_fill_orders == {}
+
+
+def __test_netted_working_entry_still_books_its_later_executions__(
+        tmp_path, monkeypatch):
+    """A reducing fill on a partially filled working entry keeps its cursor whole.
+
+    Netting lowers the owned exposure but keeps the working remainder, so a
+    later execution of the still-resting order is booked, and the venue
+    cursor (owned + netted) stays comparable with its ``cumExecQty``.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_created_at(monkeypatch, broker, 'w1', now - 600_000, qty=0.01, filled=0.004,
+                     extras={'kind': ENTRY_KIND_WORKING, 'order_type': 'limit'})
+    broker._seen_exec_ids.add('ew1a')
+    broker._reduce_entry_ownership('sell', 0.002)
+    row = broker.store_ctx.get_order('w1')
+    assert row.closed_ts_ms is None
+    assert abs(row.qty - 0.008) < 1e-12
+    assert abs(row.filled_qty - 0.002) < 1e-12
+    assert abs(venue_filled_qty(row) - 0.004) < 1e-12
+
+    broker.executions.append(_exec(exec_id='ew1a', order_id='x-w1', coid='w1',
+                                   qty=0.004, price=30000, ts_ms=now - 500_000,
+                                   symbol='BTCUSDT'))
+    broker.executions.append(_exec(exec_id='ew1b', order_id='x-w1', coid='w1',
+                                   qty=0.003, price=30000, ts_ms=now - 300_000,
+                                   symbol='BTCUSDT'))
+    broker.orders.append(_venue_order('w1', status='PartiallyFilled', cum_exec='0.007'))
+    asyncio.run(broker._disappearance_present(broker._market, []))
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [e.fill_id for e in events] == ['ew1b']
+    assert events[0].event_type == 'partial'
+    row = broker.store_ctx.get_order('w1')
+    assert abs(row.filled_qty - 0.005) < 1e-12
+    assert abs(venue_filled_qty(row) - 0.007) < 1e-12
+    assert broker._unbooked_fill_orders == {}
+
+    calls = len(broker.exec_calls)
+    asyncio.run(broker._disappearance_present(broker._market, []))
+    assert asyncio.run(broker._recover_unbooked_order_fills(broker._market)) == []
+    assert len(broker.exec_calls) == calls
+
+
+# === Remainder-cancelled entries: late fills and the cancel settlement =====
+
+def _seed_cancelled_working_entry(monkeypatch, broker, coid, *, created_ms: int,
+                                  filled: float) -> None:
+    """Seed a 0.01 working LIMIT entry and apply its REST cancel ACK."""
+    _seed_created_at(monkeypatch, broker, coid, created_ms, qty=0.01, filled=filled,
+                     extras={'kind': ENTRY_KIND_WORKING, 'order_type': 'limit'})
+    broker._retire_cancelled_row(coid)
+
+
+def __test_cancel_ack_leaves_room_for_a_late_fill_in_the_windowed_backfill__(
+        tmp_path, monkeypatch):
+    """An execution undelivered at the cancel ACK is still booked by the backfill.
+
+    The ACK carries no fill figure, so the row keeps its size: the backfill's
+    full-row barrier must not treat the booked cursor as complete and swallow
+    the missed execution.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_cancelled_working_entry(monkeypatch, broker, 'k1',
+                                  created_ms=now - 600_000, filled=0.004)
+    broker._seen_exec_ids.add('ek1a')
+    broker._deriv_exec_watermark = now - 120_000
+    broker.executions.append(_exec(exec_id='ek1a', order_id='x-k1', coid='k1',
+                                   qty=0.004, price=30000, ts_ms=now - 90_000,
+                                   symbol='BTCUSDT'))
+    broker.executions.append(_exec(exec_id='ek1b', order_id='x-k1', coid='k1',
+                                   qty=0.001, price=30000, ts_ms=now - 60_000,
+                                   symbol='BTCUSDT'))
+    events = _backfill(broker)
+    assert [e.fill_id for e in events] == ['ek1b']
+    row = broker.store_ctx.get_order('k1')
+    assert row.closed_ts_ms is None
+    assert abs(row.filled_qty - 0.005) < 1e-12
+
+
+def __test_cancel_settlement_reads_the_order_and_queues_its_missing_fill__(
+        tmp_path, monkeypatch):
+    """A dropped terminal push: the reconcile cadence settles the cancelled entry.
+
+    The order is read by ``orderLinkId`` once; its ``cumExecQty`` sizes the
+    row and queues the per-order recovery for the execution the window never
+    returns, after which the row is a settled position.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_cancelled_working_entry(monkeypatch, broker, 'k2',
+                                  created_ms=now - 600_000, filled=0.004)
+    assert broker._tracked_refs(broker.store_ctx.get_order('k2')) == set()
+    broker._seen_exec_ids.add('ek2a')
+    broker.executions.append(_exec(exec_id='ek2a', order_id='x-k2', coid='k2',
+                                   qty=0.004, price=30000, ts_ms=now - 500_000,
+                                   symbol='BTCUSDT'))
+    broker.executions.append(_exec(exec_id='ek2b', order_id='x-k2', coid='k2',
+                                   qty=0.002, price=30000, ts_ms=now - 400_000,
+                                   symbol='BTCUSDT'))
+    broker.orders.append(_venue_order('k2', status='PartiallyFilledCanceled',
+                                      cum_exec='0.006'))
+
+    asyncio.run(broker._settle_cancelled_entries(broker._market))
+    row = broker.store_ctx.get_order('k2')
+    assert row.closed_ts_ms is None
+    assert abs(row.qty - 0.006) < 1e-12
+    assert row.extras[ENTRY_CANCEL_CUM_EXEC_EXTRA] == 0.006
+    assert broker._unbooked_fill_orders['k2'] == ('x-k2', Decimal('0.006'))
+
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [e.fill_id for e in events] == ['ek2b']
+    row = broker.store_ctx.get_order('k2')
+    assert abs(row.filled_qty - 0.006) < 1e-12
+    assert broker._tracked_refs(row) == {('positions', 'BTCUSDT')}
+
+    lookups = len(broker.lookups)
+    asyncio.run(broker._settle_cancelled_entries(broker._market))
+    assert len(broker.lookups) == lookups
+
+
+def __test_cancel_settlement_retires_an_entry_that_never_executed__(
+        tmp_path, monkeypatch):
+    """A zero-fill cancelled entry is closed once the venue confirms no fill."""
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    _seed_cancelled_working_entry(monkeypatch, broker, 'k3',
+                                  created_ms=now - 600_000, filled=0.0)
+    assert broker.store_ctx.get_order('k3').closed_ts_ms is None
+
+    broker.orders.append(_venue_order('k3', status='New', cum_exec='0'))
+    asyncio.run(broker._settle_cancelled_entries(broker._market))
+    assert broker.store_ctx.get_order('k3').closed_ts_ms is None, \
+        "a still-live order is re-checked, never concluded"
+
+    broker.orders[0]['orderStatus'] = 'Cancelled'
+    asyncio.run(broker._settle_cancelled_entries(broker._market))
+    assert broker.store_ctx.get_order('k3').closed_ts_ms is not None

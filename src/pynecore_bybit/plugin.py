@@ -131,6 +131,8 @@ class Bybit(
         self._order_identity = {}
         self._seen_exec_ids = set()
         self._parked_lookup_misses = {}
+        self._unbooked_fill_orders = {}
+        self._market_entries_checked = set()
         self._created_order_ids = set()
         self._dispatch_qty = {}
         self._filled_cum = {}

@@ -1714,8 +1714,10 @@ class _ExecutionMixin(_BybitBase, ABC):
         cancelled_any = True
         for coid in self._live_coids_for_cancel(intent):
             if await self._cancel_by_coid(market, coid):
-                if self.store_ctx is not None:
-                    self.store_ctx.close_order(coid)
+                # Only the unfilled remainder is gone. The ACK carries no
+                # fill figure, so an entry row stays live until the venue's
+                # terminal order truth settles what it executed.
+                self._retire_cancelled_row(coid)
             else:
                 cancelled_any = False
         # A trading-stop-attached exit has no venue order to cancel — its
@@ -1923,8 +1925,14 @@ class _ExecutionMixin(_BybitBase, ABC):
             if status == 'Filled':
                 return CancelDispositionOutcome.ALREADY_FILLED
             if status in _DEAD_ORDER_STATUSES:
-                if self.store_ctx is not None:
-                    self.store_ctx.close_order(coid)
+                try:
+                    cum_exec: float | None = float(
+                        (existing or {}).get('cumExecQty') or 0.0)
+                except (TypeError, ValueError):
+                    cum_exec = None
+                self._retire_cancelled_row(
+                    coid, cum_exec, str((existing or {}).get('orderId') or '') or None,
+                )
                 return CancelDispositionOutcome.CANCEL_CONFIRMED
             return CancelDispositionOutcome.UNKNOWN
         except BybitError as e:
@@ -1932,8 +1940,7 @@ class _ExecutionMixin(_BybitBase, ABC):
                 f"Bybit cancel transport failure for {coid}; disposition unknown",
                 client_order_id=coid, cause=e,
             ) from e
-        if self.store_ctx is not None:
-            self.store_ctx.close_order(coid)
+        self._retire_cancelled_row(coid)
         return CancelDispositionOutcome.CANCEL_CONFIRMED
 
     @override

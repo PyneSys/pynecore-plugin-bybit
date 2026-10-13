@@ -73,19 +73,24 @@ from ._base import _BybitBase
 from .exceptions import BybitError, traceback_wanted
 from .helpers import (
     CATEGORY_SPOT,
+    ENTRY_CANCEL_CUM_EXEC_EXTRA,
+    ENTRY_NETTED_QTY_EXTRA,
+    ENTRY_REMAINDER_CANCELLED_EXTRA,
     EXECUTION_CURSOR_OVERLAP_MS,
     EXECUTION_PAGE_LIMIT,
+    EXECUTION_SINCE_SKEW_MS,
     EXECUTION_WINDOW_MS,
     PRIVATE_WS_BACKOFF_S,
     PRIVATE_WS_TOPIC_POSITION,
     PRIVATE_WS_TOPICS,
     RECONCILE_CADENCE_S,
+    venue_filled_qty,
 )
 from .state import parse_exchange_order
 from .ws import BybitWebSocket
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.storage import SpotExecutionRow
+    from pynecore.core.broker.storage import OrderRow, SpotExecutionRow
 
     from .models import InstrumentInfo
 
@@ -120,6 +125,18 @@ _CANCEL_TYPE_REASONS = {
 #: quantity — the quantities themselves come from exact decimal strings,
 #: the slack only absorbs the float round-trip.
 _FILL_EPS = 1e-9
+
+
+def _cum_exec_qty(entry: dict) -> float | None:
+    """The ``cumExecQty`` of one venue order object, ``None`` when absent or unparsable."""
+    raw = entry.get('cumExecQty')
+    if raw is None or raw == '':
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
 
 #: Server pages drained per backfill window before the read is declared
 #: inconclusive — mirrors the spot inventory port's page cap (200 pages x
@@ -717,11 +734,13 @@ class _EventStreamMixin(_BybitBase, ABC):
         every reducing fill keeps the rows truthful in all modes; quantities
         are wire-domain on both sides, so no anchor conversion is involved.
 
-        Consume the opposite-side entry rows FIFO. A partial reduction shrinks
-        the row to its residual owned quantity; a full reduction retires only
-        that physical row. It deliberately does not complete the shared intent
-        key because a same-ID reversal may already own a fresh residual entry
-        envelope under that key.
+        Consume the opposite-side entry rows FIFO through
+        :meth:`_net_entry_row`: a partial reduction lowers the owned quantity
+        (a still-working entry keeps its unfilled remainder), a full
+        reduction of a settled row retires only that physical row. It
+        deliberately does not complete the shared intent key because a
+        same-ID reversal may already own a fresh residual entry envelope
+        under that key.
         """
         if self.store_ctx is None or qty <= 0.0:
             return
@@ -741,16 +760,110 @@ class _EventStreamMixin(_BybitBase, ABC):
             if remaining <= _FILL_EPS:
                 break
             consumed = min(remaining, row.filled_qty)
-            residual = row.filled_qty - consumed
-            if residual <= _FILL_EPS:
-                self.store_ctx.close_order(row.client_order_id)
-            else:
-                self.store_ctx.upsert_order(
-                    row.client_order_id,
-                    qty=residual,
-                    filled_qty=residual,
-                )
+            self._net_entry_row(row, consumed)
             remaining -= consumed
+
+    def _net_entry_row(self, row: 'OrderRow', consumed: float) -> None:
+        """Net ``consumed`` owned exposure out of one entry row.
+
+        ``qty`` and ``filled_qty`` drop together, so ``filled_qty`` stays the
+        owned exposure while ``qty - filled_qty`` keeps a still-working
+        order's unfilled remainder: its later executions are booked instead
+        of being skipped as already covered. The cumulative netted quantity
+        is recorded under :data:`ENTRY_NETTED_QTY_EXTRA`, from which
+        :func:`venue_filled_qty` restores the venue-domain cursor that
+        comparisons against the order's ``cumExecQty`` need. A row left with
+        neither owned exposure nor a working remainder is retired (only the
+        physical row — see :meth:`_reduce_entry_ownership`).
+
+        :param row: The live entry row.
+        :param consumed: The owned quantity to net out (wire domain, at most
+            ``row.filled_qty``).
+        """
+        if self.store_ctx is None or consumed <= 0.0:
+            return
+        qty = row.qty - consumed
+        if qty <= _FILL_EPS:
+            self.store_ctx.close_order(row.client_order_id)
+            return
+        extras = dict(row.extras or {})
+        extras[ENTRY_NETTED_QTY_EXTRA] = (
+            venue_filled_qty(row) - row.filled_qty + consumed
+        )
+        self.store_ctx.upsert_order(
+            row.client_order_id,
+            qty=qty,
+            filled_qty=max(0.0, row.filled_qty - consumed),
+            extras=extras,
+        )
+
+    def _retire_cancelled_row(
+            self, coid: str, venue_cum_exec: float | None = None,
+            order_id: str | None = None,
+    ) -> None:
+        """Retire the row of a cancelled order, keeping an entry's exposure owned.
+
+        A cancel ends only the order's unfilled remainder. An entry row that
+        executed anything still carries live exposure, and entry rows own
+        that exposure for the lifetime of the position: hedge-mode run
+        scoping and restart adoption read the live rows' fill cursors, and
+        the flat sweep (:meth:`_close_entry_rows_when_flat`) retires them.
+        Every other row (exit / close legs) is closed at once.
+
+        An entry row is flagged :data:`ENTRY_REMAINDER_CANCELLED_EXTRA` and
+        settled from the venue's terminal ``cumExecQty``:
+
+        * Unknown (a REST cancel ACK): an execution may have landed before
+          the cancel and still be undelivered, so the row is neither
+          normalized nor closed — its ``qty`` keeps room for that execution
+          and the fill paths book it as usual. The private ``order`` push or
+          the reconcile cadence (:meth:`_settle_cancelled_entries`) supplies
+          the figure.
+        * Zero: the entry never executed — the row is closed.
+        * Positive: ``qty`` is normalized to the executed quantity (net of
+          the exposure reducing fills consumed) — a settled position row once
+          its cursor covers it, the same normalization the adoption baseline
+          applies to a dead partially filled entry — and a cursor lagging
+          the figure queues the per-order fill recovery.
+
+        Idempotent, and a no-op for an unknown or already closed row, so a
+        REST cancel ACK and the venue's terminal ``order`` echo can both
+        call it in either order.
+
+        :param coid: The cancelled order's ``orderLinkId``.
+        :param venue_cum_exec: The venue order's terminal ``cumExecQty``
+            (wire domain), ``None`` when the caller does not hold it.
+        :param order_id: The venue ``orderId``, for the per-order fill
+            recovery; the row's recorded order id when omitted.
+        """
+        if self.store_ctx is None:
+            return
+        row = self.store_ctx.get_order(coid)
+        if row is None or row.closed_ts_ms is not None:
+            return
+        extras = dict(row.extras or {})
+        if extras.get('kind') not in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING):
+            self.store_ctx.close_order(coid)
+            return
+        if venue_cum_exec is None:
+            if not extras.get(ENTRY_REMAINDER_CANCELLED_EXTRA):
+                extras[ENTRY_REMAINDER_CANCELLED_EXTRA] = True
+                self.store_ctx.upsert_order(coid, extras=extras)
+            return
+        # ``cumExecQty`` is venue-domain; the row is net of the exposure
+        # reducing fills consumed from it.
+        netted = venue_filled_qty(row) - row.filled_qty
+        executed = max(float(row.filled_qty), venue_cum_exec - netted)
+        if executed <= _FILL_EPS:
+            self.store_ctx.close_order(coid)
+            return
+        extras[ENTRY_REMAINDER_CANCELLED_EXTRA] = True
+        extras[ENTRY_CANCEL_CUM_EXEC_EXTRA] = venue_cum_exec
+        self.store_ctx.upsert_order(coid, qty=executed, extras=extras)
+        market = self._market
+        ref = order_id or row.exchange_order_id or str(extras.get('order_id') or '')
+        if market is not None and market.category != CATEGORY_SPOT and ref:
+            self._note_unbooked_fills(row, ref, Decimal(str(venue_cum_exec)))
 
     def _fill_event(
             self, entry: dict, market: 'InstrumentInfo', *,
@@ -796,8 +909,11 @@ class _EventStreamMixin(_BybitBase, ABC):
             self.store_ctx.record_unpark(coid)
             row = self.store_ctx.get_order(coid)
             if row is not None:
+                # The in-memory running sum is venue-domain; the row's
+                # cursor is net of the exposure reducing fills consumed.
+                netted = venue_filled_qty(row) - row.filled_qty
                 total_qty = row.qty
-                cumulative = max(cumulative, row.filled_qty + exec_qty)
+                cumulative = max(cumulative - netted, row.filled_qty + exec_qty)
                 self.store_ctx.set_filled(coid, min(total_qty, cumulative))
         is_full = cumulative >= total_qty - _FILL_EPS
         fill_qty = exec_qty
@@ -934,15 +1050,16 @@ class _EventStreamMixin(_BybitBase, ABC):
                 # terminal cancel / reject is done — drop its engine park
                 # alongside the store row (``record_unpark`` is idempotent).
                 self.store_ctx.record_unpark(coid)
-                # The REST cancel ACK closes the row synchronously; the venue
+                # The REST cancel ACK retires the row synchronously; the venue
                 # then echoes the same terminal transition on this private
-                # ``order`` push. ``close_order`` appends an ``order_closed``
-                # audit event every call, so re-closing an already-closed row
-                # would duplicate the terminal audit trail — only close a row
-                # that is still live.
-                row = self.store_ctx.get_order(coid)
-                if row is not None and row.closed_ts_ms is None:
-                    self.store_ctx.close_order(coid)
+                # ``order`` push. The retire is a no-op on an already closed
+                # row (``close_order`` appends an ``order_closed`` audit event
+                # every call), and the push's ``cumExecQty`` refines the
+                # executed quantity a kept entry row owns.
+                self._retire_cancelled_row(
+                    coid, _cum_exec_qty(entry),
+                    str(entry.get('orderId') or '') or None,
+                )
             order = parse_exchange_order(entry)
             if market.is_inverse:
                 order = self._inverse_order_to_base(order)
@@ -980,9 +1097,12 @@ class _EventStreamMixin(_BybitBase, ABC):
         execution backfill is the cadence safety net for the reconnect
         catch-up: a disappearance FILLED verdict deliberately books no fill
         slice (:meth:`_confirm_vanished_order`) and relies on this pass to
-        deliver the missed fill event.
+        deliver the missed fill event — through the time-windowed backfill,
+        or the per-order recovery once the venue's ``cumExecQty`` proves an
+        execution the window did not return.
         """
         await self._resolve_parked_dispatches(market)
+        await self._settle_cancelled_entries(market)
         rows: list[dict] | None
         try:
             rows = await self._fetch_position_rows(market)
@@ -996,7 +1116,9 @@ class _EventStreamMixin(_BybitBase, ABC):
             self._ingest_position_sizes(rows)
             self._close_entry_rows_when_flat(market)
         events = await self._reconcile_disappearance(market, rows)
+        await self._note_unbooked_market_entries(market)
         events.extend(await self._run_deriv_fill_backfill(market))
+        events.extend(await self._recover_unbooked_order_fills(market))
         return events
 
     async def _run_spot_reconcile(
@@ -1009,6 +1131,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         propagates so the engine performs its graceful stop.
         """
         await self._resolve_parked_dispatches(market)
+        await self._settle_cancelled_entries(market)
         manager = self._spot_manager
         if manager is None:
             return []
@@ -1189,6 +1312,54 @@ class _EventStreamMixin(_BybitBase, ABC):
                 "Bybit derivative fill backfill failed (transient): %s",
                 exc, exc_info=traceback_wanted(exc),
             )
+        if events:
+            self._close_entry_rows_when_flat(market)
+        return events
+
+    async def _recover_unbooked_order_fills(
+            self, market: 'InstrumentInfo',
+    ) -> list[OrderEvent]:
+        """Book the executions the venue reports for an order but the row lacks.
+
+        The time-windowed backfill re-reads only a fixed overlap behind its
+        watermark, so an execution the venue indexes later than that is never
+        returned by it. The rows queued in :attr:`_unbooked_fill_orders` carry
+        venue proof that such executions exist (``cumExecQty`` above the
+        venue-domain cursor, :func:`venue_filled_qty`); each one's executions
+        are read by ``orderId`` from its dispatch on, which no watermark can
+        outrun, and the unseen ones go through
+        :meth:`_backfill_one_execution` — the same gates and event builder as
+        the windowed backfill. A row stays queued until its cursor covers the
+        venue figure, so an execution not yet indexed is retried every
+        reconcile pass instead of being lost. Deferred, queue kept, until the
+        adoption baseline has latched (the windowed backfill's barrier).
+        """
+        pending = self._unbooked_fill_orders
+        if not pending or self.store_ctx is None or market.category == CATEGORY_SPOT:
+            return []
+        if not self._adoption_baselined:
+            # Same barrier as the windowed backfill: the adoption baseline
+            # may be folding these very executions into the adopted
+            # position. The queue is kept; the baseline's cursor seed
+            # settles what it owns before the first per-order read.
+            return []
+        events: list[OrderEvent] = []
+        for coid, (order_id, cum_exec) in list(pending.items()):
+            row = self.store_ctx.get_order(coid)
+            if row is None or venue_filled_qty(row) >= float(cum_exec) - _FILL_EPS:
+                pending.pop(coid, None)
+                continue
+            entries, conclusive = await self._order_executions(
+                market, order_id, row.created_ts_ms - EXECUTION_SINCE_SKEW_MS,
+            )
+            if not conclusive:
+                continue
+            entries.sort(key=lambda e: int(e.get('execTime') or 0))
+            for entry in entries:
+                events.extend(self._backfill_one_execution(entry, market))
+            row = self.store_ctx.get_order(coid)
+            if row is None or venue_filled_qty(row) >= float(cum_exec) - _FILL_EPS:
+                pending.pop(coid, None)
         if events:
             self._close_entry_rows_when_flat(market)
         return events

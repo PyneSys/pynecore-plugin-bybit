@@ -306,14 +306,24 @@ class _RecoveryMixin(_BybitBase, ABC):
     async def _recovery_open_order_ids(
             self, market: InstrumentInfo,
     ) -> tuple[set[str], bool]:
-        """Page ``/v5/order/realtime`` for the symbol's live order ids.
+        """The symbol's live order ids (see :meth:`_recovery_open_orders`)."""
+        orders, conclusive = await self._recovery_open_orders(market)
+        return set(orders), conclusive
+
+    async def _recovery_open_orders(
+            self, market: InstrumentInfo,
+    ) -> tuple[dict[str, Decimal], bool]:
+        """Page ``/v5/order/realtime`` for the symbol's live orders.
 
         Read directly (not through :meth:`get_open_orders`) so recovery does
         not re-enter :meth:`_ensure_broker_started` mid-startup. ``conclusive``
         is ``False`` on any transport failure — a truncated read must never
         let the orphan pass conclude a row's counterpart is absent.
+
+        :return: ``(orders, conclusive)`` — each live ``orderId`` mapped to
+            its wire-domain ``cumExecQty`` (``0`` when unparsable).
         """
-        ids: set[str] = set()
+        orders: dict[str, Decimal] = {}
         cursor: str | None = None
         try:
             while True:
@@ -325,15 +335,20 @@ class _RecoveryMixin(_BybitBase, ABC):
                 }, auth=True)
                 for entry in result.get('list') or []:
                     oid = str(entry.get('orderId') or '')
-                    if oid:
-                        ids.add(oid)
+                    if not oid:
+                        continue
+                    try:
+                        cum_exec = Decimal(str(entry.get('cumExecQty') or '0') or '0')
+                    except (InvalidOperation, TypeError, ValueError):
+                        cum_exec = Decimal(0)
+                    orders[oid] = cum_exec
                 cursor = result.get('nextPageCursor') or None
                 if not cursor:
                     break
         except BybitError as exc:
             _log_inconclusive_snapshot("open-orders snapshot read failed", exc)
-            return ids, False
-        return ids, True
+            return orders, False
+        return orders, True
 
     async def _recovery_has_exposure(
             self, market: InstrumentInfo,
@@ -393,10 +408,38 @@ class _RecoveryMixin(_BybitBase, ABC):
         execution missed there would be permanently unreachable — the
         backfill starts at the floor).
         """
+        entries, seeded = await self._order_executions(
+            market, order_id, from_ms, until_ms,
+        )
         ids: set[str] = set()
         qty_sum = 0.0
+        for entry in entries:
+            ids.add(str(entry['execId']))
+            try:
+                qty_sum += float(entry.get('execQty') or 0.0)
+            except (TypeError, ValueError):
+                pass
+        return ids, qty_sum, seeded
+
+    async def _order_executions(
+            self, market: InstrumentInfo, order_id: str, from_ms: int,
+            until_ms: int | None = None,
+    ) -> tuple[list[dict], bool]:
+        """Read every ``Trade`` execution of one order, deduplicated by ``execId``.
+
+        Filtered by ``orderId``, so the read does not depend on any time
+        watermark: the walk covers contiguous 7-day windows (the endpoint's
+        span cap) from ``from_ms`` to the present, or to ``until_ms`` when
+        that VENUE-clocked timestamp lies later than the local clock.
+
+        :return: ``(entries, conclusive)`` — the raw execution rows and
+            ``False`` on any transport failure (the rows read so far are
+            still returned).
+        """
+        entries: list[dict] = []
         if not order_id:
-            return ids, qty_sum, False
+            return entries, False
+        ids: set[str] = set()
         now_ms = int(epoch_time() * 1000)
         if until_ms is not None and until_ms > now_ms:
             now_ms = until_ms
@@ -421,22 +464,18 @@ class _RecoveryMixin(_BybitBase, ABC):
                         if not eid or eid in ids:
                             continue
                         ids.add(eid)
-                        try:
-                            qty_sum += float(entry.get('execQty') or 0.0)
-                        except (TypeError, ValueError):
-                            pass
+                        entries.append(entry)
                     cursor = result.get('nextPageCursor') or None
                     if not cursor:
                         break
                 start = end
         except BybitError as exc:
             logger.warning(
-                "Bybit recovery: execution read failed for order %s; "
-                "leaving the row parked: %s", order_id, exc,
+                "Bybit: execution read failed for order %s: %s", order_id, exc,
                 exc_info=traceback_wanted(exc),
             )
-            return ids, qty_sum, False
-        return ids, qty_sum, True
+            return entries, False
+        return entries, True
 
     # --- orphan retirement ------------------------------------------------------
 

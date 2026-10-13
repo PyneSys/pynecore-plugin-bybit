@@ -77,6 +77,7 @@ from .helpers import (
     contracts_to_base,
     format_decimal,
     round_price,
+    venue_filled_qty,
     wire_link_id,
 )
 from .models import InstrumentInfo
@@ -650,8 +651,11 @@ class _PositionsMixin(_BybitBase, ABC):
             self._deriv_exec_floor_ms = floor_ms
             for row, order_id, ids, qty_sum, dead in seeds:
                 self._seen_exec_ids.update(ids)
+                # ``qty_sum`` is the order's venue-domain cumulative; the
+                # row's cursor is net of what reducing fills consumed.
+                netted = venue_filled_qty(row) - float(row.filled_qty)
                 cumulative: float = min(
-                    float(row.qty), max(float(row.filled_qty), qty_sum),
+                    float(row.qty), max(float(row.filled_qty), qty_sum - netted),
                 )
                 if cumulative > row.filled_qty:
                     self.store_ctx.set_filled(row.client_order_id, cumulative)
@@ -809,30 +813,19 @@ class _PositionsMixin(_BybitBase, ABC):
                 if excess <= _FILL_EPS:
                     break
                 consumed = min(excess, row.filled_qty)
-                owned = row.filled_qty - consumed
-                # A working entry's unfilled residual can still fill on the
-                # venue — the netting consumes only the OWNED (filled)
-                # exposure and must keep the row alive for the resting
-                # remainder; de-dup lives in the seeded exec frontier, so a
-                # lowered cursor never re-books history.
-                unfilled = max(0.0, row.qty - row.filled_qty)
                 self.store_ctx.log_event(
                     'adoption_baseline_clamped',
                     client_order_id=row.client_order_id,
                     intent_key=row.intent_key,
                     payload={'from_filled_qty': row.filled_qty,
-                             'filled_qty': owned, 'consumed': consumed},
+                             'filled_qty': row.filled_qty - consumed,
+                             'consumed': consumed},
                 )
-                if owned <= _FILL_EPS and unfilled <= _FILL_EPS:
-                    # Retire only the physical row — the shared intent key
-                    # may already own a fresh envelope, exactly like the
-                    # fill-time netting.
-                    self.store_ctx.close_order(row.client_order_id)
-                else:
-                    self.store_ctx.upsert_order(
-                        row.client_order_id, qty=owned + unfilled,
-                        filled_qty=owned,
-                    )
+                # Exactly the fill-time netting: only the OWNED (filled)
+                # exposure is consumed, a working entry keeps its unfilled
+                # remainder (it can still fill on the venue), and a row
+                # left with neither retires only the physical row.
+                self._net_entry_row(row, consumed)
                 excess -= consumed
 
     # --- inverse net-position mirror --------------------------------------------

@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         PositionLeg,
     )
     from pynecore.core.broker.spot_inventory import SpotInventoryManager
+    from pynecore.core.broker.storage import OrderRow
 
     from .hosts import BybitHosts
     from .inventory import _BybitSpotPort
@@ -76,8 +77,12 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # one the stream missed is only recovered by the execution backfill: it
     # runs every ``RECONCILE_CADENCE_S`` (10 s) and re-reads
     # ``EXECUTION_CURSOR_OVERLAP_MS`` (60 s) behind its watermark, and a REST
-    # read may take up to 20 s. Measured on the spot lane: the execution list
-    # still missed a fill 61 s after the balance showed it.
+    # read may take up to 20 s. An execution indexed later than that overlap
+    # is booked by the per-order read once the venue's ``cumExecQty`` proves
+    # it — for a vanished order after the 25 s disappearance grace — so its
+    # delay is bounded by the venue's indexing lag. Measured on the spot
+    # lane: the execution list still missed a fill 61 s after the balance
+    # showed it.
     fill_report_grace_s = 90.0
 
     # The kline topic pushes only on trade activity (plus the confirm
@@ -212,6 +217,24 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # In-memory only: a restart re-counts from zero, its startup recovery
     # pass owns the parked rows there.
     _parked_lookup_misses: 'dict[str, int]'
+    # Derivative rows the venue reports more fills for than their
+    # ``filled_qty`` cursor holds, keyed by client order id:
+    # ``(orderId, venue cumExecQty)`` in the wire domain. Noted from the
+    # open-orders snapshot and the vanished-order confirmation; the reconcile
+    # cadence reads each order's executions by ``orderId`` until the cursor
+    # covers the venue figure (:meth:`_recover_unbooked_order_fills`). The
+    # time-windowed backfill misses an execution the venue indexes later than
+    # its read overlap; this read has no time cursor to fall behind.
+    # In-memory only: a restart's adoption baseline re-seeds every live row
+    # from the same per-order venue truth.
+    _unbooked_fill_orders: 'dict[str, tuple[str, Decimal]]'
+    # Client order ids of derivative MARKET entry rows whose terminal venue
+    # order truth was already read once (:meth:`_note_unbooked_market_entries`).
+    # A market entry leaves the open set at once and is never tracked by the
+    # disappearance pass, so this one lookup is what queues its late-indexed
+    # fill; the set keeps a partially filled, residual-cancelled order from
+    # being looked up again every pass. Pruned to the matching live rows.
+    _market_entries_checked: 'set[str]'
     # Exchange order ids for which a ``created`` OrderEvent has already been
     # emitted. Bybit re-pushes ``orderStatus='New'`` (or ``'Untriggered'``)
     # after an in-place amend (``POST /v5/order/amend``) on the SAME order id;
@@ -385,6 +408,17 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     ) -> 'tuple[set[str], bool]': ...
 
     @abstractmethod
+    async def _recovery_open_orders(
+            self, market: 'InstrumentInfo',
+    ) -> 'tuple[dict[str, Decimal], bool]': ...
+
+    @abstractmethod
+    async def _order_executions(
+            self, market: 'InstrumentInfo', order_id: str, from_ms: int,
+            until_ms: int | None = None,
+    ) -> 'tuple[list[dict], bool]': ...
+
+    @abstractmethod
     async def _recovery_fill_ids(
             self, market: 'InstrumentInfo', order_id: str, from_ms: int,
             until_ms: int | None = None,
@@ -539,3 +573,24 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
 
     @abstractmethod
     async def _resolve_parked_dispatches(self, market: 'InstrumentInfo') -> None: ...
+
+    @abstractmethod
+    async def _note_unbooked_market_entries(self, market: 'InstrumentInfo') -> None: ...
+
+    @abstractmethod
+    def _note_unbooked_fills(
+            self, row: 'OrderRow', order_id: str, cum_exec: 'Decimal',
+    ) -> None: ...
+
+    @abstractmethod
+    async def _settle_cancelled_entries(self, market: 'InstrumentInfo') -> None: ...
+
+    # --- Entry-row ownership (events.py) ---
+    @abstractmethod
+    def _net_entry_row(self, row: 'OrderRow', consumed: float) -> None: ...
+
+    @abstractmethod
+    def _retire_cancelled_row(
+            self, coid: str, venue_cum_exec: float | None = None,
+            order_id: str | None = None,
+    ) -> None: ...
