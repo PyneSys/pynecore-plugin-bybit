@@ -72,6 +72,14 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # through unshortened.
     client_order_id_max_len = 36
 
+    # Fills arrive on the private WS ``execution`` topic within seconds, but
+    # one the stream missed is only recovered by the execution backfill: it
+    # runs every ``RECONCILE_CADENCE_S`` (10 s) and re-reads
+    # ``EXECUTION_CURSOR_OVERLAP_MS`` (60 s) behind its watermark, and a REST
+    # read may take up to 20 s. Measured on the spot lane: the execution list
+    # still missed a fill 61 s after the balance showed it.
+    fill_report_grace_s = 90.0
+
     # The kline topic pushes only on trade activity (plus the confirm
     # snapshot at bar close), so a quiet instrument legitimately produces
     # no ``watch_ohlcv`` updates for several bars while the transport-level
