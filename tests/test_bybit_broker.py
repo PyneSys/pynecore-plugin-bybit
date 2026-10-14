@@ -2470,6 +2470,32 @@ def __test_bybit_netting_trailing_definitive_reject_escalates__(tmp_path):
     assert _active_netting_ownership_rows(plugin) == []
 
 
+def __test_bybit_netting_trailing_reject_of_a_crossed_level_is_flagged__(tmp_path):
+    """A stop the market already traded through is flagged as level-crossed.
+
+    Measured live (bybit-inverse cycle 223, 2026-10-13): the generic code
+    10001 with a ``retMsg`` naming ``base_price`` — the last price had passed
+    the stop. Another 10001 reject is not flagged.
+    """
+    plugin = _linear_plugin(responses=[BybitAPIError(
+        "StopLoss:830533000 set for Buy position should lower than "
+        "base_price:830529000??LastPrice", ret_code=10001,
+    )])
+    _attach_store(plugin, tmp_path, "net-crossed")
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    assert exc.value.level_crossed is True
+    assert exc.value.qty == pytest.approx(0.002)
+
+    plugin = _linear_plugin(responses=[BybitAPIError(
+        "bad params", ret_code=10001,
+    )])
+    _attach_store(plugin, tmp_path, "net-bad-params")
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    assert exc.value.level_crossed is False
+
+
 def __test_bybit_netting_trailing_ambiguous_resolved_by_readback__(tmp_path):
     """A server-side ambiguity that the position readback confirms is a success."""
     plugin = _linear_plugin(responses=[

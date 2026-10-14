@@ -125,6 +125,7 @@ from .exceptions import (
     is_benign_trading_stop_reject,
     is_order_amend_unchanged_reject,
     is_reduce_only_zero_position_reject,
+    is_trading_stop_level_crossed_reject,
     is_trading_stop_zero_position_reject,
     map_broker_error,
     reject_error,
@@ -1198,7 +1199,9 @@ class _ExecutionMixin(_BybitBase, ABC):
                 oca_type=intent.oca_type,
             )
 
-        def attach_reject(msg: str, *, moot: bool) -> BracketAttachAfterFillRejectedError:
+        def attach_reject(
+                msg: str, *, moot: bool, level_crossed: bool = False,
+        ) -> BracketAttachAfterFillRejectedError:
             return BracketAttachAfterFillRejectedError(
                 f"Bybit trading-stop attach {msg} "
                 f"(exit={intent.pine_id!r}, from_entry={intent.from_entry!r})",
@@ -1209,6 +1212,7 @@ class _ExecutionMixin(_BybitBase, ABC):
                 qty=0.0 if moot else self._core_qty(qty, anchor),
                 from_entry=intent.from_entry,
                 exit_id=intent.pine_id,
+                level_crossed=level_crossed,
             )
 
         try:
@@ -1241,7 +1245,10 @@ class _ExecutionMixin(_BybitBase, ABC):
                         f"(retCode={e.ret_code})", moot=False) from e
             else:
                 self._release_netting_ownership(own_coid)
-                raise attach_reject(f"rejected: {e}", moot=False) from e
+                raise attach_reject(
+                    f"rejected: {e}", moot=False,
+                    level_crossed=is_trading_stop_level_crossed_reject(e),
+                ) from e
         except BybitError as e:
             if not await self._resolve_ambiguous_trading_stop(
                     market, tp_price=tp_price, sl_price=sl_price,

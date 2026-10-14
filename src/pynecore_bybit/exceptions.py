@@ -171,6 +171,19 @@ def is_trading_stop_zero_position_reject(exc: BybitAPIError) -> bool:
     return exc.ret_code == 10001 and "zero position" in str(exc)
 
 
+def is_trading_stop_level_crossed_reject(exc: BybitAPIError) -> bool:
+    """Whether a trading-stop reject says the market already crossed the level.
+
+    Bybit refuses a stop-loss or take-profit on the wrong side of the last
+    price with the generic code 10001 and a ``retMsg`` naming ``base_price``
+    (measured live on the global demo, 2026-10-13, BTCUSD inverse:
+    "StopLoss:830533000 set for Buy position should lower than
+    base_price:830529000??LastPrice"). The price moved through the level
+    between the entry fill and the attach.
+    """
+    return exc.ret_code == 10001 and "base_price" in str(exc)
+
+
 def is_order_amend_unchanged_reject(exc: BybitAPIError) -> bool:
     """Whether a ``/v5/order/amend`` reject means the order already matches.
 
