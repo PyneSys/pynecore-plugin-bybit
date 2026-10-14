@@ -55,6 +55,7 @@ from pynecore.core.broker.disappearance import (
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_REJECTED,
     ExchangeOrder,
     LegType,
     OrderEvent,
@@ -70,6 +71,7 @@ from pynecore.core.broker.store_helpers import (
 )
 
 from ._base import _BybitBase
+from .events import _CANCEL_TYPE_REASONS
 from .exceptions import BybitError, traceback_wanted
 from .execution import _DEAD_ORDER_STATUSES
 from .helpers import (
@@ -151,6 +153,9 @@ class _ReconcileMixin(_BybitBase, ABC):
         * ``cancelled_event_factory`` builds the plugin's leg-typed
           cancelled event; ``sibling_coids`` retires the settled siblings
           sharing a CLOSED netting position.
+        * ``retire_cancelled_row`` retires a confirmed cancel the way the
+          live ``order`` push does, so a partially filled entry keeps
+          owning the exposure it left behind.
         """
         tracker = self._disappearance
         if tracker is None:
@@ -165,6 +170,7 @@ class _ReconcileMixin(_BybitBase, ABC):
                 request_quarantine=self.quarantine_sink,
                 sibling_coids=self._closed_position_siblings,
                 cancelled_event_factory=self._cancelled_event,
+                retire_cancelled_row=self._retire_vanished_cancelled_row,
             )
             self._disappearance = tracker
         return tracker
@@ -589,6 +595,13 @@ class _ReconcileMixin(_BybitBase, ABC):
           unexpected-cancel policy).
         * A found dead order with zero fills → CANCELLED (retired with the
           dual signal + policy).
+        * Either CANCELLED verdict carries the venue-driven reason its
+          ``cancelType`` names (a reduce-only squeeze, an OCA sibling
+          trigger, a cleared position): the push of a venue cancel can be
+          lost too, and the history then tells it apart from an operator's
+          cancel — the tracker retires the row without the policy. A
+          ``Rejected`` order carries the venue-rejected reason: only the
+          venue can reject.
         * A transport failure, or a not-found row (never landed, or a dead
           order aged out of the < 24h history retention) → INCONCLUSIVE: a
           cancel is only ever concluded from a FOUND dead order.
@@ -615,8 +628,18 @@ class _ReconcileMixin(_BybitBase, ABC):
                 # cursor.
                 return MissingConfirmation(MissingResolution.INCONCLUSIVE)
             # Zero-fill dead order, or the fills are fully booked: the
-            # residual is a genuine cancellation — dual signal + policy.
-            return MissingConfirmation(MissingResolution.CANCELLED)
+            # residual is a genuine cancellation — dual signal, plus the
+            # policy unless the venue itself names the cause. A rejected
+            # order is always the venue's verdict (the push path books it
+            # as a reject, never as an intervention).
+            if status == 'Rejected':
+                cancel_reason: str | None = CANCEL_REASON_VENUE_REJECTED
+            else:
+                cancel_reason = _CANCEL_TYPE_REASONS.get(
+                    str(existing.get('cancelType') or ''))
+            return MissingConfirmation(
+                MissingResolution.CANCELLED, cancel_reason=cancel_reason,
+            )
         if status == 'Filled' or cum_exec > 0:
             # The order filled: the disappearance premise is false. Clear
             # the stamp and leave the booking to the fill path.
@@ -686,6 +709,20 @@ class _ReconcileMixin(_BybitBase, ABC):
             order=order, event_type='cancelled',
             fill_price=None, fill_qty=None, timestamp=now_ts,
             pine_id=pine_id, from_entry=from_entry, leg_type=lt,
+        )
+
+    def _retire_vanished_cancelled_row(self, row: 'OrderRow') -> None:
+        """Retire a row the disappearance verdict confirmed cancelled.
+
+        The same retirement the live ``order`` push applies
+        (:meth:`_retire_cancelled_row`): exit / close legs and entries that
+        never executed are closed, a partially filled entry is normalized to
+        its executed quantity and stays live. A CANCELLED verdict is only
+        given once the row's fill cursor covers the venue's ``cumExecQty``,
+        so the cursor is the terminal executed figure.
+        """
+        self._retire_cancelled_row(
+            row.client_order_id, venue_filled_qty(row), row.exchange_order_id,
         )
 
     def _closed_position_siblings(

@@ -18,6 +18,7 @@ from pynecore.core.broker.store_helpers import (
 
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import BybitConnectionError
+from pynecore_bybit.helpers import ENTRY_REMAINDER_CANCELLED_EXTRA
 from pynecore_bybit.models import InstrumentInfo
 
 
@@ -160,6 +161,34 @@ def __test_grace_expired_cancel_emits_event_and_quarantines__(tmp_path):
     assert 'c1' not in _live_coids(broker)          # terminally retired
     assert calls                                    # quarantine latched
     assert all(kind is QuarantineKind.EXTERNAL_INTERVENTION for _, _, kind in calls)
+
+
+def __test_grace_expired_partial_entry_cancel_keeps_the_exposure_owned__(tmp_path):
+    # A partially filled working entry whose cancel push was lost: the cancel
+    # ended only the unfilled remainder, so the row keeps owning the executed
+    # exposure exactly as the live ``order`` push leaves it — normalized to
+    # the executed quantity, flagged, still live — while the cancel is still
+    # signalled and the policy still quarantines.
+    calls: list = []
+    broker = _DisappearanceFake(
+        market=_linear_instrument(),
+        history_by_coid={'c9': _order(order_id='o9', coid='c9',
+                                      status='Cancelled', cum='0.004')},
+    )
+    broker.on_unexpected_cancel = 'stop'
+    broker.quarantine_sink = lambda reason, ctx, *, kind: calls.append(kind)
+    _open(tmp_path, broker)
+    _seed(broker, 'c9', exchange_order_id='o9', filled=0.004)
+    _stamp(broker, 'c9')
+    events = _run_reconcile(broker, [])
+    assert [e.event_type for e in events] == ['cancelled']
+    assert calls == [QuarantineKind.EXTERNAL_INTERVENTION]
+    row = broker.store_ctx.get_order('c9')
+    assert row.closed_ts_ms is None
+    assert row.qty == pytest.approx(0.004)
+    assert row.filled_qty == pytest.approx(0.004)
+    assert (row.extras or {}).get(ENTRY_REMAINDER_CANCELLED_EXTRA)
+    assert _stamp_of(broker, 'c9') is None
 
 
 # === Verdict: FILLED (false premise cleared) ===============================

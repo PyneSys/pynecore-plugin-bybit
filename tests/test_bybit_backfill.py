@@ -8,6 +8,12 @@ from decimal import Decimal
 
 from pynecore.core.broker import storage
 from pynecore.core.broker.disappearance import MissingResolution
+from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_OCA,
+    CANCEL_REASON_VENUE_POSITION_CLEARED,
+    CANCEL_REASON_VENUE_REDUCE_ONLY,
+    CANCEL_REASON_VENUE_REJECTED,
+)
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, ENTRY_KIND_WORKING
@@ -491,6 +497,36 @@ def __test_fill_indexed_after_the_window_overlap_is_recovered_per_order__(
     assert broker.store_ctx.get_order('c1').filled_qty == 0.01
     assert broker._unbooked_fill_orders == {}
     assert asyncio.run(broker._recover_unbooked_order_fills(broker._market)) == []
+
+
+def __test_vanished_order_verdict_carries_the_venue_cancel_type__(
+        tmp_path, monkeypatch):
+    """A dead order's ``cancelType`` tells a venue cancel from an operator's.
+
+    The push of a venue-driven cancel can be lost like any other; the history
+    read at grace expiry then names the cause, so the tracker retires the leg
+    without quarantining the run. A plain user cancel stays unexplained; a
+    rejected order is always the venue's verdict.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    cases = {
+        'v1': ('Deactivated', 'CancelByReduceOnly', CANCEL_REASON_VENUE_REDUCE_ONLY),
+        'v2': ('Deactivated', 'CancelByOCOSlCanceledByTpTriggered', CANCEL_REASON_VENUE_OCA),
+        'v3': ('Deactivated', 'CancelByTpSlTsClear', CANCEL_REASON_VENUE_POSITION_CLEARED),
+        'v4': ('Cancelled', 'CancelByUser', None),
+        'v5': ('Rejected', 'UNKNOWN', CANCEL_REASON_VENUE_REJECTED),
+    }
+    for coid, (status, cancel_type, _reason) in cases.items():
+        _seed_created_at(monkeypatch, broker, coid, now - 600_000, qty=0.01)
+        broker.orders.append({**_venue_order(coid, status=status, cum_exec='0'),
+                              'cancelType': cancel_type})
+    for coid, (_status, _cancel_type, reason) in cases.items():
+        row = broker.store_ctx.get_order(coid)
+        verdict = asyncio.run(broker._confirm_vanished_order(broker._market, row))
+        assert verdict.resolution is MissingResolution.CANCELLED
+        assert verdict.cancel_reason == reason, coid
 
 
 def __test_unindexed_execution_stays_queued_until_the_venue_lists_it__(
