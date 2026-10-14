@@ -74,6 +74,7 @@ import logging
 from abc import ABC
 from decimal import Decimal, InvalidOperation
 from time import time as epoch_time
+from typing import TYPE_CHECKING
 
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
@@ -81,6 +82,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
+    VenueWritesQuarantinedError,
 )
 from pynecore.core.broker.idempotency import (
     KIND_CLOSE,
@@ -143,6 +145,9 @@ from .helpers import (
 )
 from .models import InstrumentInfo
 from .positions import HEDGE_IDX_BUY, HEDGE_IDX_SELL, POSITION_MODE_HEDGE
+
+if TYPE_CHECKING:
+    from pynecore.core.broker.storage import OrderRow
 
 logger = logging.getLogger(__name__)
 
@@ -988,6 +993,17 @@ class _ExecutionMixin(_BybitBase, ABC):
         trail intent is refused loudly (the validator already blocks
         such scripts at startup).
         """
+        return await self._execute_exit(envelope)
+
+    async def _execute_exit(
+            self, envelope: DispatchEnvelope, *,
+            supersedes: 'tuple[OrderRow, ...]' = (),
+    ) -> list[ExchangeOrder]:
+        """:meth:`execute_exit` with the trading-stop modify hand-over.
+
+        :param supersedes: Active netting ownership rows of the trading stop
+            this attach replaces (see :meth:`_execute_exit_trading_stop`).
+        """
         await self._ensure_broker_started()
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
@@ -1014,6 +1030,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         if trail_carrying:
             return await self._execute_exit_trading_stop(
                 envelope, intent, market, qty, anchor=anchor,
+                supersedes=supersedes,
             )
 
         legs: list[ExchangeOrder] = []
@@ -1147,6 +1164,7 @@ class _ExecutionMixin(_BybitBase, ABC):
             self, envelope: DispatchEnvelope, intent: ExitIntent,
             market: InstrumentInfo, qty: Decimal, *,
             anchor: Decimal | None,
+            supersedes: 'tuple[OrderRow, ...]' = (),
     ) -> list[ExchangeOrder]:
         """Attach a trail-carrying exit as the netting position's trading stop.
 
@@ -1171,33 +1189,53 @@ class _ExecutionMixin(_BybitBase, ABC):
         resolved by a position readback plus one retry, and if still
         undecided the row STAYS ACTIVE (the attach may have landed) and
         the defensive flatten resolves the exposure either way.
+
+        A write that never took effect (refused by the external-intervention
+        quarantine before it left the client, or definitively rejected)
+        leaves the venue's trading stop exactly as it was, so the ownership
+        is put back exactly as it was too: the row this attach persisted
+        returns to its pre-attach snapshot, and the ``supersedes`` rows of
+        the replaced stop become active again.
+
+        :param supersedes: Active ownership rows of the trading stop this
+            attach replaces (a modify). They are released in the same store
+            transaction that persists the new row, so neither a protective
+            fill nor a persistence failure / crash ever leaves zero or two
+            active owners of this exit.
         """
         attach_coid = envelope.client_order_id(KIND_EXIT_SL)
         own_coid = f"{attach_coid}:{_NETTING_LEG_ID}"
+        superseded = tuple(row for row in supersedes
+                           if row.client_order_id != own_coid)
         tp_price = (round_price(intent.tp_price, market.tick_size_str)
                     if intent.tp_price is not None else None)
         sl_price = (round_price(intent.sl_price, market.tick_size_str)
                     if intent.sl_price is not None else None)
         trail_distance = self._trail_distance(market, intent.trail_offset)
+        prior_owner: OrderRow | None = None
         if self.store_ctx is not None:
-            create_bracket_ownership_row(
-                self.store_ctx,
-                coid=own_coid,
-                symbol=intent.symbol,
-                side=intent.side,
-                qty=float(self._core_qty(qty, anchor)),
-                intent_key=intent.intent_key,
-                pine_entry_id=intent.pine_id,
-                from_entry=intent.from_entry,
-                leg_id=_NETTING_LEG_ID,
-                attach_coid=attach_coid,
-                tp_price=intent.tp_price,
-                sl_price=intent.sl_price,
-                trail_price=intent.trail_price,
-                trail_offset=intent.trail_offset,
-                oca_name=intent.oca_name,
-                oca_type=intent.oca_type,
-            )
+            with self.store_ctx.transaction():
+                prior_owner = self.store_ctx.get_order(own_coid)
+                for row in superseded:
+                    self._release_netting_ownership(row.client_order_id)
+                create_bracket_ownership_row(
+                    self.store_ctx,
+                    coid=own_coid,
+                    symbol=intent.symbol,
+                    side=intent.side,
+                    qty=float(self._core_qty(qty, anchor)),
+                    intent_key=intent.intent_key,
+                    pine_entry_id=intent.pine_id,
+                    from_entry=intent.from_entry,
+                    leg_id=_NETTING_LEG_ID,
+                    attach_coid=attach_coid,
+                    tp_price=intent.tp_price,
+                    sl_price=intent.sl_price,
+                    trail_price=intent.trail_price,
+                    trail_offset=intent.trail_offset,
+                    oca_name=intent.oca_name,
+                    oca_type=intent.oca_type,
+                )
 
         def attach_reject(
                 msg: str, *, moot: bool, level_crossed: bool = False,
@@ -1215,11 +1253,23 @@ class _ExecutionMixin(_BybitBase, ABC):
                 level_crossed=level_crossed,
             )
 
+        def restore_ownership() -> None:
+            if self.store_ctx is None:
+                return
+            with self.store_ctx.transaction():
+                self._restore_netting_ownership(own_coid, prior_owner)
+                for superseded_row in superseded:
+                    self._restore_netting_ownership(
+                        superseded_row.client_order_id, superseded_row)
+
         try:
             await self._post_trading_stop(
                 market, tp_price=tp_price, sl_price=sl_price,
                 trail_distance=trail_distance,
             )
+        except VenueWritesQuarantinedError:
+            restore_ownership()
+            raise
         except BybitAPIError as e:
             if e.ret_code == 34040:
                 # "Not modified": the values are already attached — an
@@ -1244,7 +1294,7 @@ class _ExecutionMixin(_BybitBase, ABC):
                         f"stayed unresolved after a server-side failure "
                         f"(retCode={e.ret_code})", moot=False) from e
             else:
-                self._release_netting_ownership(own_coid)
+                restore_ownership()
                 raise attach_reject(
                     f"rejected: {e}", moot=False,
                     level_crossed=is_trading_stop_level_crossed_reject(e),
@@ -1377,7 +1427,10 @@ class _ExecutionMixin(_BybitBase, ABC):
         except BybitAPIError as e:
             if e.ret_code != 34040:
                 return False
-        except BybitError:
+        except (BybitError, VenueWritesQuarantinedError):
+            # A quarantine-refused retry leaves the FIRST write's outcome
+            # unknown: report it unresolved, never as a request that did
+            # not leave the client.
             return False
         return await self._trading_stop_attached(
             market, tp_price=tp_price, sl_price=sl_price,
@@ -1425,6 +1478,35 @@ class _ExecutionMixin(_BybitBase, ABC):
                 self.store_ctx, coid=own_coid,
                 new_state=BRACKET_OWN_STATE_RELEASED, close_row=True,
             )
+
+    def _restore_netting_ownership(
+            self, coid: str, snapshot: 'OrderRow | None',
+    ) -> None:
+        """Put one netting ownership row back to a pre-attach snapshot.
+
+        ``None`` means the row did not exist before the attach, so it is
+        released; otherwise the snapshot's contents and its live / closed
+        status come back (no-op storeless).
+        """
+        if self.store_ctx is None:
+            return
+        if snapshot is None:
+            self._release_netting_ownership(coid)
+            return
+        self.store_ctx.reopen_order(coid)
+        self.store_ctx.upsert_order(
+            coid,
+            symbol=snapshot.symbol,
+            side=snapshot.side,
+            qty=snapshot.qty,
+            state=snapshot.state,
+            intent_key=snapshot.intent_key,
+            pine_entry_id=snapshot.pine_entry_id,
+            from_entry=snapshot.from_entry,
+            extras=dict(snapshot.extras or {}),
+        )
+        if snapshot.closed_ts_ms is not None:
+            self.store_ctx.close_order(coid)
 
     def _owned_netting_stop_rows(
             self, symbol: str, pine_id: str, from_entry: str | None,
@@ -1809,13 +1891,17 @@ class _ExecutionMixin(_BybitBase, ABC):
         """
         try:
             await self._cancel_by_coid(market, coid)
+        except VenueWritesQuarantinedError:
+            # The quarantine refused the rollback cancel: the already-placed
+            # leg is still live, so the cleanup is unverified.
+            return False, None
         except OrderDispositionUnknownError:
             verdict, executed = await self._rollback_readback(coid)
             if verdict is not None:
                 return verdict, executed
             try:
                 await self._cancel_by_coid(market, coid)
-            except OrderDispositionUnknownError:
+            except (OrderDispositionUnknownError, VenueWritesQuarantinedError):
                 return False, None
         verdict, executed = await self._rollback_readback(coid)
         if verdict is None:
@@ -1988,7 +2074,9 @@ class _ExecutionMixin(_BybitBase, ABC):
         # follow-up ``CANCELLED`` pushes for the orders this endpoint removes are
         # routed as the engine's own cancels rather than tripping the
         # ``on_unexpected_cancel`` quarantine. The marker rides the engine event
-        # queue, FIFO-ordered ahead of those pushes.
+        # queue, FIFO-ordered ahead of those pushes. A quarantine-refused
+        # cancel-all must never arm the marker, so the gate runs first.
+        self.ensure_venue_writes_allowed("cancel-all")
         if self.native_cancel_all_expected_sink is not None:
             self.native_cancel_all_expected_sink(market.symbol)
         try:
@@ -2289,26 +2377,28 @@ class _ExecutionMixin(_BybitBase, ABC):
 
         The trading stop is a position attribute with full-replacement
         write semantics: while the new intent still trails, the fresh
-        attach in :meth:`execute_exit` simply overwrites the old values
-        — no cancel window ever leaves the position unprotected. The old
-        attach's ownership row is released first (its coid derives from
-        the OLD envelope, so the new attach cannot upsert it; releasing
-        after the new persist would risk two ACTIVE rows, which the
-        venue-fill attribution refuses as ambiguous). When the new shape
-        dropped the trail, the attribute is explicitly cleared — even
-        with no ownership row on the books, a crash window may have left
-        the venue attribute set — before the order-leg path takes over
-        through the same :meth:`execute_exit` dispatch.
+        attach simply overwrites the old values — no cancel window ever
+        leaves the position unprotected. The old attach's ownership rows
+        (their coid derives from the OLD envelope, so the new attach cannot
+        upsert them) are handed to the attach as ``supersedes``: released
+        in the same store transaction that persists the new row, and
+        restored when the new write never took effect, since the venue then
+        still carries the old stop. When the new shape dropped the trail,
+        the attribute is explicitly cleared — even with no ownership row on
+        the books, a crash window may have left the venue attribute set —
+        before the order-leg path takes over through the same
+        :meth:`execute_exit` dispatch.
         """
         old_intent = old.intent
         assert isinstance(old_intent, ExitIntent)
         rows = self._owned_netting_stop_rows(
             old_intent.symbol, old_intent.pine_id, old_intent.from_entry,
         )
-        if not trail_new:
-            await self._clear_position_trading_stop(
-                market, context_coid=old.client_order_id(KIND_EXIT_SL),
-            )
+        if trail_new:
+            return await self._execute_exit(new, supersedes=tuple(rows))
+        await self._clear_position_trading_stop(
+            market, context_coid=old.client_order_id(KIND_EXIT_SL),
+        )
         for row in rows:
             self._release_netting_ownership(row.client_order_id)
         return await self.execute_exit(new)

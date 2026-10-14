@@ -91,6 +91,8 @@ class _RestMixin(_BybitBase, ABC):
         :return: The ``result`` object of the response envelope.
         :raises BybitAPIError: On a non-zero ``retCode``.
         :raises BybitConnectionError: On transport-level failures.
+        :raises VenueWritesQuarantinedError: On a POST while the
+            external-intervention quarantine forbids venue writes; nothing is sent.
         """
         query = {k: v for k, v in (params or {}).items() if v is not None}
         method_lc = method.lower()
@@ -104,6 +106,14 @@ class _RestMixin(_BybitBase, ABC):
         recv_window_ms = RECV_WINDOW_MS
 
         for attempt in range(_TIMESTAMP_RETRY_COUNT + 1):
+            if method_lc == "post":
+                # Every Bybit v5 POST mutates the account (create, amend,
+                # cancel, cancel-all, trading-stop), so this is the single
+                # transport gate of the external-intervention quarantine;
+                # reads stay allowed. It runs on every attempt: a timestamp
+                # retry is a fresh write, and the quarantine may latch while
+                # the previous (venue-rejected, 10002) attempt was in flight.
+                self.ensure_venue_writes_allowed(f"POST {endpoint}")
             headers = dict(base_headers)
             if auth:
                 headers.update(self._sign_headers(payload or "", recv_window_ms))

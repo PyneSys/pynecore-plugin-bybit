@@ -8,7 +8,7 @@ from time import time as epoch_time
 import pytest
 
 from pynecore.core.broker.exceptions import UnexpectedCancelError
-from pynecore.core.broker.models import LegType
+from pynecore.core.broker.models import LegType, QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import (
@@ -143,14 +143,15 @@ def _stamp_of(broker, coid):
 def __test_grace_expired_cancel_emits_event_and_quarantines__(tmp_path):
     # A resting working entry gone from the open set, found dead (zero fills)
     # in history: retire it with a synthetic cancelled event AND latch the
-    # engine quarantine through the ``stop`` policy's sink.
+    # engine's external-intervention quarantine through the ``stop`` policy's
+    # sink.
     calls: list = []
     broker = _DisappearanceFake(
         market=_linear_instrument(),
         history_by_coid={'c1': _order(order_id='o1', coid='c1', status='Cancelled')},
     )
     broker.on_unexpected_cancel = 'stop'
-    broker.quarantine_sink = lambda reason, ctx: calls.append((reason, ctx))
+    broker.quarantine_sink = lambda reason, ctx, *, kind: calls.append((reason, ctx, kind))
     _open(tmp_path, broker)
     _seed(broker, 'c1', exchange_order_id='o1')
     _stamp(broker, 'c1')
@@ -158,6 +159,7 @@ def __test_grace_expired_cancel_emits_event_and_quarantines__(tmp_path):
     assert [e.event_type for e in events] == ['cancelled']
     assert 'c1' not in _live_coids(broker)          # terminally retired
     assert calls                                    # quarantine latched
+    assert all(kind is QuarantineKind.EXTERNAL_INTERVENTION for _, _, kind in calls)
 
 
 # === Verdict: FILLED (false premise cleared) ===============================
@@ -229,30 +231,6 @@ def __test_reappearance_clears_stamp__(tmp_path):
     assert events == []
     assert 'c5' in _live_coids(broker)
     assert _stamp_of(broker, 'c5') is None           # cleared on reappearance
-
-
-# === Sibling sweep: skip filled exposure ===================================
-
-def __test_sibling_sweep_skips_filled_exposure__(tmp_path):
-    # The zero-fill sibling sweep cancels resting siblings but LEAVES a
-    # settled position row (live exposure) for the operator. The cancelled
-    # sibling's row is retired once the venue confirms it never executed (a
-    # fill may race the cancel ACK, which carries no fill figure).
-    broker = _DisappearanceFake(market=_linear_instrument())
-    _open(tmp_path, broker)
-    _seed(broker, 'orig', exchange_order_id='oo')
-    _seed(broker, 'sf', filled=0.01, kind=ENTRY_KIND_POSITION,
-          exchange_order_id='osf')                    # settled: real exposure
-    _seed(broker, 'sr', kind=ENTRY_KIND_WORKING, exchange_order_id='osr')  # resting
-    origin = broker.store_ctx.get_order('orig')
-    asyncio.run(broker._cancel_sibling_working_orders(origin))
-    assert [e for e, _ in broker.calls].count('/v5/order/cancel') == 1  # 'sr' only
-    assert 'sr' in _live_coids(broker)                # awaiting the fill settlement
-    broker.history_by_coid['sr'] = _order(order_id='osr', coid='sr', status='Cancelled')
-    asyncio.run(broker._settle_cancelled_entries(broker._market))
-    live = _live_coids(broker)
-    assert 'sf' in live                               # filled sibling kept
-    assert 'sr' not in live                           # zero-fill sibling swept
 
 
 # === Halt propagation ======================================================

@@ -3,6 +3,7 @@
 """
 import asyncio
 import logging
+import sqlite3
 import time
 import threading
 from decimal import Decimal
@@ -17,6 +18,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
+    VenueWritesQuarantinedError,
 )
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
@@ -35,6 +37,7 @@ from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import ENTRY_KIND_WORKING
 
 import pynecore_bybit.events as events_module
+import pynecore_bybit.execution as execution_module
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import (
     BybitAPIError, BybitConnectionError, BybitError, traceback_wanted,
@@ -692,6 +695,7 @@ def __test_bybit_exit_leg_spent_rolls_back_sibling__():
     assert cancel_body['orderLinkId'] == tp_coid
 
 
+
 def _spent_sl_prefix() -> list:
     """Canned responses: TP lands, SL id collides with a CANCELLED original."""
     return [
@@ -713,6 +717,22 @@ def _bracket_envelope() -> DispatchEnvelope:
         run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
     )
 
+
+def __test_bybit_exit_leg_spent_quarantined_rollback_escalates__():
+    """A quarantine-refused sibling rollback escalates instead of leaking.
+
+    The TP leg already landed, so the refusal must not leave execute_exit as
+    a request that never left the client: the cleanup is unverified, which
+    is the defensive-flatten path at the full bracket size.
+    """
+    plugin = _FakeBrokerBybit(responses=_spent_sl_prefix() + [
+        VenueWritesQuarantinedError("POST /v5/order/cancel"),  # rollback cancel
+    ])
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(plugin.execute_exit(_bracket_envelope()))
+    assert exc.value.qty == pytest.approx(0.001)
+    cancels = [c for c in plugin.calls if c[0] == '/v5/order/cancel']
+    assert len(cancels) == 1
 
 def __test_bybit_exit_leg_spent_ambiguous_rollback__():
     """An ambiguous sibling rollback must not replace the spent signal.
@@ -926,6 +946,24 @@ def __test_bybit_cancel_all_arms_expected_before_venue_call__():
     assert armed == [(plugin._market.symbol, 0)]
     assert plugin.calls[-1][0] == '/v5/order/cancel-all'
 
+
+
+def __test_bybit_cancel_all_under_quarantine_never_arms_expected__():
+    """A quarantine-refused cancel-all raises before arming the engine's
+    expected-cancel sink and before any venue call, so no expected-cancel
+    marker is ever left behind for a cancel that did not happen."""
+    plugin = _FakeBrokerBybit()
+    armed: list[str | None] = []
+    plugin.native_cancel_all_expected_sink = (
+        lambda symbol=None: armed.append(symbol)
+    )
+    plugin.venue_writes_blocked = lambda: True
+
+    with pytest.raises(VenueWritesQuarantinedError):
+        asyncio.run(plugin.execute_cancel_all())
+
+    assert armed == []
+    assert plugin.calls == []
 
 def __test_bybit_event_stream_translation__():
     """Private execution/order pushes -> OrderEvents with Pine identity"""
@@ -1458,7 +1496,7 @@ def __test_bybit_spot_base_fee_close_never_quarantines__(tmp_path):
     manager = SpotInventoryManager(
         plugin.store_ctx, port,
         account_id="acct-spot", symbol="BTCUSDT",
-        request_quarantine=lambda msg, ctx: quarantine_calls.append((msg, ctx)),
+        request_quarantine=lambda msg, ctx, **_kw: quarantine_calls.append((msg, ctx)),
     )
     # The adoption watermark is irrelevant to this fill-path regression;
     # skip the full startup handshake and drive the live path directly.
@@ -2512,6 +2550,24 @@ def __test_bybit_netting_trailing_ambiguous_resolved_by_readback__(tmp_path):
     assert len(_active_netting_ownership_rows(plugin)) == 1
 
 
+
+def __test_bybit_netting_trailing_quarantined_retry_stays_unresolved__(tmp_path):
+    """A quarantine refusing the bounded retry leaves the attach unresolved.
+
+    The first write is ambiguous (it may have landed), so the refusal must
+    not surface as a request that never left the client: the attach
+    escalates as unresolved and the ownership row stays active.
+    """
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("Server Timeout", ret_code=10000),
+        {'list': []},                                          # readback
+        VenueWritesQuarantinedError("POST /v5/position/trading-stop"),  # retry
+    ])
+    _attach_store(plugin, tmp_path, "net-ambig-quarantined")
+    with pytest.raises(BracketAttachAfterFillRejectedError):
+        asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    assert len(_active_netting_ownership_rows(plugin)) == 1
+
 def __test_bybit_netting_trailing_unresolved_keeps_the_row_active__(tmp_path):
     """An unresolvable attach escalates but keeps the row for replay.
 
@@ -2583,6 +2639,118 @@ def __test_bybit_modify_reattaches_the_netting_trading_stop__(tmp_path):
     rows = _active_netting_ownership_rows(plugin)
     assert len(rows) == 1
     assert rows[0].client_order_id != first_coid
+
+
+def __test_bybit_netting_quarantined_attach_leaves_no_phantom_owner__(tmp_path):
+    """A quarantine-refused attach rolls its persist-first row back.
+
+    The refused write never left the client, so its ownership row must not
+    stay active: a second active row would double the owned total and turn
+    the existing bracket's protective fill into an ambiguous, unattributed
+    execution.
+    """
+    plugin = _linear_plugin(responses=[
+        {},
+        VenueWritesQuarantinedError("POST /v5/position/trading-stop"),
+    ])
+    _attach_store(plugin, tmp_path, "net-quarantined-attach")
+    asyncio.run(plugin.execute_exit(_trail_exit_envelope()))
+    with pytest.raises(VenueWritesQuarantinedError):
+        asyncio.run(plugin.execute_exit(_trail_exit_envelope(
+            pine_id='Trail-Y', bar_ts_ms=1_752_600_060_000,
+        )))
+    rows = _active_netting_ownership_rows(plugin)
+    assert [row.pine_entry_id for row in rows] == ['Trail-X']
+
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [_venue_stop_execution(
+            stopOrderType='TrailingStop', side='Sell',
+            execQty='0.002', closedSize='0.002',
+        )],
+    }, plugin._market)
+    assert [event.pine_id for event in events] == ['Trail-X']
+
+
+def __test_bybit_netting_quarantined_reattach_keeps_the_landed_owner__(tmp_path):
+    """A refused re-attach of a landed stop restores its row, not releases it."""
+    plugin = _linear_plugin(responses=[
+        {},
+        VenueWritesQuarantinedError("POST /v5/position/trading-stop"),
+    ])
+    _attach_store(plugin, tmp_path, "net-quarantined-reattach")
+    envelope = _trail_exit_envelope()
+    asyncio.run(plugin.execute_exit(envelope))
+    before = _active_netting_ownership_rows(plugin)
+    with pytest.raises(VenueWritesQuarantinedError):
+        asyncio.run(plugin.execute_exit(envelope))
+    after = _active_netting_ownership_rows(plugin)
+    assert [(row.client_order_id, row.extras) for row in after] == [
+        (row.client_order_id, row.extras) for row in before
+    ]
+
+
+def __test_bybit_modify_rejected_reattach_restores_the_old_owner__(tmp_path):
+    """A definitively rejected trail->trail re-attach keeps the old owner.
+
+    The venue refused the write, so the OLD trading stop is still attached:
+    its ownership row must stay active, or that stop's fill would book as
+    external activity.
+    """
+    plugin = _linear_plugin(responses=[
+        {}, BybitAPIError("tp price invalid", ret_code=110092),
+    ])
+    _attach_store(plugin, tmp_path, "net-modify-reject")
+    old = _trail_exit_envelope()
+    asyncio.run(plugin.execute_exit(old))
+    first_coid = _active_netting_ownership_rows(plugin)[0].client_order_id
+    new = _trail_exit_envelope(bar_ts_ms=1_752_600_060_000, sl_price=95000.0)
+    with pytest.raises(BracketAttachAfterFillRejectedError):
+        asyncio.run(plugin.modify_exit(old, new))
+    rows = _active_netting_ownership_rows(plugin)
+    assert [row.client_order_id for row in rows] == [first_coid]
+
+
+def __test_bybit_modify_quarantined_reattach_restores_the_old_owner__(tmp_path):
+    """A quarantine-refused trail->trail re-attach keeps the old owner."""
+    plugin = _linear_plugin(responses=[
+        {}, VenueWritesQuarantinedError("POST /v5/position/trading-stop"),
+    ])
+    _attach_store(plugin, tmp_path, "net-modify-quarantined")
+    old = _trail_exit_envelope()
+    asyncio.run(plugin.execute_exit(old))
+    first_coid = _active_netting_ownership_rows(plugin)[0].client_order_id
+    new = _trail_exit_envelope(bar_ts_ms=1_752_600_060_000, sl_price=95000.0)
+    with pytest.raises(VenueWritesQuarantinedError):
+        asyncio.run(plugin.modify_exit(old, new))
+    rows = _active_netting_ownership_rows(plugin)
+    assert [row.client_order_id for row in rows] == [first_coid]
+
+
+def __test_bybit_modify_persist_failure_keeps_the_old_owner__(tmp_path, monkeypatch):
+    """A failed replacement-row persist rolls the old owner's release back.
+
+    No replacement write was sent, so the old trading stop is still on the
+    venue: its ownership row must stay active, or that stop's fill would
+    book as external activity.
+    """
+    plugin = _linear_plugin(responses=[{}])
+    _attach_store(plugin, tmp_path, "net-modify-persist-fail")
+    old = _trail_exit_envelope()
+    asyncio.run(plugin.execute_exit(old))
+    first_coid = _active_netting_ownership_rows(plugin)[0].client_order_id
+
+    def failing_persist(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(execution_module, 'create_bracket_ownership_row',
+                        failing_persist)
+    new = _trail_exit_envelope(bar_ts_ms=1_752_600_060_000, sl_price=95000.0)
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(plugin.modify_exit(old, new))
+    assert len(plugin.calls) == 1  # the original attach only
+    rows = _active_netting_ownership_rows(plugin)
+    assert [row.client_order_id for row in rows] == [first_coid]
 
 
 def __test_bybit_modify_dropping_the_trail_clears_then_places_legs__(tmp_path):

@@ -55,7 +55,6 @@ from pynecore.core.broker.disappearance import (
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.models import (
-    CancelDispositionOutcome,
     ExchangeOrder,
     LegType,
     OrderEvent,
@@ -149,10 +148,9 @@ class _ReconcileMixin(_BybitBase, ABC):
         * ``is_exempt`` skips rows flagged ``natural_close_at`` (a known
           expected close), so the grace window never raises a false
           unexpected-cancel for them.
-        * ``cancel_siblings`` powers the ``stop_and_cancel`` policy's
-          zero-fill sweep; ``cancelled_event_factory`` builds the plugin's
-          leg-typed cancelled event; ``sibling_coids`` retires the settled
-          siblings sharing a CLOSED netting position.
+        * ``cancelled_event_factory`` builds the plugin's leg-typed
+          cancelled event; ``sibling_coids`` retires the settled siblings
+          sharing a CLOSED netting position.
         """
         tracker = self._disappearance
         if tracker is None:
@@ -164,7 +162,6 @@ class _ReconcileMixin(_BybitBase, ABC):
                 tracked_refs=self._tracked_refs,
                 confirm_missing=self._confirm_missing,
                 is_exempt=self._is_exempt,
-                cancel_siblings=self._cancel_sibling_working_orders,
                 request_quarantine=self.quarantine_sink,
                 sibling_coids=self._closed_position_siblings,
                 cancelled_event_factory=self._cancelled_event,
@@ -709,50 +706,3 @@ class _ReconcileMixin(_BybitBase, ABC):
             if other.client_order_id != row.client_order_id
             and self._is_settled_position(other)
         ]
-
-    async def _cancel_sibling_working_orders(self, row: 'OrderRow') -> None:
-        """Best-effort zero-fill sibling cancel sweep (``stop_and_cancel``).
-
-        Cancels every OTHER bot-owned resting order in the origin row's
-        symbol and retires its store row, so the halt does not strand the
-        remaining working orders. Rows with live filled exposure (a settled
-        position, or a partial fill whose residual is still working) are
-        left for the operator — retiring their tracking row would strand
-        real broker exposure. A sibling whose cancel disposition is
-        ambiguous (already-filled / unknown) is kept live so a surfaced fill
-        can still book against it. Per-order failures are swallowed — this
-        runs while the quarantine / halt is already armed.
-        """
-        if self.store_ctx is None:
-            return
-        market = await asyncio.to_thread(self._broker_market)
-        for other in list(self.store_ctx.iter_live_orders(symbol=row.symbol)):
-            if other.client_order_id == row.client_order_id:
-                continue
-            extras = other.extras or {}
-            if not (other.exchange_order_id or extras.get('order_id')):
-                continue
-            if (extras.get('kind') in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)
-                    and other.filled_qty > _FILL_EPS):
-                # Real broker exposure — never cancel-and-retire it.
-                continue
-            try:
-                outcome = await self._cancel_outcome_for(
-                    market, other.client_order_id,
-                )
-            except BybitError:
-                # Ambiguous disposition (mapped reject / transport) — leave
-                # the row live for the reconcile to resolve.
-                continue
-            if outcome is not CancelDispositionOutcome.CANCEL_CONFIRMED:
-                # ALREADY_FILLED / UNKNOWN: the order may have filled or its
-                # cancel is unconfirmed — keep the row live.
-                continue
-            # ``_cancel_outcome_for`` already retired the row on a confirmed
-            # cancel; record the cascade for the forensic audit.
-            self.store_ctx.log_event(
-                'unexpected_cancel_cascade',
-                client_order_id=other.client_order_id,
-                exchange_order_id=other.exchange_order_id,
-                payload={'origin_coid': row.client_order_id},
-            )

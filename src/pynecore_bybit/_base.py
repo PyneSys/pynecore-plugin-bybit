@@ -36,7 +36,6 @@ if TYPE_CHECKING:
 
     from pynecore.core.broker.disappearance import DisappearanceTracker
     from pynecore.core.broker.models import (
-        CancelDispositionOutcome,
         DispatchEnvelope,
         EntryIntent,
         ExchangeOrder,
@@ -514,11 +513,6 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     async def _confirm_lookup(
             self, market: 'InstrumentInfo', coid: str,
     ) -> 'tuple[dict | None, bool]': ...
-
-    @abstractmethod
-    async def _cancel_outcome_for(
-            self, market: 'InstrumentInfo', coid: str,
-    ) -> 'CancelDispositionOutcome': ...
 
     @abstractmethod
     def _inverse_anchor_for(self, coid: str, *,
