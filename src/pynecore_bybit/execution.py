@@ -103,6 +103,7 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
+from pynecore.core.broker.protection_guard import ProtectionLevels
 from pynecore.core.broker.store_helpers import (
     BRACKET_OWN_STATE_RELEASED,
     ENTRY_KIND_POSITION,
@@ -139,9 +140,12 @@ from .helpers import (
     base_to_contracts,
     base_to_contracts_reduce,
     contracts_to_base,
+    exit_leg_levels,
     format_decimal,
     quantize_qty,
     round_price,
+    trading_stop_key,
+    trading_stop_levels,
 )
 from .models import InstrumentInfo
 from .positions import HEDGE_IDX_BUY, HEDGE_IDX_SELL, POSITION_MODE_HEDGE
@@ -179,6 +183,11 @@ _DEAD_ORDER_STATUSES = frozenset({
 #: retry (whose original was created at ~the same instant as this
 #: instance's persist-first dispatch row) can never be misread as spent.
 _SPENT_COID_SKEW_MS = 5_000
+
+#: Row extras flag of a dispatch retired by :meth:`_retire_spent_dispatch`:
+#: the venue order under its ``orderLinkId`` is a prior instance's, never
+#: this row's.
+_PRIOR_INSTANCE_ORDER_EXTRA = 'prior_instance_order'
 
 
 class _ExecutionMixin(_BybitBase, ABC):
@@ -219,6 +228,8 @@ class _ExecutionMixin(_BybitBase, ABC):
         if row is None:
             return None, None, None
         extras = row.extras or {}
+        if extras.get(_PRIOR_INSTANCE_ORDER_EXTRA):
+            return None, None, None
         kind = extras.get('kind')
         if kind == 'exit_leg':
             leg = (LegType.TAKE_PROFIT if extras.get('leg') == 'tp'
@@ -260,6 +271,9 @@ class _ExecutionMixin(_BybitBase, ABC):
                 existing = await self._lookup_order_by_coid(coid)
                 if existing is not None:
                     status = str(existing.get('orderStatus') or '')
+                    prior_instance = self._duplicate_original_is_spent(coid, existing)
+                    if prior_instance:
+                        self._retire_spent_dispatch(coid)
                     if status in _DEAD_ORDER_STATUSES:
                         raise ClientOrderIdSpentError(
                             f"Bybit {context}: orderLinkId {coid} is spent — "
@@ -267,7 +281,7 @@ class _ExecutionMixin(_BybitBase, ABC):
                             f"the original order is terminal "
                             f"({status}); nothing is live under this id"
                         ) from e
-                    if self._duplicate_original_is_spent(coid, existing):
+                    if prior_instance:
                         raise ClientOrderIdSpentError(
                             f"Bybit {context}: orderLinkId {coid} is spent — "
                             f"the duplicate original was created "
@@ -356,6 +370,29 @@ class _ExecutionMixin(_BybitBase, ABC):
         if created <= 0:
             return False
         return created < row.created_ts_ms - _SPENT_COID_SKEW_MS
+
+    def _retire_spent_dispatch(self, coid: str) -> None:
+        """Forget this instance's dispatch under an id a prior instance spent.
+
+        Nothing of this instance landed under ``coid``: the venue holds only
+        the prior instance's order. Left live, the persist-first row and the
+        identity map would claim that order — its executions would book as
+        this run's fills (measured live: bybit-inverse cycle 225, a 166-
+        contract execution from six hours earlier booked as the new long's
+        fill and doubled the book).
+        """
+        self._order_identity.pop(coid, None)
+        self._dispatch_qty.pop(coid, None)
+        if self.store_ctx is not None:
+            row = self.store_ctx.get_order(coid)
+            if row is not None:
+                # The closed row stays readable by ``orderLinkId``: the flag
+                # keeps :meth:`_resolve_identity` from mapping the prior
+                # instance's executions onto it.
+                extras = dict(row.extras or {})
+                extras[_PRIOR_INSTANCE_ORDER_EXTRA] = True
+                self.store_ctx.upsert_order(coid, extras=extras)
+            self.store_ctx.close_order(coid)
 
     # --- sizing / pre-flight ----------------------------------------------------
 
@@ -1262,10 +1299,12 @@ class _ExecutionMixin(_BybitBase, ABC):
                     self._restore_netting_ownership(
                         superseded_row.client_order_id, superseded_row)
 
+        protects = 'buy' if intent.side == 'sell' else 'sell'
         try:
             await self._post_trading_stop(
                 market, tp_price=tp_price, sl_price=sl_price,
-                trail_distance=trail_distance,
+                trail_distance=trail_distance, row_coid=own_coid,
+                protects=protects,
             )
         except VenueWritesQuarantinedError:
             restore_ownership()
@@ -1285,7 +1324,8 @@ class _ExecutionMixin(_BybitBase, ABC):
             elif e.ret_code in AMBIGUOUS_DISPOSITION_CODES:
                 if not await self._resolve_ambiguous_trading_stop(
                         market, tp_price=tp_price, sl_price=sl_price,
-                        trail_distance=trail_distance):
+                        trail_distance=trail_distance, row_coid=own_coid,
+                        protects=protects):
                     # Undecided after readback + one retry. The attach may
                     # have landed, so the ownership row stays ACTIVE; the
                     # defensive flatten below resolves the exposure and a
@@ -1302,7 +1342,8 @@ class _ExecutionMixin(_BybitBase, ABC):
         except BybitError as e:
             if not await self._resolve_ambiguous_trading_stop(
                     market, tp_price=tp_price, sl_price=sl_price,
-                    trail_distance=trail_distance):
+                    trail_distance=trail_distance, row_coid=own_coid,
+                    protects=protects):
                 raise attach_reject(
                     f"stayed unresolved after a transport failure: {e}",
                     moot=False) from e
@@ -1379,6 +1420,7 @@ class _ExecutionMixin(_BybitBase, ABC):
             self, market: InstrumentInfo, *,
             tp_price: Decimal | None, sl_price: Decimal | None,
             trail_distance: Decimal | None,
+            row_coid: str | None, protects: str | None = None,
     ) -> None:
         """Write the one-way position's trading-stop attributes verbatim.
 
@@ -1387,7 +1429,22 @@ class _ExecutionMixin(_BybitBase, ABC):
         call with all three ``None`` wipes the bracket wholesale. Raw —
         the callers own the error classification (attach, clear and
         modify need different taxonomies).
+
+        The write is recorded with the protection guard around the request
+        (:meth:`_settle_trading_stop_write`), so its own echo is never judged
+        as an external edit.
+
+        :param row_coid: The ownership row the levels persist on.
+        :param protects: The position side the stop protects (``None`` on
+            a clear).
         """
+        key = trading_stop_key(int(_NETTING_LEG_ID))
+        levels = trading_stop_levels(
+            float(tp_price) if tp_price is not None else None,
+            float(sl_price) if sl_price is not None else None,
+            float(trail_distance) if trail_distance is not None else None,
+        )
+        write = self._expect_protection(key, levels, row_coid=row_coid, protects=protects)
         body: dict[str, _JsonScalar] = {
             'category': market.category,
             'symbol': market.symbol,
@@ -1400,13 +1457,49 @@ class _ExecutionMixin(_BybitBase, ABC):
             'trailingStop': (format_decimal(trail_distance)
                              if trail_distance is not None else '0'),
         }
-        await self._call('/v5/position/trading-stop', method='post',
-                         body=body, auth=True)
+        try:
+            await self._call('/v5/position/trading-stop', method='post',
+                             body=body, auth=True)
+        except BybitAPIError as e:
+            self._settle_trading_stop_write(key, levels, e, write=write)
+            raise
+        except BaseException:
+            self._settle_protection(key, None, write=write)
+            raise
+        self._settle_trading_stop_write(key, levels, None, write=write)
+
+    def _settle_trading_stop_write(
+            self, key: str, levels: ProtectionLevels,
+            error: BybitAPIError | None, *, write: int,
+    ) -> None:
+        """Settle one trading-stop write with the protection guard.
+
+        A success or a "not modified" reject means the venue carries
+        ``levels``; a cleared stop (or a vanished position) is no longer
+        guarded. Any other answered reject refused ``levels``; a server-side
+        failure leaves the outcome unknown and keeps every level recorded
+        so far acceptable.
+
+        :param write: The id :meth:`_expect_protection` returned for the write.
+        """
+        cleared = levels == ProtectionLevels()
+        if error is None or error.ret_code == 34040:
+            self._settle_protection(key, levels, write=write)
+            if cleared:
+                self._forget_protection(key)
+            return
+        if error.ret_code in AMBIGUOUS_DISPOSITION_CODES:
+            self._settle_protection(key, None, write=write)
+        else:
+            self._settle_protection(key, None, rejected=levels, write=write)
+        if is_trading_stop_zero_position_reject(error):
+            self._forget_protection(key)
 
     async def _resolve_ambiguous_trading_stop(
             self, market: InstrumentInfo, *,
             tp_price: Decimal | None, sl_price: Decimal | None,
             trail_distance: Decimal | None,
+            row_coid: str | None, protects: str | None,
     ) -> bool:
         """Resolve an ambiguous trading-stop write: readback, retry, readback.
 
@@ -1422,7 +1515,8 @@ class _ExecutionMixin(_BybitBase, ABC):
         try:
             await self._post_trading_stop(
                 market, tp_price=tp_price, sl_price=sl_price,
-                trail_distance=trail_distance,
+                trail_distance=trail_distance, row_coid=row_coid,
+                protects=protects,
             )
         except BybitAPIError as e:
             if e.ret_code != 34040:
@@ -1524,6 +1618,7 @@ class _ExecutionMixin(_BybitBase, ABC):
 
     async def _clear_position_trading_stop(
             self, market: InstrumentInfo, *, context_coid: str,
+            row_coid: str | None,
     ) -> None:
         """Clear the one-way position's trading stop (benign-tolerant).
 
@@ -1535,6 +1630,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         try:
             await self._post_trading_stop(
                 market, tp_price=None, sl_price=None, trail_distance=None,
+                row_coid=row_coid,
             )
         except BybitAPIError as e:
             if is_benign_trading_stop_reject(e):
@@ -1628,15 +1724,31 @@ class _ExecutionMixin(_BybitBase, ABC):
             sl_level=float(price) if leg == 'sl' else None,
             extras=extras,
         )
+        levels = exit_leg_levels(leg_type, float(price))
+        write = self._expect_protection(coid, levels, row_coid=coid)
         try:
             result = await self._order_post(
                 '/v5/order/create', body, coid=coid, context=f"exit {leg} leg",
             )
         except Exception as exc:
             self._mark_dispatch_failure(coid, exc)
+            if isinstance(exc, OrderDispositionUnknownError):
+                self._settle_protection(coid, None, write=write)
+            else:
+                # Nothing landed under this id: there is no leg to guard.
+                self._settle_protection(coid, None, rejected=levels, write=write)
+                self._forget_protection(coid)
+            raise
+        except BaseException:
+            self._settle_protection(coid, None, write=write)
             raise
         order_id = str(result.get('orderId') or '')
         self._confirm_row(coid, order_id, extras)
+        # ``_confirm_row`` rewrote the row extras; the settle persists the
+        # levels again. An adopted duplicate reports the levels it carries.
+        self._settle_protection(
+            coid, self._landed_leg_levels(result, leg_type) or levels, write=write,
+        )
         if self.store_ctx is not None:
             self.store_ctx.log_event(
                 'exit_leg_dispatched', client_order_id=coid,
@@ -1662,6 +1774,27 @@ class _ExecutionMixin(_BybitBase, ABC):
             reduce_only=True,
             client_order_id=coid,
         )
+
+    @staticmethod
+    def _landed_leg_levels(
+            result: dict, leg_type: LegType,
+    ) -> ProtectionLevels | None:
+        """The levels an adopted duplicate exit leg carries on the venue.
+
+        A duplicate ``orderLinkId`` create returns the already-landed order
+        object (it carries ``orderStatus``); a plain create ACK carries no
+        price and yields ``None``.
+        """
+        if not result.get('orderStatus'):
+            return None
+        field = 'price' if leg_type is LegType.TAKE_PROFIT else 'triggerPrice'
+        try:
+            price = float(result.get(field) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if price <= 0.0:
+            return None
+        return exit_leg_levels(leg_type, price)
 
     @override
     async def execute_close(self, envelope: DispatchEnvelope) -> ExchangeOrder:
@@ -1825,6 +1958,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         """Clear one owned netting trading stop + release its row."""
         await self._clear_position_trading_stop(
             market, context_coid=row.client_order_id,
+            row_coid=row.client_order_id,
         )
         self._release_netting_ownership(row.client_order_id)
         if self.store_ctx is not None:
@@ -2310,16 +2444,32 @@ class _ExecutionMixin(_BybitBase, ABC):
                 body['price'] = format_decimal(price)
             else:
                 body['triggerPrice'] = format_decimal(price)
+            leg_levels = exit_leg_levels(
+                LegType.TAKE_PROFIT if leg == 'tp' else LegType.STOP_LOSS,
+                float(price),
+            )
+            write = self._expect_protection(old_coid, leg_levels, row_coid=old_coid)
             try:
                 result = await self._amend_or_none(body, coid=old_coid)
             except BybitAPIError as e:
+                # ``_amend_or_none`` parks every ambiguous outcome as
+                # disposition-unknown: a raw API error is an answered reject.
+                self._settle_protection(old_coid, None, rejected=leg_levels, write=write)
                 mapped = map_broker_error(e)
                 if mapped is not None:
                     raise mapped from e
                 raise reject_error(e) from e
+            except BaseException:
+                self._settle_protection(old_coid, None, write=write)
+                raise
+            if result is not None:
+                self._settle_protection(old_coid, leg_levels, write=write)
+            else:
+                self._settle_protection(old_coid, None, rejected=leg_levels, write=write)
             if result is None:
                 # Leg vanished mid-amend (fill/cancel race) — resolve the
                 # whole bracket through cancel+recreate.
+                self._forget_protection(old_coid)
                 return await super().modify_exit(old, new)
             self._dispatch_qty[old_coid] = float(qty)
             if self.store_ctx is not None:
@@ -2398,6 +2548,7 @@ class _ExecutionMixin(_BybitBase, ABC):
             return await self._execute_exit(new, supersedes=tuple(rows))
         await self._clear_position_trading_stop(
             market, context_coid=old.client_order_id(KIND_EXIT_SL),
+            row_coid=rows[0].client_order_id if rows else None,
         )
         for row in rows:
             self._release_netting_ownership(row.client_order_id)

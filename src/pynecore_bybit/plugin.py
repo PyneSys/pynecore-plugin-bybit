@@ -26,6 +26,7 @@ from .execution import _ExecutionMixin
 from .hosts import resolve_hosts
 from .live_provider import _LiveProviderMixin
 from .positions import _PositionsMixin
+from .protection import _ProtectionMixin
 from .provider import _ProviderMixin
 from .reconcile import _ReconcileMixin
 from .recovery import _RecoveryMixin
@@ -41,6 +42,7 @@ class Bybit(
     _EventStreamMixin,
     _ExecutionMixin,
     _ReconcileMixin,
+    _ProtectionMixin,
     _RecoveryMixin,
     _PositionsMixin,
     _StateMixin,
@@ -144,3 +146,9 @@ class Bybit(
         self._last_own_fill_ms = 0
         self._deriv_snapshot_ms = 0
         self._disappearance = None
+        self._protected_sides = {}
+        self._protection_writes = {}
+        self._position_views = {}
+        self._foreign_open_seqs = {}
+        self._swept_ownership = {}
+        self._reported_external_exec_ids = set()

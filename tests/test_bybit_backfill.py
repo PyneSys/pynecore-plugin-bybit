@@ -529,6 +529,39 @@ def __test_vanished_order_verdict_carries_the_venue_cancel_type__(
         assert verdict.cancel_reason == reason, coid
 
 
+def __test_filled_order_finished_below_its_row_size_is_settled__(tmp_path, monkeypatch):
+    """A venue order Filled with every fill booked settles a row it left short.
+
+    Measured live (bybit-inverse cycle 225): the venue finished a 165-contract
+    close at 164; the row, judged against 165, stayed live and every pass
+    re-confirmed it as filled. A close row closes; an entry row keeps its
+    exposure and drops the remainder that can no longer fill; a row still
+    missing a fill is left to the per-order recovery.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    _seed_created_at(monkeypatch, broker, 'k1', now - 600_000, qty=0.0165,
+                     filled=0.0164, extras={'kind': 'close'})
+    _seed_created_at(monkeypatch, broker, 'k2', now - 600_000, qty=0.0165,
+                     filled=0.0164)
+    _seed_created_at(monkeypatch, broker, 'k3', now - 600_000, qty=0.0165,
+                     filled=0.0100, extras={'kind': 'close'})
+    for coid in ('k1', 'k2', 'k3'):
+        broker.orders.append(_venue_order(coid, status='Filled', cum_exec='0.0164'))
+
+    for coid in ('k1', 'k2', 'k3'):
+        row = broker.store_ctx.get_order(coid)
+        verdict = asyncio.run(broker._confirm_vanished_order(broker._market, row))
+        assert verdict.resolution is MissingResolution.FILLED
+
+    assert broker.store_ctx.get_order('k1').closed_ts_ms is not None
+    entry = broker.store_ctx.get_order('k2')
+    assert entry.closed_ts_ms is None and entry.qty == 0.0164
+    short = broker.store_ctx.get_order('k3')
+    assert short.closed_ts_ms is None and short.qty == 0.0165
+
+
 def __test_unindexed_execution_stays_queued_until_the_venue_lists_it__(
         tmp_path, monkeypatch):
     """Proof of a fill the execution list does not show yet is kept, not dropped."""
@@ -632,6 +665,30 @@ def __test_market_entry_fill_indexed_late_is_recovered__(tmp_path, monkeypatch):
     assert events[0].event_type == 'filled'
     assert broker.store_ctx.get_order('m1').filled_qty == 0.01
     assert broker._unbooked_fill_orders == {}
+
+
+def __test_prior_instance_order_under_the_same_id_books_no_fill__(tmp_path, monkeypatch):
+    """A venue order a prior instance created under the row's id is not the row's.
+
+    Measured live (bybit-inverse cycle 225): a replay rebuilt a coid a run six
+    hours earlier had spent; the order truth read by ``orderLinkId`` found that
+    run's filled order and its execution booked as the new entry's fill.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_created_at(monkeypatch, broker, 'm5', now - 600_000, qty=0.01)
+    broker.executions.append(_exec(exec_id='em5', order_id='x-m5', coid='m5',
+                                   qty=0.01, price=30000, ts_ms=now - 25_200_000,
+                                   symbol='BTCUSDT'))
+    broker.orders.append({**_venue_order('m5', status='Filled', cum_exec='0.01'),
+                          'createdTime': str(now - 25_200_000)})
+
+    asyncio.run(broker._note_unbooked_market_entries(broker._market))
+    assert broker._unbooked_fill_orders == {}
+    assert asyncio.run(broker._recover_unbooked_order_fills(broker._market)) == []
+    assert broker.store_ctx.get_order('m5').filled_qty == 0.0
 
 
 def __test_market_entry_order_truth_is_read_once__(tmp_path, monkeypatch):

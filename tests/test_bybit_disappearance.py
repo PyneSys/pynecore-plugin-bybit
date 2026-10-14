@@ -302,12 +302,12 @@ def _own_fill(broker, coid, *, exec_id, exec_time, qty='0.002') -> list:
     }, broker._market)
 
 
-def _position_push(broker, *, size, side, updated) -> None:
-    broker._ingest_position_frame({
-        'topic': 'position',
-        'data': [{'category': 'linear', 'symbol': 'BTCUSDT', 'positionIdx': 0,
-                  'size': size, 'side': side, 'updatedTime': updated}],
-    }, broker._market)
+def _position_push(broker, *, size, side, updated, seq=None) -> None:
+    row = {'category': 'linear', 'symbol': 'BTCUSDT', 'positionIdx': 0,
+           'size': size, 'side': side, 'updatedTime': updated}
+    if seq is not None:
+        row['seq'] = seq
+    broker._ingest_position_frame({'topic': 'position', 'data': [row]}, broker._market)
 
 
 def __test_flat_sweep_stale_position_keeps_entry_live__(tmp_path):
@@ -352,6 +352,29 @@ def __test_flat_sweep_genuine_flat_clears_envelope__(tmp_path):
     _position_push(broker, size='0', side='', updated='3000')
     assert 'e1' not in _live_coids(broker)            # swept on genuine flat
     assert 'e1' not in broker.store_ctx.replay()[0]   # envelope cleared
+
+
+def __test_flat_sweep_delayed_flat_push_keeps_entry_live__(tmp_path):
+    # A flat view (seq 5, time 1000) older than the own fill (2000) arrives
+    # after the open view (seq 20, time 3000) that already shows the fill. Its
+    # stale size must not be paired with the newer view's time: the entry row
+    # and its envelope stay live.
+    broker = _DisappearanceFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    _seed(broker, 'e1', qty=0.002, filled=0.002, state='confirmed',
+          kind=ENTRY_KIND_POSITION, exchange_order_id='o1')
+    broker._record_identity('e1', pine_id='Long', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.002)
+    broker.store_ctx.record_envelope('e1', 1_784_292_600_000, 0)
+    _own_fill(broker, 'e1', exec_id='x1', exec_time='2000')
+
+    _position_push(broker, size='0.002', side='Buy', updated='3000', seq='20')
+    _position_push(broker, size='0', side='', updated='1000', seq='5')
+    assert 'e1' in _live_coids(broker)
+    assert 'e1' in broker.store_ctx.replay()[0]
+
+    _position_push(broker, size='0', side='', updated='4000', seq='30')
+    assert 'e1' not in _live_coids(broker)            # a genuine flat still sweeps
 
 
 # === Transient reconcile failures log one line, not a traceback ===========

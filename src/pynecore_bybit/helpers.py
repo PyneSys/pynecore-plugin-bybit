@@ -12,6 +12,9 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from hashlib import sha256
 from typing import TYPE_CHECKING
 
+from pynecore.core.broker.models import LegType
+from pynecore.core.broker.protection_guard import ProtectionLevels
+
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
 
@@ -358,3 +361,37 @@ def venue_filled_qty(row: 'OrderRow') -> float:
     except (TypeError, ValueError):
         netted = 0.0
     return float(row.filled_qty) + netted
+
+
+#: Protection-guard key prefix of a position trading stop; the suffix is the
+#: ``positionIdx``.
+TRADING_STOP_KEY_PREFIX = 'trading-stop:'
+
+
+def trading_stop_key(position_idx: int) -> str:
+    """Guard key of the trading stop on one ``positionIdx``."""
+    return f"{TRADING_STOP_KEY_PREFIX}{position_idx}"
+
+
+def exit_leg_levels(leg_type: LegType, price: float) -> ProtectionLevels:
+    """The protection one order-based exit leg carries.
+
+    :param leg_type: :attr:`LegType.TAKE_PROFIT` (a limit at ``price``) or
+        :attr:`LegType.STOP_LOSS` (a trigger at ``price``).
+    :param price: The leg's limit / trigger price.
+    """
+    if leg_type is LegType.TAKE_PROFIT:
+        return ProtectionLevels(limit=price)
+    return ProtectionLevels(stop=price)
+
+
+def trading_stop_levels(
+        tp_price: float | None, sl_price: float | None,
+        trail_distance: float | None,
+) -> ProtectionLevels:
+    """The protection one trading-stop write sets (``None``: cleared)."""
+    return ProtectionLevels(
+        stop=sl_price, limit=tp_price,
+        trailing=trail_distance is not None,
+        trail_distance=trail_distance,
+    )

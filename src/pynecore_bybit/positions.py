@@ -44,7 +44,10 @@ from decimal import ROUND_DOWN, Decimal
 from time import time as epoch_time
 from typing import Callable
 
-from pynecore.core.broker.exceptions import ExchangeOrderRejectedError
+from pynecore.core.broker.exceptions import (
+    ExchangeOrderRejectedError,
+    OrderDispositionUnknownError,
+)
 from pynecore.core.broker.models import (
     DispatchEnvelope,
     EntryIntent,
@@ -54,6 +57,7 @@ from pynecore.core.broker.models import (
     OrderType,
     PositionLeg,
 )
+from pynecore.core.broker.protection_guard import ProtectionLevels
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
@@ -77,6 +81,8 @@ from .helpers import (
     contracts_to_base,
     format_decimal,
     round_price,
+    trading_stop_key,
+    trading_stop_levels,
     venue_filled_qty,
     wire_link_id,
 )
@@ -217,32 +223,43 @@ class _PositionsMixin(_BybitBase, ABC):
         flat sweep compares it against the last own fill so a stale-flat
         reading (a ``position`` push that has not yet caught up with the
         bot's own fill) never retires a live entry row.
+
+        A row older (by ``seq``) than a view of the same leg already seen is
+        a delayed push: its size and time are history and touch neither the
+        cache nor the watermark, so an old flat reading is never paired with
+        a newer view's timestamp.
         """
-        parsed: list[tuple[int, float, int]] = []
-        snapshot_ms = 0
+        parsed: list[tuple[int, float, int, dict]] = []
         for row in rows:
-            updated_ms = self._position_row_updated_ms(row)
             parsed.append((
                 self._position_row_index(row),
                 self._position_row_size(row),
-                updated_ms,
+                self._position_row_updated_ms(row),
+                row,
             ))
+        if not rows:
+            return
+        self._record_position_views(rows)
+        current = [(idx, size, updated_ms) for idx, size, updated_ms, row in parsed
+                   if not self._position_view_superseded(idx, row)]
+        if not current:
+            return
+        sizes = self._deriv_sizes
+        if sizes is None:
+            sizes = {}
+            self._deriv_sizes = sizes
+        snapshot_ms = 0
+        for idx, size, updated_ms in current:
+            sizes[idx] = size
             snapshot_ms = max(snapshot_ms, updated_ms)
-        if rows:
-            sizes = self._deriv_sizes
-            if sizes is None:
-                sizes = {}
-                self._deriv_sizes = sizes
-            for idx, size, _ in parsed:
-                sizes[idx] = size
-            # A snapshot just received reflects the venue state as of now;
-            # fall back to the local clock when the rows carry no
-            # ``updatedTime`` (a degenerate feed) so the freshness gate is
-            # never starved of a timestamp.
-            self._deriv_snapshot_ms = max(
-                self._deriv_snapshot_ms,
-                snapshot_ms or int(epoch_time() * 1000),
-            )
+        # A snapshot just received reflects the venue state as of now;
+        # fall back to the local clock when the rows carry no
+        # ``updatedTime`` (a degenerate feed) so the freshness gate is
+        # never starved of a timestamp.
+        self._deriv_snapshot_ms = max(
+            self._deriv_snapshot_ms,
+            snapshot_ms or int(epoch_time() * 1000),
+        )
 
     def _deriv_is_flat(self) -> bool:
         """Whether the last-known venue position of the symbol is flat.
@@ -346,7 +363,7 @@ class _PositionsMixin(_BybitBase, ABC):
                 row.get('unrealisedPnl'), field='unrealisedPnl',
             )
             if market.is_inverse and entry_price > 0.0:
-                size = contracts_to_base(size, entry_price)
+                size = self._inverse_core_size(side, size, entry_price)
                 # Inverse unrealised PnL arrives in the settle coin; the
                 # core's openprofit is quote-denominated — convert at the
                 # mark price (falling back to the last trade, then the
@@ -854,6 +871,23 @@ class _PositionsMixin(_BybitBase, ABC):
         self._inverse_net_contracts = contracts
         self._inverse_net_base = base
 
+    def _inverse_core_size(self, side: str, contracts: float, avg_price: float) -> float:
+        """Report an inverse position in the base the core was told it holds.
+
+        While the mirror holds the venue's exact contract count, its base is
+        the sum of the fills the core booked, so the report matches the book
+        exactly. Converting at the venue's average price instead differs from
+        it by a fraction of a contract (each fill converts at its own anchor),
+        which the core cannot tell from a manual reduction (measured live:
+        bybit-inverse cycle 226, 3.38e-09 BTC on a 165-contract short adopted
+        as an external close). A count that differs is a real change and
+        converts at the average price.
+        """
+        signed = contracts if side == 'buy' else -contracts
+        if signed == self._inverse_net_contracts:
+            return abs(self._inverse_net_base)
+        return contracts_to_base(contracts, avg_price)
+
     def _apply_inverse_fill(self, side: str, contracts: float, base: float) -> None:
         """Fold one own fill into the inverse net-position mirror.
 
@@ -1018,29 +1052,64 @@ class _PositionsMixin(_BybitBase, ABC):
         zero-position response, an idempotent re-amend with "not modified"
         — both benign no-ops (see
         :func:`~pynecore_bybit.exceptions.is_benign_trading_stop_reject`).
+
+        A transport or server-side failure leaves the outcome unknown. On an
+        attach it raises :class:`ExchangeOrderRejectedError`, so the emulator
+        flattens the leg rather than trust it protected. On a clear it raises
+        :class:`OrderDispositionUnknownError`: the emulator's persist-first
+        ``clearing`` row then re-drives the clear on the next sync.
         """
         del side  # Bybit derives the protective side from the leg itself.
         market = await asyncio.to_thread(self._broker_market)
+        idx = int(leg_id)
+        tp = (round_price(tp_price, market.tick_size_str)
+              if tp_price is not None else None)
+        sl = (round_price(sl_price, market.tick_size_str)
+              if sl_price is not None else None)
+        trail = (round_price(trail_offset, market.tick_size_str)
+                 if trail_offset is not None else None)
         body: dict = {
             'category': market.category,
             'symbol': market.symbol,
-            'positionIdx': int(leg_id),
+            'positionIdx': idx,
             'tpslMode': 'Full',
-            'takeProfit': (format_decimal(round_price(tp_price, market.tick_size_str))
-                           if tp_price is not None else '0'),
-            'stopLoss': (format_decimal(round_price(sl_price, market.tick_size_str))
-                         if sl_price is not None else '0'),
-            'trailingStop': (format_decimal(round_price(trail_offset,
-                                                        market.tick_size_str))
-                             if trail_offset is not None else '0'),
+            'takeProfit': format_decimal(tp) if tp is not None else '0',
+            'stopLoss': format_decimal(sl) if sl is not None else '0',
+            'trailingStop': format_decimal(trail) if trail is not None else '0',
         }
+        key = trading_stop_key(idx)
+        levels = trading_stop_levels(
+            float(tp) if tp is not None else None,
+            float(sl) if sl is not None else None,
+            float(trail) if trail is not None else None,
+        )
+        cleared = levels == ProtectionLevels()
+        write = self._expect_protection(
+            key, levels, row_coid=self._trading_stop_row_coid(leg_id, coid),
+        )
         try:
             await self._call('/v5/position/trading-stop', method='post',
                              body=body, auth=True)
         except BybitAPIError as e:
+            if e.ret_code == 34040:
+                # "Not modified": the leg already carries these levels.
+                self._settle_protection(key, levels, write=write)
+            elif e.ret_code in AMBIGUOUS_DISPOSITION_CODES:
+                self._settle_protection(key, None, write=write)
+            else:
+                self._settle_protection(key, None, rejected=levels, write=write)
             if is_benign_trading_stop_reject(e):
+                if cleared or e.ret_code != 34040:
+                    # Cleared, or the leg is flat: nothing left to guard.
+                    self._forget_protection(key)
                 return
             if e.ret_code in AMBIGUOUS_DISPOSITION_CODES:
+                if cleared:
+                    raise OrderDispositionUnknownError(
+                        f"Bybit trading-stop clear on leg {leg_id}: server-side "
+                        f"failure (retCode={e.ret_code}); disposition unknown",
+                        client_order_id=coid, cause=e,
+                    ) from e
                 # Server-side failure — surface as a rejection so the
                 # emulator's attach path runs its defensive flatten instead
                 # of trusting an unprotected leg.
@@ -1052,7 +1121,19 @@ class _PositionsMixin(_BybitBase, ABC):
             if mapped is not None:
                 raise mapped from e
             raise reject_error(e) from e
-        except BybitError as e:
-            raise ExchangeOrderRejectedError(
-                f"Bybit trading-stop transport failure on leg {leg_id}: {e}"
-            ) from e
+        except BaseException as e:
+            self._settle_protection(key, None, write=write)
+            if isinstance(e, BybitError):
+                if cleared:
+                    raise OrderDispositionUnknownError(
+                        f"Bybit trading-stop clear on leg {leg_id}: transport "
+                        f"failure; disposition unknown",
+                        client_order_id=coid, cause=e,
+                    ) from e
+                raise ExchangeOrderRejectedError(
+                    f"Bybit trading-stop transport failure on leg {leg_id}: {e}"
+                ) from e
+            raise
+        self._settle_protection(key, levels, write=write)
+        if cleared:
+            self._forget_protection(key)

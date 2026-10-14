@@ -43,8 +43,12 @@ if TYPE_CHECKING:
         OrderEvent,
         PositionLeg,
     )
+    from pynecore.core.broker.protection_guard import (
+        ProtectionLevelGuard,
+        ProtectionLevels,
+    )
     from pynecore.core.broker.spot_inventory import SpotInventoryManager
-    from pynecore.core.broker.storage import OrderRow
+    from pynecore.core.broker.storage import OrderRow, RunContext
 
     from .hosts import BybitHosts
     from .inventory import _BybitSpotPort
@@ -315,6 +319,35 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # predates it). Clamps both the resumed watermark and the overlapped
     # window start.
     _deriv_exec_floor_ms: int = 0
+    # External-intervention detection (protection.py). The guard holds the
+    # SL/TP levels the bot put on the venue; built lazily against the
+    # journal it persists to, rebuilt if ``store_ctx`` is replaced. Class
+    # defaults because the runtime ``__init__`` does not assign them.
+    _protection_guard_instance: 'ProtectionLevelGuard | None' = None
+    _protection_guard_store: 'RunContext | None' = None
+    # Position side each one-way trading-stop key protects, recorded at the
+    # write (the venue clears the stop when that position closes or flips).
+    _protected_sides: dict[str, str]
+    # Per protection key: own writes in flight and the wall-clock time the
+    # last one was sent or settled. A position view older than that must
+    # not retire the key (a flat read that predates the bot's own attach).
+    _protection_writes: dict[str, tuple[int, float]]
+    # ``positionIdx`` -> recorded position views ``(seq, size, updatedTime)``
+    # in ``seq`` order: a closing execution is judged against the newest view
+    # that precedes it, never one that already shows the close.
+    _position_views: dict[int, list[tuple[int, float, int]]]
+    # ``positionIdx`` -> ``seq`` of each foreign execution that opened
+    # exposure on the leg (``0``: no ``seq``). A view older than such an
+    # open understates the foreign share, so a close after it is not
+    # provably the run's.
+    _foreign_open_seqs: dict[int, list[int]]
+    # ``positionIdx`` -> (signed run exposure, flat view ``seq``) the flat
+    # sweep retired: a manual close that arrives after the flat view is
+    # judged against it.
+    _swept_ownership: dict[int, tuple[float, int]]
+    # Execution ids already reported as a manual close (the live push and the
+    # backfill overlap re-read can deliver the same execution).
+    _reported_external_exec_ids: set[str]
 
     # ------------------------------------------------------------------
     # Bybit-private cross-mix-in method surface.
@@ -437,6 +470,13 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     @abstractmethod
     def _position_row_size(row: dict) -> float: ...
 
+    @staticmethod
+    @abstractmethod
+    def _position_row_index(row: dict) -> int: ...
+
+    @abstractmethod
+    def _run_owned_hedge_signed_size(self) -> float: ...
+
     @abstractmethod
     def _ingest_position_sizes(self, rows: list[dict]) -> None: ...
 
@@ -508,6 +548,9 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     @abstractmethod
     async def _lookup_order_by_coid(self, coid: str) -> dict | None: ...
 
+    @abstractmethod
+    def _duplicate_original_is_spent(self, coid: str, existing: dict) -> bool: ...
+
     # --- Runtime reconcile (reconcile.py) ---
     @abstractmethod
     async def _confirm_lookup(
@@ -578,6 +621,54 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
 
     @abstractmethod
     async def _settle_cancelled_entries(self, market: 'InstrumentInfo') -> None: ...
+
+    # --- External-intervention detection (protection.py) ---
+    @abstractmethod
+    def _expect_protection(
+            self, key: str, levels: 'ProtectionLevels', *,
+            row_coid: str | None, protects: str | None = None,
+    ) -> int: ...
+
+    @abstractmethod
+    def _settle_protection(
+            self, key: str, confirmed: 'ProtectionLevels | None', *,
+            rejected: 'ProtectionLevels | None' = None, write: int | None = None,
+    ) -> None: ...
+
+    @abstractmethod
+    def _forget_protection(self, key: str) -> None: ...
+
+    @abstractmethod
+    def _forget_trading_stop_if_flat(self, side: str) -> None: ...
+
+    @abstractmethod
+    def _trading_stop_row_coid(self, leg_id: str, coid: str) -> str | None: ...
+
+    @abstractmethod
+    def _observe_exit_leg_push(
+            self, entry: dict, coid: str, leg_type: LegType,
+            market: 'InstrumentInfo',
+    ) -> None: ...
+
+    @abstractmethod
+    def _observe_position_rows(
+            self, rows: list[dict], market: 'InstrumentInfo', *,
+            read_started_at: float | None,
+    ) -> None: ...
+
+    @abstractmethod
+    def _note_external_execution(
+            self, entry: dict, market: 'InstrumentInfo', *, ambiguous: bool,
+    ) -> None: ...
+
+    @abstractmethod
+    def _record_position_views(self, rows: list[dict]) -> None: ...
+
+    @abstractmethod
+    def _position_view_superseded(self, idx: int, row: dict) -> bool: ...
+
+    @abstractmethod
+    def _remember_swept_ownership(self) -> None: ...
 
     # --- Entry-row ownership (events.py) ---
     @abstractmethod

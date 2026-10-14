@@ -643,8 +643,30 @@ class _ReconcileMixin(_BybitBase, ABC):
         if status == 'Filled' or cum_exec > 0:
             # The order filled: the disappearance premise is false. Clear
             # the stamp and leave the booking to the fill path.
+            if status == 'Filled':
+                self._settle_filled_row(row, float(cum_exec))
             return MissingConfirmation(MissingResolution.FILLED)
         return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+
+    def _settle_filled_row(self, row: 'OrderRow', cum_exec: float) -> None:
+        """Settle a row whose venue order finished with every fill booked.
+
+        The venue can finish an order below the dispatched size (a
+        reduce-only order trimmed to the position left to reduce). The fill
+        path settles that from the execution's ``orderQty``; a row whose
+        fills were booked without it — adopted across a restart, say — would
+        otherwise stay live forever, re-stamped and re-confirmed as filled
+        on every pass (measured live: bybit-inverse cycle 225, a 165-contract
+        close the venue finished at 164). An exit / close row is closed; an
+        entry row keeps owning its exposure and drops only the remainder
+        that can no longer fill.
+        """
+        if self.store_ctx is None or venue_filled_qty(row) < cum_exec - _FILL_EPS:
+            return
+        if (row.extras or {}).get('kind') in ('exit_leg', 'close'):
+            self.store_ctx.close_order(row.client_order_id)
+        elif row.qty > row.filled_qty + _FILL_EPS:
+            self.store_ctx.upsert_order(row.client_order_id, qty=row.filled_qty)
 
     async def _confirm_lookup(
             self, market: 'InstrumentInfo', coid: str,
@@ -671,6 +693,10 @@ class _ReconcileMixin(_BybitBase, ABC):
                 return None, False
             entries = result.get('list') or []
             if entries:
+                if self._duplicate_original_is_spent(coid, entries[0]):
+                    # A prior instance's order under the same id is not
+                    # this row's order: nothing of ours exists under it.
+                    return None, True
                 return entries[0], True
         return None, True
 

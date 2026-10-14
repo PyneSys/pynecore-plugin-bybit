@@ -30,11 +30,12 @@ from pynecore.core.broker.models import (
     ExitIntent,
     LegType,
     OrderType,
+    QuarantineKind,
 )
 from pynecore.core.broker.idempotency import KIND_ENTRY
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
-from pynecore.core.broker.store_helpers import ENTRY_KIND_WORKING
+from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, ENTRY_KIND_WORKING
 
 import pynecore_bybit.events as events_module
 import pynecore_bybit.execution as execution_module
@@ -599,8 +600,19 @@ def __test_bybit_duplicate_coid_prior_instance_spent__(tmp_path):
                    'orderStatus': 'Filled', 'createdTime': '1000000000000'}]},
     ])
     _attach_store(plugin, tmp_path, "prior")
+    envelope = _entry_envelope()
+    coid = envelope.client_order_id(KIND_ENTRY)
     with pytest.raises(ClientOrderIdSpentError):
-        asyncio.run(plugin.execute_entry(_entry_envelope()))
+        asyncio.run(plugin.execute_entry(envelope))
+    # Nothing of this instance landed under the id: its dispatch row and
+    # identity must not claim the prior run's order (bybit-inverse cycle 225).
+    assert plugin.store_ctx is not None
+    spent_row = plugin.store_ctx.get_order(coid)
+    assert spent_row is not None and spent_row.closed_ts_ms is not None
+    assert coid not in plugin._order_identity
+    # The closed row stays readable by id: a late execution of the prior
+    # run's order must still resolve as foreign, never as this row's fill.
+    assert plugin._resolve_identity(coid, '777') == (None, None, None)
 
     # A same-instant original (createdTime aligned with the dispatch row) is
     # a genuine in-process retry and is still adopted.
@@ -1821,6 +1833,29 @@ def __test_bybit_position_port_primitives__():
         ))
 
 
+def __test_bybit_trading_stop_clear_failure_is_disposition_unknown__():
+    """An unconfirmed clear is retried; an unconfirmed attach still flattens"""
+    # Live crash, bybit c270 2026-10-14: a strategy cancel cleared a leg's
+    # bracket during a venue 503 and the rejection ended the run. The
+    # emulator retries a clear only on disposition-unknown.
+    for failure in (BybitConnectionError("HTTP 503"),
+                    BybitAPIError("server timeout", ret_code=10016)):
+        plugin = _linear_plugin(responses=[failure])
+        with pytest.raises(OrderDispositionUnknownError) as raised:
+            asyncio.run(plugin.amend_bracket(
+                'BTCUSDT', '2', side='buy', tp_price=None, sl_price=None,
+                trail_offset=None, coid='coid-clear',
+            ))
+        assert raised.value.client_order_id == 'coid-clear'
+
+        plugin = _linear_plugin(responses=[failure])
+        with pytest.raises(ExchangeOrderRejectedError):
+            asyncio.run(plugin.amend_bracket(
+                'BTCUSDT', '2', side='buy', tp_price=90000.0, sl_price=None,
+                trail_offset=None, coid='coid-attach',
+            ))
+
+
 def __test_bybit_linear_event_filters_and_flat_sweep__():
     """Category/execType filters and the position-cache flat sweep"""
     plugin = _linear_plugin()
@@ -2089,6 +2124,70 @@ def __test_bybit_one_way_close_fill_nets_the_entry_rows__(tmp_path):
     assert row is not None and row.closed_ts_ms is not None
 
 
+def __test_bybit_close_the_venue_trimmed_is_complete_at_its_size__(tmp_path):
+    """A reduce-only close the venue cut to the position is Filled, not partial.
+
+    Measured live (bybit-inverse cycle 225): a 165-contract close met a
+    164-contract position; Bybit booked the order as 164 and reported it
+    Filled (``orderQty`` 164, ``leavesQty`` 0). Judged against the
+    dispatched 165, the row stayed live and the cycle-end check read it as
+    164 contracts the run still owned.
+    """
+    plugin = _inverse_plugin()
+    market = plugin._market
+    assert market is not None
+    _attach_store(plugin, tmp_path, "trimmed-close")
+    plugin.store_ctx.upsert_order(
+        'coid-c1', symbol='BTCUSD', side='buy', qty=165.0, state='confirmed',
+        from_entry='', intent_key='',
+        extras={'kind': 'close', 'close_of_entry': '', 'anchor': '82766.2'},
+    )
+    plugin._record_identity('coid-c1', pine_id=None, from_entry='',
+                            leg_type=LegType.CLOSE, qty=165.0)
+    plugin._wire_anchor['coid-c1'] = Decimal('82766.2')
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'category': 'inverse', 'symbol': 'BTCUSD', 'execType': 'Trade',
+            'execId': 'tc-1', 'orderId': '951', 'orderLinkId': 'coid-c1',
+            'side': 'Buy', 'execQty': '164', 'execPrice': '82766.1',
+            'orderQty': '164', 'leavesQty': '0', 'execTime': '1752600000000',
+        }],
+    }, market)
+    assert [e.event_type for e in events] == ['filled']
+    row = plugin.store_ctx.get_order('coid-c1')
+    assert row is not None and row.closed_ts_ms is not None
+    assert row.qty == 164.0
+
+    # A slice of a trimmed order that keeps working stays partial.
+    plugin.store_ctx.upsert_order(
+        'coid-c2', symbol='BTCUSD', side='buy', qty=165.0, state='confirmed',
+        from_entry='', intent_key='',
+        extras={'kind': 'close', 'close_of_entry': '', 'anchor': '82766.2'},
+    )
+    plugin._record_identity('coid-c2', pine_id=None, from_entry='',
+                            leg_type=LegType.CLOSE, qty=165.0)
+    plugin._wire_anchor['coid-c2'] = Decimal('82766.2')
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'category': 'inverse', 'symbol': 'BTCUSD', 'execType': 'Trade',
+            'execId': 'tc-2', 'orderId': '952', 'orderLinkId': 'coid-c2',
+            'side': 'Buy', 'execQty': '100', 'execPrice': '82766.1',
+            'orderQty': '164', 'leavesQty': '64', 'execTime': '1752600001000',
+        }],
+    }, market)
+    assert [e.event_type for e in events] == ['partial']
+    row = plugin.store_ctx.get_order('coid-c2')
+    assert row is not None and row.closed_ts_ms is None
+    assert row.qty == 164.0
+
+    # A row without a usable order size keeps the dispatched one.
+    assert events_module._venue_trimmed_qty({}, 165.0) is None
+    assert events_module._venue_trimmed_qty({'orderQty': '0'}, 165.0) is None
+    assert events_module._venue_trimmed_qty({'orderQty': '165'}, 165.0) is None
+
+
 def __test_bybit_inverse_amend_anchor__():
     """In-place amends keep the dispatched anchor pinned per coid"""
     # Unfilled LIMIT amend: the price moves, the anchor does not — a
@@ -2282,6 +2381,29 @@ def __test_bybit_inverse_position_and_hedge_gate__():
         asyncio.run(plugin._ensure_broker_started())
 
 
+def __test_bybit_inverse_position_reports_the_booked_base__():
+    """A position the mirror tracks reports the base the fills booked.
+
+    Measured live (bybit-inverse cycle 226): a 165-contract short booked as
+    0.001997073379738 BTC was reported as 165 / avgPrice = 0.00199707, and
+    the 3.38e-09 difference was adopted as a manual close. A contract count
+    the mirror does not hold is a real change and converts at the average.
+    """
+    row = _position_row(symbol='BTCUSD', size='165', side='Sell',
+                        avgPrice='82621', unrealisedPnl='0', markPrice='82621')
+    plugin = _inverse_plugin(responses=[{'list': [row]}, {'list': [row]}])
+    plugin._inverse_net_contracts = -165.0
+    plugin._inverse_net_base = -0.001997073379738057
+    position = asyncio.run(plugin.get_position('BTCUSD'))
+    assert position is not None
+    assert position.size == 0.001997073379738057
+
+    plugin._inverse_net_contracts = -166.0
+    position = asyncio.run(plugin.get_position('BTCUSD'))
+    assert position is not None
+    assert position.size == pytest.approx(165 / 82621)
+
+
 def _venue_stop_execution(**overrides) -> dict:
     """A coid-less trading-stop execution row (venue-materialised close)."""
     row = {
@@ -2373,22 +2495,51 @@ def __test_bybit_venue_trading_stop_fill_attributes_in_backfill__(tmp_path):
         'external_activity_ignored')) == []
 
 
-def __test_bybit_manual_close_without_stop_type_stays_external__(tmp_path):
-    """A venue-UI manual close carries no ``stopOrderType`` — still external."""
+def __test_bybit_manual_close_without_stop_type_is_reported__(tmp_path):
+    """A venue-UI manual close carries no ``stopOrderType`` — someone else's close.
+
+    It is not booked as the bracket's fill (the engine adopts the venue's
+    shrink), and as it closed exposure the run owns it is reported as an
+    external intervention. Without a ``createType`` its origin is unknown,
+    so it is not reported.
+    """
     plugin = _linear_plugin()
     plugin._position_mode = POSITION_MODE_HEDGE
     _attach_store(plugin, tmp_path, "manual-close")
     _seed_bracket_ownership(plugin)
+    plugin.store_ctx.upsert_order(
+        'entry-s', symbol='BTCUSDT', side='sell', qty=0.02, filled_qty=0.02,
+        state='confirmed', intent_key='S', pine_entry_id='S',
+        extras={'kind': ENTRY_KIND_POSITION},
+    )
+    plugin._adoption_baselined = True
+    # The leg views before the close (``seq`` orders them against it).
+    plugin._ingest_position_sizes([
+        {'symbol': 'BTCUSDT', 'positionIdx': idx, 'size': size,
+         'updatedTime': '1752600000000', 'seq': '50'}
+        for idx, size in ((1, '0'), (2, '0.02'))
+    ])
+    quarantines: list = []
+    plugin.on_unexpected_cancel = 'stop'
+    plugin.quarantine_sink = lambda reason, ctx, *, kind: quarantines.append(kind)
     market = plugin._market
 
     events = plugin._translate_executions({
         'topic': 'execution',
-        'data': [_venue_stop_execution(stopOrderType='', execId='vs-2')],
+        'data': [_venue_stop_execution(stopOrderType='', execId='vs-2',
+                                       createType='CreateByClosing', seq='100')],
     }, market)
 
     assert events == []
     assert len(list(plugin.store_ctx.iter_events_by_kind_for_run_id(
         'external_activity_ignored'))) == 1
+    assert quarantines == [QuarantineKind.EXTERNAL_INTERVENTION]
+
+    plugin._translate_executions({
+        'topic': 'execution',
+        'data': [_venue_stop_execution(stopOrderType='', execId='vs-3')],
+    }, market)
+    assert len(quarantines) == 1
 
 
 def __test_bybit_ambiguous_bracket_ownership_refuses_to_guess__(tmp_path):
