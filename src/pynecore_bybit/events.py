@@ -71,7 +71,7 @@ from pynecore.core.broker.store_helpers import (
 from pynecore.core.plugin import override
 
 from ._base import _BybitBase
-from .exceptions import BybitError, traceback_wanted
+from .exceptions import BybitAdoptionBaselineError, BybitError, traceback_wanted
 from .helpers import (
     BRACKET_OWN_WIRE_QTY_EXTRA,
     CATEGORY_SPOT,
@@ -219,6 +219,18 @@ _VENUE_STOP_ORDER_LEG = {
     'StopLoss': LegType.STOP_LOSS,
     'TrailingStop': LegType.TRAILING_STOP,
 }
+
+#: A venue mechanism that closes the position on its own — a liquidation,
+#: its takeover, auto-deleveraging, an admin close, a delivery — by
+#: ``createType`` of a ``Trade`` execution or by ``execType``. Read at
+#: adoption for the time the bot was down (:meth:`_unbooked_venue_closeouts`).
+_VENUE_CLOSEOUT_CREATE_TYPES = frozenset({
+    'CreateByLiq',
+    'CreateByTakeOver_PassThrough',
+    'CreateByAdl_PassThrough',
+    'CreateByAdminClosing',
+})
+_VENUE_CLOSEOUT_EXEC_TYPES = frozenset({'AdlTrade', 'BustTrade', 'Delivery'})
 
 
 class _EventStreamMixin(_BybitBase, ABC):
@@ -656,7 +668,11 @@ class _EventStreamMixin(_BybitBase, ABC):
         core closes the run's trades FIFO). Only the rest is foreign. An
         execution after the earlier ones of the same stop order took the
         run's whole share claims nothing (zero-quantity claims: the stop is
-        still the run's own, it closed foreign exposure only).
+        still the run's own, it closed foreign exposure only). A run that
+        holds nothing on the leg by its ledger-proven share
+        (:meth:`_leg_share_proven`), with nothing claimed before, claims
+        nothing at all: the execution is judged as foreign activity, which
+        takes nothing of the run's share.
         """
         if self.store_ctx is None:
             return [], False
@@ -708,6 +724,13 @@ class _EventStreamMixin(_BybitBase, ABC):
         # earlier executions: the fill booking takes the credit first.
         share = (abs(self._journal_leg_shares().get(self._closed_leg(exec_side), 0.0))
                  + self._ledger_reduce_credit_open(entry, exec_side, market))
+        # With the leg's share proven by the position ledger, a run holding
+        # nothing there had nothing the stop could close: a claim would book
+        # a phantom exit fill. Without that proof the journal may lag the
+        # venue, and the rows' quantity stands in for the share.
+        proven = self._leg_share_proven(exec_side, market)
+        if share <= tolerance and claimed <= tolerance and proven:
+            return [], False
         if len(candidates) == 1:
             only = candidates[0]
             assert only.pine_entry_id is not None
@@ -743,6 +766,8 @@ class _EventStreamMixin(_BybitBase, ABC):
             # the rows left unclaimed.
             if share > tolerance:
                 own = min(exec_qty, share)
+            elif proven:
+                own = 0.0
             else:
                 own = min(exec_qty, max(0.0, total - claimed))
             claims = []
@@ -792,6 +817,20 @@ class _EventStreamMixin(_BybitBase, ABC):
             )
         return claims, False
 
+    def _leg_share_proven(self, side: str, market: 'InstrumentInfo') -> bool:
+        """Whether the journal share of the leg a reduce on ``side`` closes is proven.
+
+        Once the adoption baseline committed and the leg's position ledger
+        started, the journal holds the run's share as the ledger judged it:
+        every flat sweep waits for it, and a give-up leaves its netting as an
+        open credit (:meth:`_ledger_reduce_credit_open`).
+        """
+        if self.store_ctx is None or market.category == CATEGORY_SPOT \
+                or not self._adoption_baselined:
+            return False
+        ledger = self._leg_ledgers.get(self._closed_leg(side))
+        return ledger is not None and ledger.started
+
     def _ownership_wire_qty(
             self, row: 'OrderRow', market: 'InstrumentInfo', exec_price: float,
     ) -> float:
@@ -836,6 +875,160 @@ class _EventStreamMixin(_BybitBase, ABC):
             if isinstance(qty, (int, float)) and not isinstance(qty, bool):
                 claimed += float(qty)
         return claimed
+
+    async def _unbooked_venue_stop_executions(
+            self, market: 'InstrumentInfo', floor_ms: int,
+    ) -> list[dict]:
+        """The run's own fired trading stops no process of the run booked, up to ``floor_ms``.
+
+        A position TP/SL or trailing stop that fires while the bot is down
+        is a coid-less venue execution under an order id no journal row
+        holds: the adoption baseline's per-order walk never reads it, and
+        the execution backfill starts at the adoption floor. Read here from
+        the symbol's execution history, from the oldest live
+        bracket-ownership row (persisted before its attach, so its stop
+        cannot fire earlier; no earlier than the run's last backfill
+        watermark, below which every execution was attributed already) up
+        to the floor. Kept: a reduce with a position ``stopOrderType`` on the
+        side of a live ownership row older than it, whose ``execId`` no
+        attribution of the run recorded.
+
+        :raises BybitAdoptionBaselineError: When a history window cannot be
+            read completely.
+        """
+        if self.store_ctx is None or market.category == CATEGORY_SPOT:
+            return []
+        owners = [row for row in iter_active_bracket_ownerships(self.store_ctx)
+                  if row.side in ('buy', 'sell')]
+        if not owners:
+            return []
+        return await self._unbooked_executions(
+            market, min(row.created_ts_ms for row in owners), floor_ms,
+            'venue_bracket_fill_attributed',
+            lambda entry: self._own_venue_stop_execution(entry, market, owners),
+        )
+
+    async def _unbooked_venue_closeouts(
+            self, market: 'InstrumentInfo', floor_ms: int,
+    ) -> list[dict]:
+        """The venue's own closes of the run's position while the bot was down, up to ``floor_ms``.
+
+        A liquidation, auto-deleveraging, an admin close or a delivery
+        (:data:`_VENUE_CLOSEOUT_CREATE_TYPES`, :data:`_VENUE_CLOSEOUT_EXEC_TYPES`)
+        carries no coid and no size of the leg it closed: how much of it was
+        the run's share cannot be told once someone else holds the leg too.
+        Read from the oldest live entry row on, like
+        :meth:`_unbooked_venue_stop_executions`; kept: a close on the side of
+        a live entry row older than it, whose ``execId`` no adoption of the
+        run recorded.
+
+        :raises BybitAdoptionBaselineError: When a history window cannot be
+            read completely.
+        """
+        if self.store_ctx is None or market.category == CATEGORY_SPOT:
+            return []
+        entries = [row for row in self.store_ctx.iter_live_orders()
+                   if (row.extras or {}).get('kind') in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)
+                   and row.filled_qty > _FILL_EPS]
+        if not entries:
+            return []
+        return await self._unbooked_executions(
+            market, min(row.created_ts_ms for row in entries), floor_ms,
+            'venue_closeout_while_down',
+            lambda entry: self._venue_closeout_execution(entry, market, entries),
+        )
+
+    async def _unbooked_executions(
+            self, market: 'InstrumentInfo', oldest_ms: int, floor_ms: int,
+            booked_kind: str, keep: Callable[[dict], bool],
+    ) -> list[dict]:
+        """The executions ``keep`` selects from ``oldest_ms`` up to ``floor_ms``
+        whose ``execId`` no ``booked_kind`` event of the run recorded.
+
+        The read starts no earlier than the run's last backfill watermark:
+        below it every execution was attributed already.
+
+        :raises BybitAdoptionBaselineError: When a history window cannot be
+            read completely.
+        """
+        assert self.store_ctx is not None
+        start = oldest_ms - EXECUTION_SINCE_SKEW_MS
+        watermark = self._load_deriv_exec_watermark(market)
+        if watermark is not None:
+            start = max(start, watermark - EXECUTION_CURSOR_OVERLAP_MS)
+        booked = {
+            str(payload.get('exec_id') or '') for _ik, _coid, _eoid, payload
+            in self.store_ctx.iter_events_by_kind_for_run_id(booked_kind)
+        }
+        found: dict[str, dict] = {}
+        while start < floor_ms:
+            end = min(start + EXECUTION_WINDOW_MS, floor_ms)
+            entries, conclusive = await self._drain_deriv_exec_window(market, start, end)
+            if not conclusive:
+                raise BybitAdoptionBaselineError(
+                    "adoption baseline: execution history read failed for "
+                    f"{market.symbol} ({start}..{end})",
+                )
+            for entry in entries:
+                exec_id = str(entry.get('execId') or '')
+                if exec_id and exec_id not in booked and exec_id not in found and keep(entry):
+                    found[exec_id] = entry
+            start = end
+        return sorted(found.values(), key=execution_sort_key)
+
+    @staticmethod
+    def _venue_closeout_execution(
+            entry: dict, market: 'InstrumentInfo', entries: list['OrderRow'],
+    ) -> bool:
+        """Whether ``entry`` is the venue closing a side the live entry rows ``entries`` own."""
+        if str(entry.get('symbol') or '') != market.symbol:
+            return False
+        if str(entry.get('category') or market.category) != market.category:
+            return False
+        exec_type = str(entry.get('execType') or 'Trade')
+        if exec_type not in _VENUE_CLOSEOUT_EXEC_TYPES and not (
+                exec_type == 'Trade'
+                and str(entry.get('createType') or '') in _VENUE_CLOSEOUT_CREATE_TYPES):
+            return False
+        try:
+            closed_size = float(entry.get('closedSize') or 0.0)
+            exec_ms = int(entry.get('execTime') or 0)
+        except (TypeError, ValueError):
+            return False
+        if closed_size <= 0.0:
+            return False
+        entry_side = 'buy' if str(entry.get('side') or '').lower() == 'sell' else 'sell'
+        return any(row.side == entry_side
+                   and row.created_ts_ms - EXECUTION_SINCE_SKEW_MS <= exec_ms
+                   for row in entries)
+
+    @staticmethod
+    def _own_venue_stop_execution(
+            entry: dict, market: 'InstrumentInfo', owners: list['OrderRow'],
+    ) -> bool:
+        """Whether ``entry`` is a fired trading stop of one of the ownership rows ``owners``."""
+        if str(entry.get('symbol') or '') != market.symbol:
+            return False
+        if str(entry.get('category') or market.category) != market.category:
+            return False
+        if str(entry.get('execType') or 'Trade') != 'Trade':
+            return False
+        if str(entry.get('orderLinkId') or ''):
+            return False
+        if str(entry.get('stopOrderType') or '') not in _VENUE_STOP_ORDER_LEG:
+            return False
+        try:
+            closed_size = float(entry.get('closedSize') or 0.0)
+            exec_qty = float(entry.get('execQty') or 0.0)
+            exec_ms = int(entry.get('execTime') or 0)
+        except (TypeError, ValueError):
+            return False
+        if closed_size <= 0.0 or exec_qty <= 0.0:
+            return False
+        side = str(entry.get('side') or '').lower()
+        return any(row.side == side
+                   and row.created_ts_ms - EXECUTION_SINCE_SKEW_MS <= exec_ms
+                   for row in owners)
 
     @staticmethod
     def _venue_bracket_claim_slices(

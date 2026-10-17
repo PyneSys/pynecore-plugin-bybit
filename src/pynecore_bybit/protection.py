@@ -677,7 +677,9 @@ class _ProtectionMixin(_BybitBase, ABC):
         it (the venue pushes ``position`` and ``execution`` as separate
         frames): the newest view of the leg not older than the start then
         sets the baseline now, so a stop someone else adds before the next
-        view is judged against it.
+        view is judged against it. Without such a view the leg waits for its
+        first one (:attr:`_share_unviewed`): the bot may attach its own stop
+        before it arrives.
         """
         tolerance = self._qty_tolerance(market)
         seq = _parse_seq(entry.get('seq'))
@@ -690,11 +692,14 @@ class _ProtectionMixin(_BybitBase, ABC):
             if new_side == old_side:
                 continue
             self._share_held_since.pop(idx, None)
+            self._share_unviewed.discard(idx)
             if not new_side or seq is None or exec_ms is None:
                 self._share_start.pop(idx, None)
                 continue
             self._share_start[idx] = (seq, exec_ms)
             self._baseline_bare_trading_stop_from_last_view(idx)
+            if not self._protection_guard().known(trading_stop_key(idx)):
+                self._share_unviewed.add(idx)
 
     def _baseline_bare_trading_stop_from_last_view(self, idx: int) -> None:
         """Set the bare baseline of leg ``idx`` from the newest view already seen."""
@@ -1335,8 +1340,12 @@ class _ProtectionMixin(_BybitBase, ABC):
         stop to the venue: the key is forgotten, never judged — unless the
         view may predate the bot's own write of the key (in flight, or a
         snapshot read that started before it settled). A row older (by
-        ``seq``) than a view of the same leg already seen is a delayed push:
-        it neither forgets nor is judged. A push is not specific to one
+        ``seq``) than a view of the same leg already seen is a delayed push,
+        and one older than the own execution that started the run's share
+        shows the leg before the run held anything of it: neither forgets
+        nor is judged. The first view of a share the bot attached its stop
+        to before that view arrived shows the venue before the attach
+        (:meth:`_precede_own_trading_stop`). A push is not specific to one
         change (the venue pushes on every order event), so a mismatch needs
         a second observation.
 
@@ -1360,6 +1369,10 @@ class _ProtectionMixin(_BybitBase, ABC):
                 continue
             self._leg_last_view[idx] = row
             self._note_leg_view(idx, row, read_started_at)
+            if self._view_predates_share(idx, row):
+                continue
+            first_view = idx in self._share_unviewed
+            self._share_unviewed.discard(idx)
             if guard.known(key):
                 if size <= 0.0:
                     if self._view_postdates_own_writes(key, read_started_at):
@@ -1371,6 +1384,8 @@ class _ProtectionMixin(_BybitBase, ABC):
                 if str(row.get('side') or '').lower() == side:
                     venue = self._trading_stop_view(idx, row)
                     if venue is not None:
+                        if first_view:
+                            self._precede_own_trading_stop(idx, key, venue, row, market)
                         guard.observe(key, venue, tick=market.tick_size,
                                       read_started_at=read_started_at)
                     self._home_trading_stop(key, idx)
@@ -1381,6 +1396,55 @@ class _ProtectionMixin(_BybitBase, ABC):
             if size > 0.0:
                 self._baseline_bare_trading_stop(idx, key, row)
         self._judge_pending_tpsl_orders(market)
+
+    def _view_predates_share(self, idx: int, row: dict) -> bool:
+        """Whether position ``row`` is older than the run's current share on leg ``idx``.
+
+        By ``seq``, against the own execution that started the share
+        (:attr:`_share_start`): such a view shows the leg before the run
+        held anything of it. ``False`` when either is not known.
+        """
+        start = self._share_start.get(idx)
+        seq = _parse_seq(row.get('seq'))
+        return start is not None and seq is not None and seq < start[0]
+
+    def _precede_own_trading_stop(
+            self, idx: int, key: str, venue: ProtectionLevels, row: dict,
+            market: 'InstrumentInfo',
+    ) -> None:
+        """Take the first view of a new share as the venue before the bot's own attach.
+
+        The own execution that started the run's share arrived before any
+        view of the position it built, and the bot attached its trading
+        stop before that view arrived (:attr:`_share_unviewed`). The venue
+        pushes the position the fill built as soon as it fills, so the view
+        may show the position before the attach landed: the bot's own older
+        state, ranked below its writes (:meth:`ProtectionLevelGuard.precede`)
+        and acceptable until the venue is seen carrying the attach. Bare is
+        the venue's own state of a position the fill opened. A stop the bot
+        did not write may have been on the position before the run's fill
+        merged into it or been put there since: it is logged as an error with
+        an audit event, as :meth:`_baseline_bare_trading_stop` does.
+        """
+        if not self._protection_guard().precede(key, venue, tick=market.tick_size):
+            return
+        if venue == ProtectionLevels():
+            return
+        seq = _parse_seq(row.get('seq'))
+        side = str(row.get('side') or '').lower()
+        logger.error(
+            "Bybit position %s carries a trading stop (%s) the bot never set, seen "
+            "first with the run's share on it after the bot's own attach: whether it "
+            "was there before the attach or added since is not known; accepting it "
+            "until the venue shows the attach",
+            idx, venue,
+        )
+        if self.store_ctx is not None:
+            self.store_ctx.log_event(
+                TRADING_STOP_ORIGIN_UNPROVEN_EVENT,
+                payload={'position_idx': idx, 'seq': seq, 'side': side,
+                         'levels': venue.as_list()},
+            )
 
     def _note_leg_view(self, idx: int, row: dict, read_started_at: float | None) -> None:
         """Remember when the newest view of leg ``idx`` the ledger holds was taken.

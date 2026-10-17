@@ -2,7 +2,9 @@
 @pyne
 """
 import asyncio
+import logging
 import random
+import sqlite3
 import time
 
 import pytest
@@ -3527,6 +3529,85 @@ def __test_view_before_its_own_execution_push_sets_the_bare_baseline__(tmp_path)
     assert not plugin._protection_guard().known('trading-stop:0')
 
 
+def __test_helper_attach_after_exec_first(tmp_path, name: str, *,
+                                          during=None) -> '_InterventionFake':
+    """The run's entry execution push arrives before any view of its position.
+
+    The flat leg was seen at seq 30; the entry fills at seq 40 and the bot
+    attaches its trailing stop before the position push of the fill arrives.
+    ``during`` is pushed while the attach is in flight.
+    """
+    plugin = _InterventionFake(responses=[{}])
+    _attach_store(plugin, tmp_path, name)
+    plugin._adoption_baselined = True
+    _push(plugin, __test_helper_view(size=0, seq=30))
+    assert len(__test_helper_own_entry_fill(plugin, 'entry-1', qty='0.002', seq=40)) == 1
+    if during is not None:
+        plugin.during['/v5/position/trading-stop'] = lambda _body: _push(plugin, during)
+    asyncio.run(plugin.execute_exit(_trail_envelope()))
+    plugin.during.clear()
+    return plugin
+
+
+def __test_view_of_the_fill_after_the_own_attach_is_an_older_write__(tmp_path):
+    fill_view = __test_helper_stop_view(size='0.002', seq='40')
+    own = __test_helper_stop_view(size='0.002', tp='110000', sl='90000', trail='5',
+                                  seq='40')
+    for name, during in (('settled', None), ('in-flight', fill_view)):
+        plugin = __test_helper_attach_after_exec_first(tmp_path, f"exec-first-{name}",
+                                                       during=during)
+        # The venue pushed the position the fill built before the attach
+        # landed: bare, the bot's own older state, never someone else's edit.
+        _push(plugin, fill_view)
+        _push(plugin, fill_view)
+        assert plugin.quarantines == [], name
+        assert __test_helper_audits(plugin, 'trading_stop_origin_unproven') == [], name
+        # Once the venue is seen carrying the attach, a bare view is an edit.
+        _push(plugin, own)
+        _push(plugin, fill_view)
+        _push(plugin, fill_view)
+        assert _kinds(plugin) == [QuarantineKind.EXTERNAL_INTERVENTION], name
+
+
+def __test_view_older_than_the_run_fill_never_judges_or_forgets_the_own_stop__(tmp_path):
+    own = __test_helper_stop_view(size='0.002', tp='110000', sl='90000', trail='5',
+                                  seq='40')
+    bare = __test_helper_stop_view(size='0.002', seq='40')
+    # A re-push of the flat leg from before the run's fill must not retire
+    # the stop the bot just attached to the position the fill opened.
+    plugin = __test_helper_attach_after_exec_first(tmp_path, "older-flat")
+    _push(plugin, __test_helper_view(size=0, seq=30))
+    assert plugin._protection_guard().known('trading-stop:0')
+    _push(plugin, own)
+    assert plugin.quarantines == []
+    assert __test_helper_audits(plugin, 'trading_stop_origin_unproven') == []
+    _push(plugin, bare)
+    _push(plugin, bare)
+    assert _kinds(plugin) == [QuarantineKind.EXTERNAL_INTERVENTION]
+
+    # Someone else's position carried its own stop before the run's add
+    # merged into it; the bot's Full attach replaced it. Late views of that
+    # older position are not judged against the bot's levels.
+    plugin = _InterventionFake(responses=[{}])
+    _attach_store(plugin, tmp_path, "older-merged")
+    plugin._adoption_baselined = True
+    foreign = __test_helper_stop_view(size='0.01', sl='29000', seq='30')
+    _push(plugin, foreign)
+    __test_helper_own_entry_fill(plugin, 'entry-1', qty='0.002', seq=40)
+    asyncio.run(plugin.execute_exit(_trail_envelope()))
+    _push(plugin, foreign)
+    _push(plugin, foreign)
+    assert plugin.quarantines == []
+    assert plugin._protection_guard().known('trading-stop:0')
+    # The view of the merged position from before the attach still shows the
+    # other party's stop: not the bot's, and not provably an edit either.
+    merged = __test_helper_stop_view(size='0.012', sl='29000', seq='40')
+    _push(plugin, merged)
+    _push(plugin, merged)
+    assert plugin.quarantines == []
+    assert len(__test_helper_audits(plugin, 'trading_stop_origin_unproven')) == 1
+
+
 def __test_helper_merge_into_a_protected_position(tmp_path, name: str) -> '_InterventionFake':
     """The run's 0.02 joins someone else's 0.01 that already carries a stop."""
     plugin = _InterventionFake()
@@ -4058,3 +4139,248 @@ def __test_share_start_survives_a_same_side_add_without_seq__(tmp_path):
     verdicts = [payload['verdict'] for payload
                 in __test_helper_audits(plugin, 'foreign_tpsl_order_judged')]
     assert verdicts == ['preexisting']
+
+
+# === Restart: an own trading stop that fired while the bot was down =========
+
+def __test_helper_stop_fired_while_down(tmp_path, name: str, monkeypatch, *,
+                                        mode: str = POSITION_MODE_ONE_WAY,
+                                        foreign_qty: str = '0.002',
+                                        fired: dict | None = None):
+    """The run's 0.002 long carries its own trailing stop; the bot goes down.
+
+    While it is down the stop fires (a coid-less venue execution no journal
+    row names) and someone else opens ``foreign_qty`` on the same leg. The
+    restarted process runs its adoption baseline over that venue. ``fired``
+    replaces the stop's execution with another one closing the run's long.
+
+    :return: The restarted plugin and the execution rows the adoption read
+        down to its floor.
+    """
+    idx = 1 if mode == POSITION_MODE_HEDGE else 0
+    plugin = _InterventionFake(responses=[{}], mode=mode)
+    _attach_store(plugin, tmp_path, name)
+    plugin._adoption_baselined = True
+    __test_helper_own_entry_fill(plugin, 'entry-1', qty='0.002', seq=40)
+    _push(plugin, __test_helper_view(idx=idx, size=0.002, seq=40))
+    envelope = _trail_envelope()
+    envelope = DispatchEnvelope(
+        intent=ExitIntent(**{**envelope.intent.__dict__, 'symbol': 'BTCUSDT.P'}),
+        run_tag=envelope.run_tag, bar_ts_ms=envelope.bar_ts_ms,
+        coid_max_len=envelope.coid_max_len,
+    )
+    if mode == POSITION_MODE_ONE_WAY:
+        asyncio.run(plugin.execute_exit(envelope))
+        assert plugin._protection_guard().known('trading-stop:0')
+    else:
+        create_bracket_ownership_row(
+            plugin.store_ctx, coid='own-hedge-1', symbol='BTCUSDT.P', side='sell',
+            qty=0.002, intent_key='Trail-X', pine_entry_id='Trail-X', from_entry='Long',
+            leg_id=str(idx), attach_coid='attach-hedge-1', tp_price=110000.0,
+            sl_price=90000.0, trail_price=105000.0, trail_offset=50.0,
+            oca_name=None, oca_type=None,
+        )
+    attached_ms = int(plugin.store_ctx.get_order(
+        next(row.client_order_id for row in plugin.store_ctx.iter_live_orders()
+             if row.state == 'bracket_own')).created_ts_ms)
+
+    if fired is None:
+        fired = __test_helper_stop_fire('ts-fire', 'TrailingStop', qty='0.002', seq='50')
+    fired['execTime'] = str(attached_ms + 1_000)
+    foreign = __test_helper_foreign_open('f-open', qty=foreign_qty, seq=60)
+    foreign['execTime'] = str(attached_ms + 2_000)
+    floor_ms = attached_ms + 10_000
+    rows = __test_helper_view(idx=idx, size=float(foreign_qty), seq=60)['data']
+    if mode == POSITION_MODE_HEDGE:
+        rows = rows + __test_helper_view(idx=2, size=0, seq=60)['data']
+    executions = [fired, foreign]
+    reads = []
+
+    fresh = _restarted(plugin, mode=mode)
+
+    async def venue_time() -> int:
+        return floor_ms
+
+    async def lookup(_market, coid):
+        return {'orderId': f"venue-{coid}", 'cumExecQty': '0.002'}, True
+
+    async def fills(_market, order_id, _from_ms, until_ms=None):
+        assert until_ms == floor_ms
+        assert order_id == 'venue-entry-1'
+        return {'own-entry-1'}, 0.002, True, []
+
+    async def position_rows(_market):
+        return [dict(row) for row in rows]
+
+    async def window(_market, start_ms, end_ms):
+        reads.append((start_ms, end_ms))
+        return [dict(entry) for entry in executions
+                if start_ms <= int(entry['execTime']) <= end_ms], True
+
+    monkeypatch.setattr(fresh, '_venue_time_ms', venue_time)
+    monkeypatch.setattr(fresh, '_confirm_lookup', lookup)
+    monkeypatch.setattr(fresh, '_recovery_fill_ids', fills)
+    monkeypatch.setattr(fresh, '_fetch_position_rows', position_rows)
+    monkeypatch.setattr(fresh, '_drain_deriv_exec_window', window)
+    asyncio.run(fresh._apply_adoption_baseline(fresh._market, rows))
+    assert fresh._adoption_baselined
+    assert reads and reads[-1][1] == floor_ms and reads[0][0] <= int(fired['execTime'])
+    return fresh, idx
+
+
+def __test_own_stop_fired_while_down_is_booked_at_adoption__(tmp_path, monkeypatch):
+    for mode in (POSITION_MODE_ONE_WAY, POSITION_MODE_HEDGE):
+        fresh, idx = __test_helper_stop_fired_while_down(
+            tmp_path, f"down-fire-{mode}", monkeypatch, mode=mode)
+        # The stop closed the run's share; the leg now holds only the other
+        # party's position.
+        assert fresh._journal_leg_shares().get(idx, 0.0) == pytest.approx(0.0), mode
+        assert not fresh._protection_guard().known(f"trading-stop:{idx}"), mode
+        audits = __test_helper_audits(fresh, 'venue_bracket_fill_attributed')
+        assert [(payload['exec_id'], payload['claim_qty']) for payload in audits] \
+            == [('ts-fire', pytest.approx(0.002))], mode
+        # The other party's bare position and its own close are not the bot's.
+        bare = __test_helper_view(idx=idx, size=0.002, seq=60)
+        _push(fresh, bare)
+        _push(fresh, bare)
+        _push(fresh, _exec_push(__test_helper_foreign_close('f-close', qty='0.002', seq=70)))
+        _push(fresh, __test_helper_view(idx=idx, size=0, seq=70))
+        assert fresh.quarantines == [], mode
+
+
+def __test_own_stop_fired_while_down_is_booked_once__(tmp_path, monkeypatch):
+    fresh, _idx = __test_helper_stop_fired_while_down(tmp_path, "down-fire-once", monkeypatch)
+    # A replayed push of the same execution changes nothing.
+    events = _push(fresh, _exec_push(__test_helper_stop_fire(
+        'ts-fire', 'TrailingStop', qty='0.002', seq='50')))
+    assert events == []
+    assert len(__test_helper_audits(fresh, 'venue_bracket_fill_attributed')) == 1
+
+
+
+def __test_helper_closeout(exec_type: str, create_type: str) -> dict:
+    """The venue closing the run's 0.002 long on its own: no link id, no stop type."""
+    return _close_exec(execId='closeout-1', orderId='order-closeout-1', execType=exec_type,
+                       execQty='0.002', closedSize='0.002', createType=create_type, seq='50')
+
+
+@pytest.mark.parametrize('exec_type, create_type', [
+    ('Trade', 'CreateByLiq'), ('Trade', 'CreateByAdl_PassThrough'),
+    ('Trade', 'CreateByTakeOver_PassThrough'), ('Trade', 'CreateByAdminClosing'),
+    ('AdlTrade', ''), ('BustTrade', ''), ('Delivery', ''),
+])
+def __test_venue_closeout_while_down_retires_the_run_share__(
+        tmp_path, monkeypatch, caplog, exec_type, create_type):
+    """A liquidation (or ADL, admin close, delivery) while the bot is down
+    names no leg size: the run's share on that side is taken as closed,
+    logged ERROR and audited. The other party who reopened the leg keeps
+    theirs, and its later close is no intervention."""
+    for mode in (POSITION_MODE_ONE_WAY, POSITION_MODE_HEDGE):
+        with caplog.at_level(logging.ERROR, logger='pynecore_bybit.positions'):
+            fresh, idx = __test_helper_stop_fired_while_down(
+                tmp_path, f"closeout-{exec_type}-{create_type}-{mode}", monkeypatch, mode=mode,
+                fired=__test_helper_closeout(exec_type, create_type))
+        assert fresh._journal_leg_shares().get(idx, 0.0) == pytest.approx(0.0), mode
+        audits = __test_helper_audits(fresh, 'venue_closeout_while_down')
+        assert [(payload['exec_id'], payload['retired_qty']) for payload in audits] \
+            == [('closeout-1', pytest.approx(0.002))], mode
+        assert any('closed the bot' in record.getMessage() for record in caplog.records)
+        assert not fresh._protection_guard().known(f"trading-stop:{idx}"), mode
+        bare = __test_helper_view(idx=idx, size=0.002, seq=60)
+        _push(fresh, bare)
+        _push(fresh, bare)
+        _push(fresh, _exec_push(__test_helper_foreign_close('f-close', qty='0.002', seq=70)))
+        _push(fresh, __test_helper_view(idx=idx, size=0, seq=70))
+        assert fresh.quarantines == [], mode
+
+
+def __test_venue_closeout_while_down_is_retired_once__(tmp_path, monkeypatch):
+    """The audit names the execution: an older entry's remainder that filled
+    after the restart is not retired again by the same closeout at the next
+    start."""
+    closeout = __test_helper_closeout('Trade', 'CreateByLiq')
+    fresh, _idx = __test_helper_stop_fired_while_down(
+        tmp_path, "closeout-once", monkeypatch, fired=closeout)
+    at = int(closeout['execTime'])
+    __test_helper_own_entry_fill(fresh, 'entry-2', qty='0.002', seq=80, exec_ms=at + 20_000)
+    with sqlite3.connect(tmp_path / "closeout-once.sqlite") as db:
+        db.execute("UPDATE orders SET created_ts_ms = ? WHERE client_order_id = 'entry-2'",
+                   (at - 5_000,))
+    assert asyncio.run(fresh._unbooked_venue_closeouts(fresh._market, at + 10_000)) == []
+
+
+def __test_user_close_while_down_is_no_venue_closeout__(tmp_path, monkeypatch):
+    """A user's close is not the venue's mechanics: never taken as a closeout."""
+    entry = __test_helper_closeout('Trade', 'CreateByUser')
+    plugin = _InterventionFake(responses=[{}])
+    _attach_store(plugin, tmp_path, "closeout-user")
+    __test_helper_own_entry_fill(plugin, 'entry-1', qty='0.002', seq=40)
+    rows = list(plugin.store_ctx.iter_live_orders())
+    entry['execTime'] = str(max(row.created_ts_ms for row in rows) + 1_000)
+    assert not plugin._venue_closeout_execution(entry, plugin._market, rows)
+    assert plugin._venue_closeout_execution(
+        dict(entry, createType='CreateByLiq'), plugin._market, rows)
+    # A closeout older than every entry row closed someone else's exposure.
+    older = str(min(row.created_ts_ms for row in rows) - 120_000)
+    assert not plugin._venue_closeout_execution(
+        dict(entry, createType='CreateByLiq', execTime=older), plugin._market, rows)
+
+def __test_stop_fire_after_the_run_share_is_gone_books_no_phantom_fill__(tmp_path):
+    for name, legs in (('single', ('L-X',)), ('pyramid', ('L-X', 'L-Y'))):
+        plugin = _manual_plugin(tmp_path, f"phantom-{name}")
+        for leg in legs:
+            create_bracket_ownership_row(
+                plugin.store_ctx, coid=f"bo:{leg}\x00Long:0", symbol='BTCUSDT.P',
+                side='sell', qty=0.01, intent_key=f"{leg}\x00Long", pine_entry_id=leg,
+                from_entry='Long', leg_id='0', attach_coid=f"attach-{leg}",
+                tp_price=None, sl_price=29000.0, trail_price=None, trail_offset=None,
+            )
+        # The run's own close takes its whole share; its stop is still recorded.
+        __test_helper_own_exit_row(plugin, 'close-1', qty=0.02)
+        _push(plugin, _exec_push(__test_helper_own_exec('close-1', exec_id='c-1',
+                                                        qty='0.02', seq=60)))
+        _push(plugin, __test_helper_view(size=0, seq=60))
+        assert plugin._run_owned_signed_size() == 0.0, name
+        # Someone else opens on the leg, and a Full stop closes that position.
+        _push(plugin, _exec_push(__test_helper_foreign_open('f-1', qty='0.01', seq=70)))
+        _push(plugin, __test_helper_view(size=0.01, seq=70))
+        events = _push(plugin, _exec_push(_close_exec(
+            execId='vs-1', orderId='venue-stop', side='Sell', execQty='0.01',
+            closedSize='0.01', stopOrderType='StopLoss', createType='CreateByStopLoss',
+            seq='80')))
+        assert events == [], name
+        assert __test_helper_audits(plugin, 'venue_bracket_fill_attributed') == [], name
+        _push(plugin, __test_helper_view(size=0, seq=80))
+        assert plugin.quarantines == [], name
+        assert plugin._run_owned_signed_size() == 0.0, name
+
+
+def __test_later_stop_execution_after_the_run_share_is_claimed_books_no_phantom_fill__(
+        tmp_path):
+    plugin = _manual_plugin(tmp_path, "phantom-split")
+    for leg in ('L-X', 'L-Y'):
+        create_bracket_ownership_row(
+            plugin.store_ctx, coid=f"bo:{leg}\x00Long:0", symbol='BTCUSDT.P', side='sell',
+            qty=0.01, intent_key=f"{leg}\x00Long", pine_entry_id=leg, from_entry='Long',
+            leg_id='0', attach_coid=f"attach-{leg}", tp_price=None, sl_price=29000.0,
+            trail_price=None, trail_offset=None,
+        )
+    # An own close leaves the run 0.01 of its pyramid; someone else adds 0.03.
+    __test_helper_own_exit_row(plugin, 'close-1', qty=0.01)
+    _push(plugin, _exec_push(__test_helper_own_exec('close-1', exec_id='c-1',
+                                                    qty='0.01', seq=60)))
+    _push(plugin, __test_helper_view(size=0.01, seq=60))
+    _push(plugin, _exec_push(__test_helper_foreign_open('f-1', qty='0.03', seq=70)))
+    _push(plugin, __test_helper_view(size=0.04, seq=70))
+    # The Full stop closes the merged 0.04 in two executions: the first takes
+    # the run's 0.01, the second only the other party's exposure.
+    booked = []
+    for exec_id, seq in (('vs-1', '80'), ('vs-2', '81')):
+        booked.extend(_push(plugin, _exec_push(_close_exec(
+            execId=exec_id, orderId='venue-stop', side='Sell', execQty='0.02',
+            closedSize='0.02', stopOrderType='StopLoss', createType='CreateByStopLoss',
+            seq=seq))))
+    assert sum(event.fill_qty for event in booked) == pytest.approx(0.01)
+    _push(plugin, __test_helper_view(size=0, seq=81))
+    assert plugin.quarantines == []
+    assert plugin._run_owned_signed_size() == 0.0

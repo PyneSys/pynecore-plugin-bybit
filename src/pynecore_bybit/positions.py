@@ -62,6 +62,7 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     PENDING_DISPATCH_STATES,
+    iter_active_bracket_ownerships,
 )
 from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
@@ -507,7 +508,12 @@ class _PositionsMixin(_BybitBase, ABC):
         bracket legs too — their pre-restart fills already reduced the
         adopted net, so their cursors must equally reflect venue truth or a
         later backfill / reconcile pass would re-book (or forever await)
-        those slices. A NON-ENTRY row (exit / bracket / close leg) whose
+        those slices. The run's own position trading stops that fired while
+        the bot was down have no row of their own and no ``orderLinkId``:
+        they are read from the symbol's execution history down to the floor
+        (:meth:`_unbooked_venue_stop_executions`), netted from the entry rows
+        like an unbooked exit fill, and the fired stop is no longer guarded.
+        A NON-ENTRY row (exit / bracket / close leg) whose
         seeded cursor covers its full size is CLOSED on commit, mirroring
         the live path's full-fill terminal (``_fill_event``): that terminal
         can never fire for it afterwards — its executions are seeded into
@@ -668,6 +674,10 @@ class _PositionsMixin(_BybitBase, ABC):
                         )
                         last_index_lag = pass_index_lag
                 seeds.append((row, order_id, ids, qty_sum, lookup is None, executions))
+            # The run's own trading stops that fired while the bot was down:
+            # no row's order walk reads them.
+            stop_executions = await self._unbooked_venue_stop_executions(market, floor_ms)
+            closeouts = await self._unbooked_venue_closeouts(market, floor_ms)
             try:
                 verify = await self._fetch_position_rows(market)
             except BybitError as exc:
@@ -787,9 +797,14 @@ class _PositionsMixin(_BybitBase, ABC):
                         payload={'filled_qty': cumulative,
                                  'kind': (row.extras or {}).get('kind')},
                     )
+            order_reduces = len(unbooked_reduces)
+            for entry in stop_executions:
+                self._seen_exec_ids.add(str(entry.get('execId') or ''))
+                unbooked_reduces.append((str(entry.get('side') or '').lower(),
+                                         float(entry.get('execQty') or 0.0), [entry]))
             tolerance = market.qty_step / 2 if market.qty_step > 0 else _FILL_EPS
-            for side, quantity in self._take_persisted_ledger_credits(
-                    unbooked_reduces, tolerance):
+            credited = self._take_persisted_ledger_credits(unbooked_reduces, tolerance)
+            for position, (side, quantity) in enumerate(credited):
                 # A reducing fill the run never booked (it landed while the
                 # bot was down) consumed entry exposure exactly like a booked
                 # one: net it out of the entry rows before the venue clamp,
@@ -797,8 +812,31 @@ class _PositionsMixin(_BybitBase, ABC):
                 # misses it when foreign exposure shares the leg. What an
                 # earlier process's position ledger already netted for it is
                 # not netted again.
+                if position < order_reduces:
+                    self._reduce_entry_ownership(side, quantity)
+                    continue
+                _, executed, (entry,) = unbooked_reduces[position]
+                owned = self._entry_side_exposure(side)
                 self._reduce_entry_ownership(side, quantity)
+                self._log_adopted_venue_stop(
+                    entry, side,
+                    claim=owned - self._entry_side_exposure(side) + executed - quantity,
+                )
+            for entry in closeouts:
+                # The venue closed the run's side while the bot was down; the
+                # execution does not say how much of it was the run's. The
+                # run's share on that side is taken as gone — someone else
+                # who holds the leg now keeps theirs.
+                side = str(entry.get('side') or '').lower()
+                self._seen_exec_ids.add(str(entry.get('execId') or ''))
+                owned = self._entry_side_exposure(side)
+                self._reduce_entry_ownership(side, owned)
+                self._log_venue_closeout_while_down(entry, side, retired=owned)
             self._clamp_entry_ownership_to_venue(market, verify)
+            for side in {str(entry.get('side') or '').lower()
+                         for entry in (*stop_executions, *closeouts)}:
+                # The venue clears a fired stop with the position it closed.
+                self._forget_trading_stop_if_flat(side)
             # The journal holds the run's share as of the verified snapshot:
             # the position ledgers anchor on that very view.
             self._note_share_held_since(floor_ms, market)
@@ -813,6 +851,78 @@ class _PositionsMixin(_BybitBase, ABC):
         raise BybitAdoptionBaselineError(
             "adoption baseline: position snapshot kept changing across "
             f"{_ADOPTION_STABLE_ATTEMPTS} attempts",
+        )
+
+    def _entry_side_exposure(self, side: str) -> float:
+        """The owned exposure of the live entry rows a reduce on ``side`` nets."""
+        assert self.store_ctx is not None
+        entry_side = 'buy' if side == 'sell' else 'sell'
+        return sum(
+            float(row.filled_qty) for row in self.store_ctx.iter_live_orders()
+            if row.side == entry_side
+            and (row.extras or {}).get('kind') in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)
+            and row.filled_qty > _FILL_EPS
+        )
+
+    def _log_venue_closeout_while_down(self, entry: dict, side: str, *, retired: float) -> None:
+        """Journal one venue close of the run's side the adoption baseline retired.
+
+        Logged ERROR: the run's share is assumed, not measured. The audit's
+        ``exec_id`` keeps a later restart from retiring a newer share for the
+        same execution (:meth:`_unbooked_venue_closeouts`).
+        """
+        assert self.store_ctx is not None
+        logger.error(
+            "Bybit adoption baseline: the venue closed the bot's %s side while the bot "
+            "was down (%s %s, execution %s, %s): the run's share there (%s) is taken "
+            "as closed — check the venue history",
+            'long' if side == 'sell' else 'short', entry.get('execType') or 'Trade',
+            entry.get('createType') or '-', entry.get('execId'), entry.get('execQty'),
+            retired,
+        )
+        self.store_ctx.log_event(
+            'venue_closeout_while_down',
+            exchange_order_id=str(entry.get('orderId') or '') or None,
+            payload={'exec_id': str(entry.get('execId') or ''),
+                     'exec_type': str(entry.get('execType') or 'Trade'),
+                     'create_type': str(entry.get('createType') or ''),
+                     'side': side, 'exec_qty': entry.get('execQty'),
+                     'exec_time': entry.get('execTime'), 'retired_qty': retired},
+        )
+
+    def _log_adopted_venue_stop(self, entry: dict, side: str, *, claim: float) -> None:
+        """Journal one own trading stop the adoption baseline booked as a reduce.
+
+        Recorded as the live attribution would record it, on the newest
+        live ownership row of the stop's side, so a later execution of the
+        same stop order and a later restart see the claim
+        (:meth:`_venue_stop_claimed`, :meth:`_unbooked_venue_stop_executions`).
+        """
+        assert self.store_ctx is not None
+        owners = sorted(
+            (row for row in iter_active_bracket_ownerships(self.store_ctx) if row.side == side),
+            key=lambda row: row.created_ts_ms,
+        )
+        owner = owners[-1] if owners else None
+        logger.warning(
+            "Bybit adoption baseline: own %s %s (%s %s) fired while the bot was "
+            "down — netting %s of the run's share",
+            entry.get('stopOrderType'), entry.get('execId'), entry.get('side'),
+            entry.get('execQty'), claim,
+        )
+        self.store_ctx.log_event(
+            'venue_bracket_fill_attributed',
+            client_order_id=owner.client_order_id if owner is not None else None,
+            exchange_order_id=str(entry.get('orderId') or '') or None,
+            payload={
+                'exec_id': str(entry.get('execId') or ''),
+                'stop_order_type': str(entry.get('stopOrderType') or ''),
+                'exit_id': owner.pine_entry_id if owner is not None else None,
+                'from_entry': owner.from_entry if owner is not None else None,
+                'claim_qty': claim,
+                'split': False,
+                'source': 'adoption_baseline',
+            },
         )
 
     def _clamp_entry_ownership_to_venue(

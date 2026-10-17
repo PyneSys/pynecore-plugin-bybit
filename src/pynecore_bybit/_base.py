@@ -396,6 +396,12 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # (:meth:`_note_share_start`): the venue pushes ``position`` and
     # ``execution`` as separate frames, in either order.
     _leg_last_view: dict[int, dict]
+    # Legs whose current share an own execution started before any view of
+    # the position it built arrived, the trading stop still unguarded then:
+    # the first such view may reach the guard only after the bot's own
+    # attach, and shows the venue as it stood before it
+    # (:meth:`_precede_own_trading_stop`).
+    _share_unviewed: set[int]
     # Wall-clock epoch-ms of the latest private-stream open whose outage
     # window the execution backfill has not re-read yet; ``None`` once it
     # has. A stream outage loses position views and executions alike, so
@@ -545,6 +551,16 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
 
     @abstractmethod
     def _deriv_is_flat(self) -> bool: ...
+
+    @abstractmethod
+    async def _unbooked_venue_stop_executions(
+            self, market: 'InstrumentInfo', floor_ms: int,
+    ) -> list[dict]: ...
+
+    @abstractmethod
+    async def _unbooked_venue_closeouts(
+            self, market: 'InstrumentInfo', floor_ms: int,
+    ) -> list[dict]: ...
 
     @abstractmethod
     async def _fetch_deriv_position(

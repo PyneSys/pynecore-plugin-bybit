@@ -164,3 +164,4 @@ class Bybit(
         self._pending_tpsl_orders = {}
         self._leg_view_at = {}
         self._leg_last_view = {}
+        self._share_unviewed = set()
