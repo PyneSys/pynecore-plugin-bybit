@@ -29,6 +29,7 @@ from pynecore.types.ohlcv import OHLCV
 from .config import BybitConfig
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
     from decimal import Decimal
     from typing import Callable
 
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
 
     from .hosts import BybitHosts
     from .inventory import _BybitSpotPort
+    from .ledger import LegLedger
     from .models import InstrumentInfo
     from .ws import BybitWebSocket
 
@@ -261,7 +263,9 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     _wire_anchor: 'dict[str, Decimal]'
     # Signed net-position mirror of the inverse one-way path:
     # venue contracts and the base quantity reported to the core, folded
-    # from this strategy's own fills (seeded from the venue at startup).
+    # from this strategy's own fills (seeded from the venue at startup) and
+    # netted with the journal when the position ledger books a close of the
+    # run's share that no own fill made (``_net_inverse_mirror``).
     # Their ratio is the position's effective conversion anchor — reduce
     # dispatches (close / exit legs) convert through it so a core
     # full-close lands exactly on the venue's contract count even after
@@ -332,22 +336,76 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # last one was sent or settled. A position view older than that must
     # not retire the key (a flat read that predates the bot's own attach).
     _protection_writes: dict[str, tuple[int, float]]
-    # ``positionIdx`` -> recorded position views ``(seq, size, updatedTime)``
-    # in ``seq`` order: a closing execution is judged against the newest view
-    # that precedes it, never one that already shows the close.
-    _position_views: dict[int, list[tuple[int, float, int]]]
-    # ``positionIdx`` -> ``seq`` of each foreign execution that opened
-    # exposure on the leg (``0``: no ``seq``). A view older than such an
-    # open understates the foreign share, so a close after it is not
-    # provably the run's.
-    _foreign_open_seqs: dict[int, list[int]]
-    # ``positionIdx`` -> (signed run exposure, flat view ``seq``) the flat
-    # sweep retired: a manual close that arrives after the flat view is
-    # judged against it.
-    _swept_ownership: dict[int, tuple[float, int]]
-    # Execution ids already reported as a manual close (the live push and the
-    # backfill overlap re-read can deliver the same execution).
-    _reported_external_exec_ids: set[str]
+    # Quantities the bot itself sent per guarded order ``orderLinkId`` (the
+    # dispatch and every own amend): a venue view showing another quantity
+    # was amended by someone else. The journal row's quantity counts too, so
+    # a restart that empties this map still judges against it.
+    _own_order_qtys: dict[str, list[float]]
+    # Polled quantity mismatches awaiting their confirming snapshot, per
+    # ``orderLinkId``: ``(venue quantity, observations)``.
+    _qty_mismatches: dict[str, tuple[float, int]]
+    # Orders already reported for a quantity edit (one report per order).
+    _qty_reported: set[str]
+    # Derivative orders whose quantity cut was already logged, with the
+    # quantity logged (one log per cut quantity; a cut is never reported).
+    _qty_cut_logged: dict[str, float]
+    # Orders whose next judged quantity view is the operator-resume baseline,
+    # and the ones whose baseline this process already took.
+    _qty_rebaseline_pending: set[str]
+    _qty_rebaselined: set[str]
+    # ``positionIdx`` -> the leg's ledger (``ledger.py``): position views,
+    # executions and the run's share, judged in ``seq`` order.
+    _leg_ledgers: 'dict[int, LegLedger]'
+    # Execution ids already entered into the ledgers, in arrival order (the
+    # live push and the backfill overlap re-read deliver every execution).
+    _ledger_exec_ids: dict[str, None]
+    # ``seq`` of every execution of the symbol known to the ledgers, in
+    # arrival order: a position view stamped with one of them may close an
+    # interval (its last transaction is known).
+    _ledger_exec_seqs: dict[int, None]
+    # Open execution batches (one push, one backfill window): the ledgers
+    # judge once the whole batch is entered.
+    _ledger_hold: int
+    # Foreign order ids (or execution ids) already reported as a close of
+    # the run's share: one report per foreign order.
+    _reported_close_orders: set[str]
+    # ``positionIdx`` -> ``(seq, execTime)`` of the own execution that gave
+    # the run its current share on the leg; absent when the run holds none
+    # there or the start is not known (a restart). A position view older
+    # than it cannot set the bare trading-stop baseline.
+    _share_start: dict[int, tuple[int, int]]
+    # ``positionIdx`` -> venue time (ms) from which the run is proven to hold
+    # its current share on the leg, when the own execution that started it
+    # is not known (:attr:`_share_start` absent): the adoption baseline's
+    # floor after a restart. Dropped when the share's side changes.
+    _share_held_since: dict[int, int]
+    # Foreign TP/SL orders already judged (reported or logged): venue order
+    # id -> ``(quantity, trigger price)`` of the newest verdict, ``None`` once
+    # reported. Restored from the journal on first use; ``None`` before.
+    _foreign_tpsl_judged: dict[str, tuple[float | None, float | None] | None] | None = None
+    # Foreign partial TP/SL orders seen resting on a leg the run holds a
+    # share of, awaiting the evidence of their verdict: venue order id ->
+    # ``(newest order row, wall-clock time first seen)``.
+    _pending_tpsl_orders: dict[str, tuple[dict, float]]
+    # ``positionIdx`` -> wall-clock time the newest position view of the leg
+    # the ledger holds was taken (a push's arrival, a REST read's start).
+    _leg_view_at: dict[int, float]
+    # ``positionIdx`` -> the newest position row of the leg seen (by ``seq``,
+    # then arrival). An own execution booked after the view of the position
+    # it built sets the bare trading-stop baseline from it
+    # (:meth:`_note_share_start`): the venue pushes ``position`` and
+    # ``execution`` as separate frames, in either order.
+    _leg_last_view: dict[int, dict]
+    # Wall-clock epoch-ms of the latest private-stream open whose outage
+    # window the execution backfill has not re-read yet; ``None`` once it
+    # has. A stream outage loses position views and executions alike, so
+    # the ledgers prove no interval meanwhile (``LegLedger.advance``). Class
+    # default because the runtime ``__init__`` does not assign it.
+    _ledger_stream_opened_ms: int | None = None
+    # Credit the own execution being booked took from the ledger
+    # (``_ledger_reduce_credit`` / ``_ledger_entry_credit``), summed over its
+    # fill slices for its ledger entry.
+    _ledger_credit_taken: float = 0.0
 
     # ------------------------------------------------------------------
     # Bybit-private cross-mix-in method surface.
@@ -445,6 +503,11 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     ) -> 'tuple[dict[str, Decimal], bool]': ...
 
     @abstractmethod
+    async def _open_order_rows(
+            self, market: 'InstrumentInfo',
+    ) -> 'tuple[list[dict], bool]': ...
+
+    @abstractmethod
     async def _order_executions(
             self, market: 'InstrumentInfo', order_id: str, from_ms: int,
             until_ms: int | None = None,
@@ -454,7 +517,7 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     async def _recovery_fill_ids(
             self, market: 'InstrumentInfo', order_id: str, from_ms: int,
             until_ms: int | None = None,
-    ) -> 'tuple[set[str], float, bool]': ...
+    ) -> 'tuple[set[str], float, bool, list[dict]]': ...
 
     @abstractmethod
     def _inverse_order_to_base(self, order: 'ExchangeOrder') -> 'ExchangeOrder': ...
@@ -475,7 +538,7 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     def _position_row_index(row: dict) -> int: ...
 
     @abstractmethod
-    def _run_owned_hedge_signed_size(self) -> float: ...
+    def _run_owned_signed_size(self) -> float: ...
 
     @abstractmethod
     def _ingest_position_sizes(self, rows: list[dict]) -> None: ...
@@ -493,6 +556,9 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
 
     @abstractmethod
     def _apply_inverse_fill(self, side: str, contracts: float, base: float) -> None: ...
+
+    @abstractmethod
+    def _net_inverse_mirror(self, side: str, contracts: float) -> None: ...
 
     # PositionPort transport primitives (hedge-mode one-way emulation) —
     # declared on the base so ``position_port = self`` satisfies the core
@@ -560,6 +626,9 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     @abstractmethod
     def _inverse_anchor_for(self, coid: str, *,
                             fallback: 'float | None' = None) -> 'Decimal | None': ...
+
+    @abstractmethod
+    def _entry_coid_for(self, from_entry: str) -> str | None: ...
 
     @abstractmethod
     def _inverse_fill_anchor(
@@ -642,6 +711,23 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     def _forget_trading_stop_if_flat(self, side: str) -> None: ...
 
     @abstractmethod
+    def _guard_cleared_trading_stop(self, key: str, idx: int) -> None: ...
+
+    @abstractmethod
+    def _note_share_start(
+            self, entry: dict, before: dict[int, float], after: dict[int, float],
+            market: 'InstrumentInfo',
+    ) -> None: ...
+
+    @abstractmethod
+    def _note_share_held_since(self, since_ms: int, market: 'InstrumentInfo') -> None: ...
+
+    @abstractmethod
+    def _observe_foreign_tpsl_order(
+            self, entry: dict, market: 'InstrumentInfo',
+    ) -> None: ...
+
+    @abstractmethod
     def _trading_stop_row_coid(self, leg_id: str, coid: str) -> str | None: ...
 
     @abstractmethod
@@ -657,9 +743,80 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     ) -> None: ...
 
     @abstractmethod
+    def _observe_entry_push(
+            self, entry: dict, coid: str, market: 'InstrumentInfo',
+    ) -> None: ...
+
+    @abstractmethod
+    def _observe_open_order_levels(
+            self, orders: list[dict], market: 'InstrumentInfo', *,
+            read_started_at: float,
+    ) -> None: ...
+
+    @abstractmethod
+    async def _observe_resume_baseline(self, market: 'InstrumentInfo') -> None: ...
+
+    @abstractmethod
+    def _note_own_order_qty(self, coid: str, qty: float) -> None: ...
+
+    @abstractmethod
+    def _retract_own_order_qty(self, coid: str, qty: float) -> None: ...
+
+    @abstractmethod
     def _note_external_execution(
             self, entry: dict, market: 'InstrumentInfo', *, ambiguous: bool,
     ) -> None: ...
+
+    @abstractmethod
+    def _note_non_trade_execution(self, entry: dict, market: 'InstrumentInfo') -> None: ...
+
+    @abstractmethod
+    def _note_own_execution(
+            self, entry: dict, market: 'InstrumentInfo', *,
+            reducing: bool, share: dict[int, float], credit: float = 0.0,
+    ) -> None: ...
+
+    @abstractmethod
+    def _journal_leg_shares(self) -> dict[int, float]: ...
+
+    @abstractmethod
+    def _closed_leg(self, side: str) -> int: ...
+
+    @abstractmethod
+    def _ledger_advance(self, market: 'InstrumentInfo') -> None: ...
+
+    @abstractmethod
+    def _ledger_batch(self, market: 'InstrumentInfo') -> 'AbstractContextManager[None]': ...
+
+    @abstractmethod
+    def _note_ledger_seq(self, entry: dict, market: 'InstrumentInfo') -> None: ...
+
+    @abstractmethod
+    def _ledger_reduce_credit(
+            self, entry: dict, side: str, qty: float, market: 'InstrumentInfo',
+    ) -> float: ...
+
+    @abstractmethod
+    def _ledger_reduce_credit_open(
+            self, entry: dict, side: str, market: 'InstrumentInfo',
+    ) -> float: ...
+
+    @abstractmethod
+    def _ledger_entry_credit_due(self, entry: dict, market: 'InstrumentInfo') -> bool: ...
+
+    @abstractmethod
+    def _ledger_entry_credit(
+            self, entry: dict, side: str, qty: float, journal_before: float,
+            market: 'InstrumentInfo',
+    ) -> float: ...
+
+    @abstractmethod
+    def _take_persisted_ledger_credits(
+            self, reduces: list[tuple[str, float, list[dict]]], tolerance: float,
+    ) -> list[tuple[str, float]]: ...
+
+    @abstractmethod
+    def _sweep_waits_for_ledger(self) -> bool: ...
 
     @abstractmethod
     def _record_position_views(self, rows: list[dict]) -> None: ...
@@ -667,12 +824,12 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     @abstractmethod
     def _position_view_superseded(self, idx: int, row: dict) -> bool: ...
 
-    @abstractmethod
-    def _remember_swept_ownership(self) -> None: ...
-
     # --- Entry-row ownership (events.py) ---
     @abstractmethod
     def _net_entry_row(self, row: 'OrderRow', consumed: float) -> None: ...
+
+    @abstractmethod
+    def _reduce_entry_ownership(self, side: str, qty: float) -> None: ...
 
     @abstractmethod
     def _retire_cancelled_row(

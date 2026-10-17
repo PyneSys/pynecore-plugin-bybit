@@ -134,6 +134,7 @@ from .exceptions import (
     reject_error,
 )
 from .helpers import (
+    BRACKET_OWN_WIRE_QTY_EXTRA,
     CATEGORY_SPOT,
     TRIGGER_DIRECTION_FALL,
     TRIGGER_DIRECTION_RISE,
@@ -863,6 +864,33 @@ class _ExecutionMixin(_BybitBase, ABC):
             return None
         return round_price(intent.stop, market.tick_size_str)
 
+    @staticmethod
+    def _entry_order_levels(
+            intent: EntryIntent, market: InstrumentInfo,
+    ) -> ProtectionLevels | None:
+        """The level a resting entry order carries, for the protection guard.
+
+        A limit entry its limit price, a stop entry its trigger. A market
+        entry rests nowhere (``None``). A stop-limit entry — a ``LIMIT``
+        intent that still carries its ``stop`` (see
+        :meth:`_stop_limit_dormancy_trigger`) — is not guarded at all
+        (``None``), neither its levels nor its quantity: a known blind spot,
+        a foreign edit of it goes unseen. Whether it rests as a plain limit
+        or as a dormant conditional one depends on the price at each
+        placement, and the venue's view of a conditional limit order, before
+        and after its trigger fired, is unverified: a guess there would judge
+        the bot's own order as edited.
+        """
+        if intent.order_type is OrderType.LIMIT and intent.limit is not None:
+            if intent.stop is not None:
+                return None
+            return ProtectionLevels(limit=float(round_price(intent.limit,
+                                                            market.tick_size_str)))
+        if intent.order_type is OrderType.STOP and intent.stop is not None:
+            return ProtectionLevels(stop=float(round_price(intent.stop,
+                                                           market.tick_size_str)))
+        return None
+
     async def _place_entry_order(
             self, envelope: DispatchEnvelope, intent: EntryIntent,
             market: InstrumentInfo, qty: Decimal,
@@ -981,14 +1009,35 @@ class _ExecutionMixin(_BybitBase, ABC):
                 payload={'kind': entry_kind,
                          'order_type': intent.order_type.value},
             )
+        # A resting entry is the bot's own order like an exit leg: its level
+        # and quantity are guarded, so an edit someone else makes is seen.
+        levels = self._entry_order_levels(intent, market)
+        write: int | None = None
+        if levels is not None:
+            self._note_own_order_qty(coid, float(qty))
+            write = self._expect_protection(coid, levels, row_coid=coid)
         try:
             result = await self._order_post('/v5/order/create', body,
                                             coid=coid, context="entry")
         except Exception as exc:
             self._mark_dispatch_failure(coid, exc)
+            if levels is not None:
+                if isinstance(exc, OrderDispositionUnknownError):
+                    self._settle_protection(coid, None, write=write)
+                else:
+                    self._settle_protection(coid, None, rejected=levels, write=write)
+                    self._forget_protection(coid)
+            raise
+        except BaseException:
+            if levels is not None:
+                self._settle_protection(coid, None, write=write)
             raise
         order_id = str(result.get('orderId') or '')
         self._confirm_row(coid, order_id, extras)
+        if levels is not None:
+            # ``_confirm_row`` rewrote the row extras; the settle persists the
+            # levels again.
+            self._settle_protection(coid, levels, write=write)
         if self.store_ctx is not None:
             self.store_ctx.log_event(
                 'entry_dispatched', client_order_id=coid,
@@ -1272,6 +1321,7 @@ class _ExecutionMixin(_BybitBase, ABC):
                     trail_offset=intent.trail_offset,
                     oca_name=intent.oca_name,
                     oca_type=intent.oca_type,
+                    extra_payload={BRACKET_OWN_WIRE_QTY_EXTRA: float(qty)},
                 )
 
         def attach_reject(
@@ -1475,10 +1525,11 @@ class _ExecutionMixin(_BybitBase, ABC):
         """Settle one trading-stop write with the protection guard.
 
         A success or a "not modified" reject means the venue carries
-        ``levels``; a cleared stop (or a vanished position) is no longer
-        guarded. Any other answered reject refused ``levels``; a server-side
-        failure leaves the outcome unknown and keeps every level recorded
-        so far acceptable.
+        ``levels``; a cleared stop leaves the run's position bare, still
+        guarded while the run holds it (:meth:`_guard_cleared_trading_stop`),
+        and a vanished position is no longer guarded. Any other answered
+        reject refused ``levels``; a server-side failure leaves the outcome
+        unknown and keeps every level recorded so far acceptable.
 
         :param write: The id :meth:`_expect_protection` returned for the write.
         """
@@ -1486,7 +1537,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         if error is None or error.ret_code == 34040:
             self._settle_protection(key, levels, write=write)
             if cleared:
-                self._forget_protection(key)
+                self._guard_cleared_trading_stop(key, int(_NETTING_LEG_ID))
             return
         if error.ret_code in AMBIGUOUS_DISPOSITION_CODES:
             self._settle_protection(key, None, write=write)
@@ -1725,6 +1776,7 @@ class _ExecutionMixin(_BybitBase, ABC):
             extras=extras,
         )
         levels = exit_leg_levels(leg_type, float(price))
+        self._note_own_order_qty(coid, float(qty))
         write = self._expect_protection(coid, levels, row_coid=coid)
         try:
             result = await self._order_post(
@@ -2311,16 +2363,40 @@ class _ExecutionMixin(_BybitBase, ABC):
             body['triggerPrice'] = format_decimal(
                 round_price(intent.stop, market.tick_size_str),
             )
+        levels = self._entry_order_levels(intent, market)
+        guarded = levels is not None
+        write: int | None = None
+        if guarded:
+            assert levels is not None
+            self._note_own_order_qty(old_coid, float(qty))
+            write = self._expect_protection(old_coid, levels, row_coid=old_coid)
+        else:
+            # The amended order is one the guard does not judge (it became a
+            # stop-limit): the levels it was placed with are no longer its own.
+            self._forget_protection(old_coid)
         try:
             result = await self._amend_or_none(body, coid=old_coid)
         except BybitAPIError as e:
+            if guarded:
+                self._settle_protection(old_coid, None, rejected=levels, write=write)
+                self._retract_own_order_qty(old_coid, float(qty))
             mapped = map_broker_error(e)
             if mapped is not None:
                 raise mapped from e
             raise reject_error(e) from e
+        except BaseException:
+            if guarded:
+                self._settle_protection(old_coid, None, write=write)
+            raise
+        if guarded:
+            if result is not None:
+                self._settle_protection(old_coid, levels, write=write)
+            else:
+                self._settle_protection(old_coid, None, rejected=levels, write=write)
         if result is None:
             # The working order is gone (filled / cancelled race) — the
             # base cancel+recreate resolves the disposition cleanly.
+            self._forget_protection(old_coid)
             return await super().modify_entry(old, new)
         self._dispatch_qty[old_coid] = float(qty)
         if self.store_ctx is not None:
@@ -2448,6 +2524,7 @@ class _ExecutionMixin(_BybitBase, ABC):
                 LegType.TAKE_PROFIT if leg == 'tp' else LegType.STOP_LOSS,
                 float(price),
             )
+            self._note_own_order_qty(old_coid, float(qty))
             write = self._expect_protection(old_coid, leg_levels, row_coid=old_coid)
             try:
                 result = await self._amend_or_none(body, coid=old_coid)
@@ -2455,6 +2532,7 @@ class _ExecutionMixin(_BybitBase, ABC):
                 # ``_amend_or_none`` parks every ambiguous outcome as
                 # disposition-unknown: a raw API error is an answered reject.
                 self._settle_protection(old_coid, None, rejected=leg_levels, write=write)
+                self._retract_own_order_qty(old_coid, float(qty))
                 mapped = map_broker_error(e)
                 if mapped is not None:
                     raise mapped from e

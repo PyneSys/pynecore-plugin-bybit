@@ -66,7 +66,8 @@ class _BackfillFake(Bybit):
     """Bybit with the REST dispatcher replaced by a window-aware fake.
 
     ``executions`` are ``/v5/execution/list`` rows; each request filters them
-    to its ``[startTime, endTime]`` span (newest-first) and enforces the
+    to its ``[startTime, endTime]`` span (newest-first), its ``orderId`` and
+    its ``execType`` when the request names them, and enforces the
     endpoint's real 7-day span cap — an over-wide window raises the measured
     ``retCode 10001`` so a walk that respected the cap is proven. ``fail_once``
     makes the first execution read raise a transport error (the mid-window
@@ -99,10 +100,12 @@ class _BackfillFake(Bybit):
                     "startTime/endTime exceeds 7 days", ret_code=10001,
                 )
             order_id = params.get('orderId')
+            exec_type = params.get('execType')
             rows = [
                 row for row in self.executions
                 if start <= int(row.get('execTime') or 0) <= end
                 and (order_id is None or row.get('orderId') == order_id)
+                and (exec_type is None or row.get('execType', 'Trade') == exec_type)
             ]
             rows.sort(key=lambda r: int(r.get('execTime') or 0), reverse=True)
             return {'list': rows, 'nextPageCursor': ''}
@@ -517,6 +520,9 @@ def __test_vanished_order_verdict_carries_the_venue_cancel_type__(
         'v3': ('Deactivated', 'CancelByTpSlTsClear', CANCEL_REASON_VENUE_POSITION_CLEARED),
         'v4': ('Cancelled', 'CancelByUser', None),
         'v5': ('Rejected', 'UNKNOWN', CANCEL_REASON_VENUE_REJECTED),
+        'v6': ('Cancelled', 'CancelByPrepareLiq', CANCEL_REASON_VENUE_POSITION_CLEARED),
+        'v7': ('Deactivated', 'CancelByCannotAffordOrderCost', CANCEL_REASON_VENUE_REJECTED),
+        'v8': ('Cancelled', 'CancelBySmp', None),
     }
     for coid, (status, cancel_type, _reason) in cases.items():
         _seed_created_at(monkeypatch, broker, coid, now - 600_000, qty=0.01)
@@ -527,6 +533,77 @@ def __test_vanished_order_verdict_carries_the_venue_cancel_type__(
         verdict = asyncio.run(broker._confirm_vanished_order(broker._market, row))
         assert verdict.resolution is MissingResolution.CANCELLED
         assert verdict.cancel_reason == reason, coid
+
+
+def __test_backfill_books_same_millisecond_executions_in_seq_order__(tmp_path):
+    """Executions of one millisecond are booked in the venue's ``seq`` order.
+
+    The execution list serves them newest first. Booking the own exit before
+    the entry it closes would net nothing (the entry row owns nothing yet)
+    and leave the run owning a position the venue already closed.
+    """
+    now = int(time.time() * 1000)
+    ts_ms = now - 30_000
+    entry = {**_exec(exec_id='e-in', order_id='x-c1', coid='c1', qty=0.01,
+                     price=30000, ts_ms=ts_ms, symbol='BTCUSDT'), 'seq': '101'}
+    close = {**_exec(exec_id='e-out', order_id='x-x1', coid='x1', qty=0.01,
+                     price=30100, ts_ms=ts_ms, symbol='BTCUSDT'),
+             'side': 'Sell', 'closedSize': '0.01', 'seq': '102'}
+    broker = _BackfillFake(market=_linear_instrument(), executions=[close, entry])
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed(broker, 'c1', qty=0.01)
+    broker.store_ctx.upsert_order(
+        'x1', symbol='BTCUSDT', side='sell', qty=0.01, state='confirmed',
+        intent_key='X\x00Long', from_entry='Long', exchange_order_id='x-x1',
+        extras={'kind': 'exit_leg', 'leg': 'tp', 'exit_id': 'X'},
+    )
+    broker.store_ctx.add_ref('x1', 'order_id', 'x-x1')
+    broker._deriv_exec_watermark = now - 120_000
+    events = _backfill(broker)
+    assert [event.fill_id for event in events] == ['e-in', 'e-out']
+    assert broker._run_owned_signed_size() == 0.0
+
+
+def __test_backfilled_venue_exec_types_enter_the_ledger__(tmp_path):
+    """A venue execution only the windowed backfill delivers proves its interval.
+
+    The run's long is closed by the venue (ADL, takeover liquidation,
+    settlement) while the stream is down; the flat position view arrives,
+    the execution comes from the backfill. The ledger books the venue truth
+    at once, without waiting out the give-up grace, and never reports it.
+    """
+    now = int(time.time() * 1000)
+    for exec_type in ('AdlTrade', 'BustTrade', 'Settle'):
+        venue_close = {
+            **_exec(exec_id=f"v-{exec_type}", order_id=f"venue-{exec_type}", coid='',
+                    qty=0.02, price=30000, ts_ms=now - 30_000, symbol='BTCUSDT'),
+            'execType': exec_type, 'side': 'Sell', 'closedSize': '0.02',
+            'createType': '', 'seq': '100',
+        }
+        broker = _BackfillFake(market=_linear_instrument(), executions=[venue_close])
+        (tmp_path / exec_type).mkdir()
+        _open(tmp_path / exec_type, broker)
+        quarantines: list = []
+        broker.quarantine_sink = lambda reason, ctx, *, kind: quarantines.append(kind)
+        broker._adoption_baselined = True
+        _seed(broker, 'c1', qty=0.02, filled=0.02)
+        view = {'symbol': 'BTCUSDT', 'category': 'linear', 'positionIdx': 0,
+                'side': 'Buy', 'size': '0.02', 'updatedTime': str(now - 60_000),
+                'seq': '50'}
+        broker._ingest_position_sizes([view])
+        broker._ledger_advance(broker._market)
+        broker._ingest_position_sizes([{**view, 'side': '', 'size': '0', 'seq': '100'}])
+        broker._ledger_advance(broker._market)
+        assert broker._leg_ledgers[0].open, exec_type
+        broker._deriv_exec_watermark = now - 120_000
+        assert _backfill(broker) == [], exec_type
+        assert not broker._leg_ledgers[0].open, exec_type
+        assert quarantines == [], exec_type
+        clamped = [payload for _, _, _, payload in
+                   broker.store_ctx.iter_events_by_kind_for_run_id('own_share_clamped')]
+        assert len(clamped) == 1, exec_type
+        assert broker._run_owned_signed_size() == 0.0, exec_type
 
 
 def __test_filled_order_finished_below_its_row_size_is_settled__(tmp_path, monkeypatch):

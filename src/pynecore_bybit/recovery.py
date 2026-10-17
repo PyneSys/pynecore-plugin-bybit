@@ -89,6 +89,23 @@ from .models import InstrumentInfo
 logger = logging.getLogger(__name__)
 
 
+def open_orders_by_id(rows: list[dict]) -> dict[str, Decimal]:
+    """Map each open-order row's ``orderId`` to its wire-domain ``cumExecQty``.
+
+    An unparsable ``cumExecQty`` maps to ``0``; a row without an id is skipped.
+    """
+    orders: dict[str, Decimal] = {}
+    for entry in rows:
+        oid = str(entry.get('orderId') or '')
+        if not oid:
+            continue
+        try:
+            orders[oid] = Decimal(str(entry.get('cumExecQty') or '0') or '0')
+        except (InvalidOperation, TypeError, ValueError):
+            orders[oid] = Decimal(0)
+    return orders
+
+
 def _log_inconclusive_snapshot(what: str, exc: BybitError) -> None:
     """Log a venue snapshot read that could not be trusted.
 
@@ -213,7 +230,7 @@ class _RecoveryMixin(_BybitBase, ABC):
         order_id = str(existing.get('orderId') or '')
         if cum_exec > 0:
             from_ms = row.created_ts_ms - EXECUTION_SINCE_SKEW_MS
-            exec_ids, _exec_qty, seeded = await self._recovery_fill_ids(
+            exec_ids, _exec_qty, seeded, _entries = await self._recovery_fill_ids(
                 market, order_id, from_ms,
             )
             if not seeded or not exec_ids:
@@ -313,17 +330,27 @@ class _RecoveryMixin(_BybitBase, ABC):
     async def _recovery_open_orders(
             self, market: InstrumentInfo,
     ) -> tuple[dict[str, Decimal], bool]:
-        """Page ``/v5/order/realtime`` for the symbol's live orders.
+        """The symbol's live orders (see :meth:`_open_order_rows`).
+
+        :return: ``(orders, conclusive)`` — each live ``orderId`` mapped to
+            its wire-domain ``cumExecQty`` (``0`` when unparsable).
+        """
+        rows, conclusive = await self._open_order_rows(market)
+        return open_orders_by_id(rows), conclusive
+
+    async def _open_order_rows(
+            self, market: InstrumentInfo,
+    ) -> tuple[list[dict], bool]:
+        """Page ``/v5/order/realtime`` for the symbol's live order rows.
 
         Read directly (not through :meth:`get_open_orders`) so recovery does
         not re-enter :meth:`_ensure_broker_started` mid-startup. ``conclusive``
         is ``False`` on any transport failure — a truncated read must never
         let the orphan pass conclude a row's counterpart is absent.
 
-        :return: ``(orders, conclusive)`` — each live ``orderId`` mapped to
-            its wire-domain ``cumExecQty`` (``0`` when unparsable).
+        :return: ``(rows, conclusive)`` — the raw venue order objects read.
         """
-        orders: dict[str, Decimal] = {}
+        rows: list[dict] = []
         cursor: str | None = None
         try:
             while True:
@@ -333,22 +360,14 @@ class _RecoveryMixin(_BybitBase, ABC):
                     'limit': OPEN_ORDERS_PAGE_LIMIT,
                     'cursor': cursor,
                 }, auth=True)
-                for entry in result.get('list') or []:
-                    oid = str(entry.get('orderId') or '')
-                    if not oid:
-                        continue
-                    try:
-                        cum_exec = Decimal(str(entry.get('cumExecQty') or '0') or '0')
-                    except (InvalidOperation, TypeError, ValueError):
-                        cum_exec = Decimal(0)
-                    orders[oid] = cum_exec
+                rows.extend(result.get('list') or [])
                 cursor = result.get('nextPageCursor') or None
                 if not cursor:
                     break
         except BybitError as exc:
             _log_inconclusive_snapshot("open-orders snapshot read failed", exc)
-            return orders, False
-        return orders, True
+            return rows, False
+        return rows, True
 
     async def _recovery_has_exposure(
             self, market: InstrumentInfo,
@@ -386,7 +405,7 @@ class _RecoveryMixin(_BybitBase, ABC):
     async def _recovery_fill_ids(
             self, market: InstrumentInfo, order_id: str, from_ms: int,
             until_ms: int | None = None,
-    ) -> tuple[set[str], float, bool]:
+    ) -> tuple[set[str], float, bool, list[dict]]:
         """Collect one order's fills for the de-dup seed + the fill cursor.
 
         Filtered by ``orderId``, walking contiguous 7-day windows (the
@@ -398,9 +417,10 @@ class _RecoveryMixin(_BybitBase, ABC):
         the summed wire-domain ``execQty`` of those executions (base on
         linear, whole USD contracts on inverse — the ids and the quantity
         come from the SAME read, so a cursor advanced by this sum is always
-        covered by the seeded de-dup), and ``seeded``, which is ``False`` on
+        covered by the seeded de-dup), ``seeded``, which is ``False`` on
         any transport failure so the caller leaves the row pending rather
-        than advancing a fill cursor with no de-dup anchor.
+        than advancing a fill cursor with no de-dup anchor, and the raw
+        execution rows read.
 
         ``until_ms`` clamps the walk's end to at least that VENUE-clocked
         timestamp: the adoption baseline passes its floor so a lagging
@@ -419,7 +439,7 @@ class _RecoveryMixin(_BybitBase, ABC):
                 qty_sum += float(entry.get('execQty') or 0.0)
             except (TypeError, ValueError):
                 pass
-        return ids, qty_sum, seeded
+        return ids, qty_sum, seeded, entries
 
     async def _order_executions(
             self, market: InstrumentInfo, order_id: str, from_ms: int,

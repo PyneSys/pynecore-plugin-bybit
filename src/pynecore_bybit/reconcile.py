@@ -81,6 +81,7 @@ from .helpers import (
     EXECUTION_CURSOR_OVERLAP_MS,
     venue_filled_qty,
 )
+from .recovery import open_orders_by_id
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
@@ -382,7 +383,14 @@ class _ReconcileMixin(_BybitBase, ABC):
         the derivative position snapshot shows exposure (``None`` on a
         failed read), and is omitted entirely on spot.
         """
-        open_orders, orders_ok = await self._recovery_open_orders(market)
+        read_started_at = epoch_time()
+        order_rows, orders_ok = await self._open_order_rows(market)
+        open_orders = open_orders_by_id(order_rows)
+        if orders_ok:
+            # The private push is the fast path of the guard; this read
+            # judges the guarded orders whose edit push was lost or skipped.
+            self._observe_open_order_levels(order_rows, market,
+                                            read_started_at=read_started_at)
         present: dict[str, set[str] | None] = {
             'orders': set(open_orders) if orders_ok else None,
         }

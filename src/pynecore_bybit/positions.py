@@ -42,7 +42,7 @@ import math
 from abc import ABC
 from decimal import ROUND_DOWN, Decimal
 from time import time as epoch_time
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
@@ -87,6 +87,9 @@ from .helpers import (
     wire_link_id,
 )
 from .models import InstrumentInfo
+
+if TYPE_CHECKING:
+    from pynecore.core.broker.storage import OrderRow
 
 logger = logging.getLogger(__name__)
 
@@ -277,28 +280,33 @@ class _PositionsMixin(_BybitBase, ABC):
             return False
         if self._position_mode == POSITION_MODE_HEDGE and self.store_ctx is not None:
             return (
-                abs(self._run_owned_hedge_signed_size()) <= _FILL_EPS
+                abs(self._run_owned_signed_size()) <= _FILL_EPS
                 and self._deriv_snapshot_ms >= self._last_own_fill_ms
             )
         if not all(size <= 0.0 for size in sizes.values()):
             return False
         return self._deriv_snapshot_ms >= self._last_own_fill_ms
 
-    def _run_owned_hedge_signed_size(self) -> float:
-        """Return this run's signed hedge exposure from its durable fills.
+    def _run_owned_signed_size(self) -> float:
+        """Return this run's signed exposure from its durable entry rows.
 
-        Bybit exposes one aggregate Buy row and one aggregate Sell row for the
-        whole account. Those rows can include positions opened by another bot
-        run or manually, so they are not an ownership boundary. The run's
-        persisted fill cursors are the only attributable source: entry fills
-        add exposure and filled close rows subtract it. Startup-adopted foreign
-        rows are deliberately excluded.
+        Bybit exposes one aggregate position per leg for the whole account.
+        Those legs can include positions opened by another bot run or
+        manually, so they are not an ownership boundary. The run's live entry
+        rows are: each one owns what it filled, net of the exposure the
+        run's reducing fills consumed from it (:meth:`_reduce_entry_ownership`
+        nets them at fill time). An exit leg's or a close's own fill cursor is
+        therefore never counted on top — it is already netted out of the
+        entry rows. Startup-adopted foreign rows are deliberately excluded.
         """
         if self.store_ctx is None:
             return 0.0
         owned = 0.0
         for row in self.store_ctx.iter_live_orders():
-            if (row.extras or {}).get(ADOPTED_STARTUP_EXTRA_KEY):
+            extras = row.extras or {}
+            if extras.get('kind') not in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING):
+                continue
+            if extras.get(ADOPTED_STARTUP_EXTRA_KEY):
                 continue
             filled = float(row.filled_qty)
             if filled <= 0.0:
@@ -318,7 +326,7 @@ class _PositionsMixin(_BybitBase, ABC):
         """
         if self.store_ctx is None:
             return rows
-        owned = self._run_owned_hedge_signed_size()
+        owned = self._run_owned_signed_size()
         if abs(owned) <= _FILL_EPS:
             return []
         wanted_idx = HEDGE_IDX_BUY if owned > 0.0 else HEDGE_IDX_SELL
@@ -395,10 +403,21 @@ class _PositionsMixin(_BybitBase, ABC):
 
     def _parked_adoption_executions(
             self, market: InstrumentInfo, order_id: str, floor_ms: int,
-    ) -> tuple[set[str], float]:
-        """Return exact private execution slices parked behind the adoption gate."""
+            known_ids: set[str],
+    ) -> tuple[set[str], float, list[dict]]:
+        """Return exact private execution slices parked behind the adoption gate.
+
+        A fill can legitimately reach the startup window through BOTH the
+        REST walk and a parked push, so every ``execId`` in ``known_ids``
+        (the walk's) is skipped — its quantity is already in the walk's sum.
+
+        :param known_ids: ``execId`` set the REST walk already returned.
+        :return: Their ``execId`` set, summed wire-domain quantity and rows,
+            all disjoint from ``known_ids``.
+        """
         ids: set[str] = set()
         quantity = 0.0
+        entries: list[dict] = []
         for frame in self._pre_adoption_frames:
             if str(frame.get('topic') or '') != 'execution':
                 continue
@@ -415,11 +434,12 @@ class _PositionsMixin(_BybitBase, ABC):
                 if exec_time > floor_ms:
                     continue
                 exec_id = str(entry.get('execId') or '')
-                if not exec_id or exec_id in ids:
+                if not exec_id or exec_id in ids or exec_id in known_ids:
                     continue
                 ids.add(exec_id)
                 quantity += _wire_float(entry.get('execQty'), field='execQty')
-        return ids, quantity
+                entries.append(entry)
+        return ids, quantity, entries
 
     async def _venue_time_ms(self) -> int:
         """Read the venue server clock (``/v5/market/time``) in epoch-ms."""
@@ -609,13 +629,14 @@ class _PositionsMixin(_BybitBase, ABC):
                     or str((lookup or {}).get('orderId') or '')
                 ids: set[str] = set()
                 qty_sum = 0.0
+                executions: list[dict] = []
                 if order_id:
                     # A retained handle is still walked even for a dead
                     # order — its historical executions must seed the
                     # de-dup frontier and the cursor before any terminal
                     # decision is applied.
                     from_ms = row.created_ts_ms - EXECUTION_SINCE_SKEW_MS
-                    ids, qty_sum, seeded = await self._recovery_fill_ids(
+                    ids, qty_sum, seeded, executions = await self._recovery_fill_ids(
                         market, order_id, from_ms, until_ms=floor_ms,
                     )
                     if not seeded:
@@ -623,13 +644,15 @@ class _PositionsMixin(_BybitBase, ABC):
                             "adoption baseline: execution seed read failed "
                             f"for order {order_id}",
                         )
-                    parked_ids, parked_qty = self._parked_adoption_executions(
+                    parked_ids, parked_qty, parked = self._parked_adoption_executions(
                         market,
                         order_id,
                         floor_ms,
+                        ids,
                     )
                     ids.update(parked_ids)
                     qty_sum += parked_qty
+                    executions = [*executions, *parked]
                 if lookup is not None:
                     # F8 order-truth gate: the position snapshot can reflect
                     # a fill whose execution row is not indexed yet — a
@@ -644,7 +667,7 @@ class _PositionsMixin(_BybitBase, ABC):
                             f"order {order_id} ({qty_sum} < {cum_exec})"
                         )
                         last_index_lag = pass_index_lag
-                seeds.append((row, order_id, ids, qty_sum, lookup is None))
+                seeds.append((row, order_id, ids, qty_sum, lookup is None, executions))
             try:
                 verify = await self._fetch_position_rows(market)
             except BybitError as exc:
@@ -666,7 +689,8 @@ class _PositionsMixin(_BybitBase, ABC):
                 continue
             self._adoption_baselined = True
             self._deriv_exec_floor_ms = floor_ms
-            for row, order_id, ids, qty_sum, dead in seeds:
+            unbooked_reduces: list[tuple[str, float, list[dict]]] = []
+            for row, order_id, ids, qty_sum, dead, executions in seeds:
                 self._seen_exec_ids.update(ids)
                 # ``qty_sum`` is the order's venue-domain cumulative; the
                 # row's cursor is net of what reducing fills consumed.
@@ -674,6 +698,10 @@ class _PositionsMixin(_BybitBase, ABC):
                 cumulative: float = min(
                     float(row.qty), max(float(row.filled_qty), qty_sum - netted),
                 )
+                if ((row.extras or {}).get('kind') in ('exit_leg', 'close')
+                        and cumulative > row.filled_qty + _FILL_EPS):
+                    unbooked_reduces.append(
+                        (row.side, cumulative - float(row.filled_qty), executions))
                 if cumulative > row.filled_qty:
                     self.store_ctx.set_filled(row.client_order_id, cumulative)
                     self.store_ctx.log_event(
@@ -759,7 +787,22 @@ class _PositionsMixin(_BybitBase, ABC):
                         payload={'filled_qty': cumulative,
                                  'kind': (row.extras or {}).get('kind')},
                     )
+            tolerance = market.qty_step / 2 if market.qty_step > 0 else _FILL_EPS
+            for side, quantity in self._take_persisted_ledger_credits(
+                    unbooked_reduces, tolerance):
+                # A reducing fill the run never booked (it landed while the
+                # bot was down) consumed entry exposure exactly like a booked
+                # one: net it out of the entry rows before the venue clamp,
+                # which only sees the excess over the whole venue leg and
+                # misses it when foreign exposure shares the leg. What an
+                # earlier process's position ledger already netted for it is
+                # not netted again.
+                self._reduce_entry_ownership(side, quantity)
             self._clamp_entry_ownership_to_venue(market, verify)
+            # The journal holds the run's share as of the verified snapshot:
+            # the position ledgers anchor on that very view.
+            self._note_share_held_since(floor_ms, market)
+            self._ledger_advance(market)
             return verify
         if last_index_lag is not None:
             raise BybitAdoptionBaselineError(
@@ -793,6 +836,18 @@ class _PositionsMixin(_BybitBase, ABC):
         adoption owns that surplus. Wire domain on both sides; no anchor
         conversion. Rows in a pending-dispatch state stay untouched —
         F1 recovery owns their resolution and their cursors are zero.
+
+        Hedge legs are separate positions: each side is clamped to its own
+        leg. A one-way account holds ONE signed position, and a folded
+        reversal is booked as a single entry row on the new side whose
+        closing part is never netted from the old side's rows: the rows of
+        the two sides are folded against each other first, and the run's
+        net is clamped to the venue's signed position. Clamped side by side,
+        the reversal's closing part would be netted twice — once off the old
+        side, once off the new — and foreign exposure on the venue's side
+        would land in the run's share. The fold cannot tell a reversal from
+        rows of both sides that predate the fill-time netting; it never owns
+        more than the side-by-side clamp would.
         """
         if self.store_ctx is None:
             return
@@ -804,19 +859,17 @@ class _PositionsMixin(_BybitBase, ABC):
             side = str(row.get('side') or '').lower()
             if side in venue:
                 venue[side] += size
+        if self._position_mode != POSITION_MODE_HEDGE:
+            net = venue['buy'] - venue['sell']
+            venue = {'buy': max(net, 0.0), 'sell': max(-net, 0.0)}
+            folded = min(sum(row.filled_qty for row in self._clampable_entry_rows(market, side))
+                         for side in ('buy', 'sell'))
+            if folded > _FILL_EPS:
+                for side in ('buy', 'sell'):
+                    self._net_entry_rows_fifo(self._clampable_entry_rows(market, side),
+                                              folded, 'adoption_baseline_folded')
         for side in ('buy', 'sell'):
-            live = sorted(
-                (
-                    row for row in self.store_ctx.iter_live_orders(
-                        symbol=market.symbol)
-                    if row.side == side
-                    and row.state not in PENDING_DISPATCH_STATES
-                    and (row.extras or {}).get('kind')
-                    in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)
-                    and row.filled_qty > _FILL_EPS
-                ),
-                key=lambda entry_row: entry_row.created_ts_ms,
-            )
+            live = self._clampable_entry_rows(market, side)
             excess = sum(row.filled_qty for row in live) - venue[side]
             if excess <= _FILL_EPS:
                 continue
@@ -826,24 +879,53 @@ class _PositionsMixin(_BybitBase, ABC):
                 "the bot was down, or the rows predate fill-time netting)",
                 side, excess,
             )
-            for row in live:
-                if excess <= _FILL_EPS:
-                    break
-                consumed = min(excess, row.filled_qty)
-                self.store_ctx.log_event(
-                    'adoption_baseline_clamped',
-                    client_order_id=row.client_order_id,
-                    intent_key=row.intent_key,
-                    payload={'from_filled_qty': row.filled_qty,
-                             'filled_qty': row.filled_qty - consumed,
-                             'consumed': consumed},
-                )
-                # Exactly the fill-time netting: only the OWNED (filled)
-                # exposure is consumed, a working entry keeps its unfilled
-                # remainder (it can still fill on the venue), and a row
-                # left with neither retires only the physical row.
-                self._net_entry_row(row, consumed)
-                excess -= consumed
+            self._net_entry_rows_fifo(live, excess, 'adoption_baseline_clamped')
+
+    def _clampable_entry_rows(self, market: InstrumentInfo, side: str) -> list['OrderRow']:
+        """The settled entry rows of ``side`` that own exposure, oldest first."""
+        assert self.store_ctx is not None
+        return sorted(
+            (
+                row for row in self.store_ctx.iter_live_orders(symbol=market.symbol)
+                if row.side == side
+                and row.state not in PENDING_DISPATCH_STATES
+                and (row.extras or {}).get('kind')
+                in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)
+                and row.filled_qty > _FILL_EPS
+            ),
+            key=lambda entry_row: entry_row.created_ts_ms,
+        )
+
+    def _net_entry_rows_fifo(
+            self, rows: list['OrderRow'], quantity: float, kind: str,
+    ) -> None:
+        """Net ``quantity`` owned exposure out of ``rows`` in order, journalling each.
+
+        Exactly the fill-time netting: only the OWNED (filled) exposure is
+        consumed, a working entry keeps its unfilled remainder (it can still
+        fill on the venue), and a row left with neither retires only the
+        physical row.
+
+        :param rows: Entry rows of one side, oldest first.
+        :param quantity: The exposure to net (wire domain).
+        :param kind: The audit event kind logged per row.
+        """
+        assert self.store_ctx is not None
+        remaining = quantity
+        for row in rows:
+            if remaining <= _FILL_EPS:
+                break
+            consumed = min(remaining, row.filled_qty)
+            self.store_ctx.log_event(
+                kind,
+                client_order_id=row.client_order_id,
+                intent_key=row.intent_key,
+                payload={'from_filled_qty': row.filled_qty,
+                         'filled_qty': row.filled_qty - consumed,
+                         'consumed': consumed},
+            )
+            self._net_entry_row(row, consumed)
+            remaining -= consumed
 
     # --- inverse net-position mirror --------------------------------------------
 
@@ -880,12 +962,20 @@ class _PositionsMixin(_BybitBase, ABC):
         it by a fraction of a contract (each fill converts at its own anchor),
         which the core cannot tell from a manual reduction (measured live:
         bybit-inverse cycle 226, 3.38e-09 BTC on a 165-contract short adopted
-        as an external close). A count that differs is a real change and
+        as an external close). A venue holding the mirror's contracts and
+        more on the same side (someone else added to the shared position)
+        reports the booked base plus the extra contracts at the average
+        price: the core then sees its own exposure intact, never a phantom
+        reduction. Fewer contracts, or the other side, is a real change and
         converts at the average price.
         """
         signed = contracts if side == 'buy' else -contracts
-        if signed == self._inverse_net_contracts:
+        mirror = self._inverse_net_contracts
+        if signed == mirror:
             return abs(self._inverse_net_base)
+        if signed * mirror > 0.0 and abs(signed) > abs(mirror):
+            return (abs(self._inverse_net_base)
+                    + contracts_to_base(abs(signed) - abs(mirror), avg_price))
         return contracts_to_base(contracts, avg_price)
 
     def _apply_inverse_fill(self, side: str, contracts: float, base: float) -> None:
@@ -899,6 +989,38 @@ class _PositionsMixin(_BybitBase, ABC):
         self._inverse_net_contracts += sign * contracts
         self._inverse_net_base += sign * base
         if self._inverse_net_contracts == 0.0:
+            self._inverse_net_base = 0.0
+
+    def _net_inverse_mirror(self, side: str, contracts: float) -> None:
+        """Take ``contracts`` of the ``side`` exposure off the inverse mirror.
+
+        The mirror folds the run's own fills; the run's contracts can also
+        leave the leg without one: the position ledger books a foreign or
+        venue close of the run's share, or a clamp to the venue view, by
+        netting the journal (:meth:`_net_side_share`). The mirror follows the
+        journal there, or it keeps contracts the venue no longer holds for
+        the run: the next position's core-facing size then converts at the
+        venue average instead of the base its fills booked (a phantom
+        reduction the core adopts), and a core full close no longer snaps
+        onto the venue's contract count (a base residue). The base moves pro
+        rata, so the contracts left keep the average conversion the core was
+        told. A mirror holding nothing has no conversion to keep and stays as
+        it is.
+
+        :param side: The side whose exposure is taken off (``'buy'`` moves
+            the signed mirror down, ``'sell'`` up).
+        :param contracts: Wire-domain contracts.
+        """
+        market = self._market
+        if market is None or not market.is_inverse or contracts <= 0.0:
+            return
+        held = self._inverse_net_contracts
+        if held == 0.0:
+            return
+        shifted = held + (contracts if side == 'sell' else -contracts)
+        self._inverse_net_base *= shifted / held
+        self._inverse_net_contracts = shifted
+        if shifted == 0.0:
             self._inverse_net_base = 0.0
 
     # --- PositionPort transport surface (core one-way emulation) ---------------
@@ -1099,9 +1221,11 @@ class _PositionsMixin(_BybitBase, ABC):
             else:
                 self._settle_protection(key, None, rejected=levels, write=write)
             if is_benign_trading_stop_reject(e):
-                if cleared or e.ret_code != 34040:
-                    # Cleared, or the leg is flat: nothing left to guard.
+                if e.ret_code != 34040:
+                    # The leg is flat: nothing left to guard.
                     self._forget_protection(key)
+                elif cleared:
+                    self._guard_cleared_trading_stop(key, idx)
                 return
             if e.ret_code in AMBIGUOUS_DISPOSITION_CODES:
                 if cleared:
@@ -1136,4 +1260,4 @@ class _PositionsMixin(_BybitBase, ABC):
             raise
         self._settle_protection(key, levels, write=write)
         if cleared:
-            self._forget_protection(key)
+            self._guard_cleared_trading_stop(key, idx)

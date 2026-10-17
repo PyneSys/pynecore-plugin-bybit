@@ -55,6 +55,7 @@ from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_OCA,
     CANCEL_REASON_VENUE_POSITION_CLEARED,
     CANCEL_REASON_VENUE_REDUCE_ONLY,
+    CANCEL_REASON_VENUE_REJECTED,
     ExchangeOrder,
     LegType,
     OrderEvent,
@@ -72,6 +73,7 @@ from pynecore.core.plugin import override
 from ._base import _BybitBase
 from .exceptions import BybitError, traceback_wanted
 from .helpers import (
+    BRACKET_OWN_WIRE_QTY_EXTRA,
     CATEGORY_SPOT,
     ENTRY_CANCEL_CUM_EXEC_EXTRA,
     ENTRY_NETTED_QTY_EXTRA,
@@ -84,6 +86,7 @@ from .helpers import (
     PRIVATE_WS_TOPIC_POSITION,
     PRIVATE_WS_TOPICS,
     RECONCILE_CADENCE_S,
+    execution_sort_key,
     venue_filled_qty,
 )
 from .state import parse_exchange_order
@@ -127,18 +130,45 @@ def _venue_trimmed_qty(entry: dict, dispatched: float) -> float | None:
     return order_qty
 
 
-#: ``cancelType`` values that mean the VENUE terminated the order as a
-#: consequence of the position / sibling orders it protects (never a user or
-#: operator action), mapped onto the engine's venue-driven cancel reasons.
-#: ``CancelByReduceOnly``: a reduce-only order squeezed to nothing after the
-#: net position fell below the summed reduce-only quantity (measured live:
-#: a sibling bracket's SL fill shrank the shared inverse position and the
-#: venue amended this TP to the residual, then cancelled it).
+#: ``cancelType`` values that mean the VENUE terminated the order (never a
+#: user or operator action), mapped onto the engine's venue-driven cancel
+#: reasons (the V5 ``cancelType`` enum):
+#:
+#: * ``CancelByReduceOnly``: a reduce-only order squeezed to nothing after
+#:   the net position fell below the summed reduce-only quantity (measured
+#:   live: a sibling bracket's SL fill shrank the shared inverse position
+#:   and the venue amended this TP to the residual, then cancelled it).
+#: * The OCO pair types: the sibling leg of a venue-linked pair triggered.
+#: * The position-clearing types: the venue cleared the position the order
+#:   worked on (TP/SL/trailing clear, liquidation and ADL preparation,
+#:   settlement, delivery).
+#: * The venue-refusal types: the venue terminated the order on its own
+#:   rules (an unaffordable triggered order, margin and account checks,
+#:   trading limits, rebalancing, an admin action, the disconnect-cancel
+#:   protection).
+#:
+#: ``CancelByUser`` stays unmapped, and so does ``CancelBySmp``: self-match
+#: prevention fires when another order of the same account crossed this
+#: one — an order someone else placed.
 _CANCEL_TYPE_REASONS = {
     'CancelByReduceOnly': CANCEL_REASON_VENUE_REDUCE_ONLY,
     'CancelByOCOTpCanceledBySlTriggered': CANCEL_REASON_VENUE_OCA,
     'CancelByOCOSlCanceledByTpTriggered': CANCEL_REASON_VENUE_OCA,
     'CancelByTpSlTsClear': CANCEL_REASON_VENUE_POSITION_CLEARED,
+    'CancelByPrepareLiq': CANCEL_REASON_VENUE_POSITION_CLEARED,
+    'CancelAllBeforeLiq': CANCEL_REASON_VENUE_POSITION_CLEARED,
+    'CancelByPrepareAdl': CANCEL_REASON_VENUE_POSITION_CLEARED,
+    'CancelAllBeforeAdl': CANCEL_REASON_VENUE_POSITION_CLEARED,
+    'CancelBySettle': CANCEL_REASON_VENUE_POSITION_CLEARED,
+    'CancelByDelivery': CANCEL_REASON_VENUE_POSITION_CLEARED,
+    'CancelByCannotAffordOrderCost': CANCEL_REASON_VENUE_REJECTED,
+    'CancelByPmTrialMmOverEquity': CANCEL_REASON_VENUE_REJECTED,
+    'CancelByAccountBlocking': CANCEL_REASON_VENUE_REJECTED,
+    'CancelByCrossSelfMuch': CANCEL_REASON_VENUE_REJECTED,
+    'CancelByCrossReachMaxTradeNum': CANCEL_REASON_VENUE_REJECTED,
+    'CancelByRebalance': CANCEL_REASON_VENUE_REJECTED,
+    'CancelByAdmin': CANCEL_REASON_VENUE_REJECTED,
+    'CancelByDCP': CANCEL_REASON_VENUE_REJECTED,
 }
 
 #: Small float slack when comparing cumulative fills against the dispatch
@@ -180,11 +210,13 @@ _DERIV_EXEC_CURSOR_EVENT = 'deriv_exec_cursor'
 #: protective close would be dropped as external activity (measured live:
 #: the S-X stop fired at 17:55, the fill was ignored twice, and the book
 #: stayed short 0.02 for 47 minutes, mis-sizing the next folded reversal).
+#: Only the ``Full``-mode types: the plugin writes every trading stop with
+#: ``tpslMode=Full``, so a ``PartialTakeProfit`` / ``PartialStopLoss`` fire
+#: is a stop someone else placed (measured: none of the 908 own venue
+#: bracket attributions in the lab journal carried a Partial type).
 _VENUE_STOP_ORDER_LEG = {
     'TakeProfit': LegType.TAKE_PROFIT,
-    'PartialTakeProfit': LegType.TAKE_PROFIT,
     'StopLoss': LegType.STOP_LOSS,
-    'PartialStopLoss': LegType.STOP_LOSS,
     'TrailingStop': LegType.TRAILING_STOP,
 }
 
@@ -206,6 +238,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         await self._ensure_broker_started()
         market = await asyncio.to_thread(self._broker_market)
         is_deriv = market.category != CATEGORY_SPOT
+        await self._observe_resume_baseline(market)
         loop = asyncio.get_running_loop()
         next_reconcile = loop.time() + RECONCILE_CADENCE_S
         while True:
@@ -216,6 +249,10 @@ class _EventStreamMixin(_BybitBase, ABC):
             if ws is None or not ws.is_open:
                 await self._open_private_ws(market)
                 if is_deriv:
+                    # Until the backfill has re-read the window the stream
+                    # was down (or not open yet), the position ledgers prove
+                    # nothing: the views of that window are lost too.
+                    self._ledger_stream_opened_ms = int(epoch_time() * 1000)
                     # A (re)connect closes the stream-gap: any fill that
                     # landed while the private PUSH was down is read back
                     # from the durable execution cursor. The first open at
@@ -452,6 +489,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         if not rows:
             return
         self._ingest_position_sizes(rows)
+        self._ledger_advance(market)
         self._close_entry_rows_when_flat(market)
         self._observe_position_rows(rows, market, read_started_at=None)
 
@@ -462,73 +500,100 @@ class _EventStreamMixin(_BybitBase, ABC):
         events: list[OrderEvent] = []
         manager = self._spot_manager
         port = self._spot_port
-        for entry in frame.get('data') or ():
-            if str(entry.get('symbol') or '') != market.symbol:
-                continue
-            if str(entry.get('category') or market.category) != market.category:
-                # The same symbol name can exist in several categories
-                # (spot and linear BTCUSDT) — activity of the other
-                # category must not be attributed to this run.
-                continue
-            if str(entry.get('execType') or 'Trade') != 'Trade':
-                # Non-trade executions (linear ``Funding`` / ``Settle`` /
-                # ADL / bust rows) carry no order fill: funding is a
-                # settle-coin cashflow the wallet read reflects, the
-                # size-changing exotics surface through the venue-
-                # authoritative position read. No OrderEvent slot exists
-                # for a fill-less cash event (cTrader skips swaps the
-                # same way).
-                continue
-            exec_id = str(entry.get('execId') or '')
-            if not exec_id or exec_id in self._seen_exec_ids:
-                continue
-            coid = str(entry.get('orderLinkId') or '')
-            pine_id, from_entry, leg_type = self._resolve_identity(
-                coid or None, str(entry.get('orderId') or '') or None,
-            )
-            claims: list[tuple[str, str | None, LegType, float]] = []
-            ambiguous = False
-            if leg_type is None:
-                # Second chance: a venue-materialised trading-stop close
-                # carries no coid and an unknown orderId, but the durable
-                # bracket-ownership row(s) prove it is ours — a pyramid's
-                # shared 'Full' stop closes several exits in one order and
-                # arrives as multiple claims.
-                claims, ambiguous = self._attribute_venue_bracket_execution(
-                    entry, market,
-                )
-            if leg_type is None and not claims:
-                # External activity (manual trade, another bot): it must
-                # not move this strategy's position (the engine adopts the
-                # venue's position change). The balance invariant is the
-                # guard that catches base-asset interference; a manual
-                # close of the run's derivative exposure is reported.
-                if self.store_ctx is not None:
-                    self.store_ctx.log_event(
-                        'external_activity_ignored',
-                        exchange_order_id=str(entry.get('orderId') or '') or None,
-                        payload={'exec_id': exec_id},
-                    )
-                self._note_external_execution(entry, market, ambiguous=ambiguous)
-                continue
-            if manager is not None and port is not None:
-                execution = port.to_execution(entry)
-                if execution is None or not manager.record_live_fill(execution):
-                    # Unparsable (already logged by the port) or a replay
-                    # the ledger already booked — do not emit.
-                    self._seen_exec_ids.add(exec_id)
+        with self._ledger_batch(market):
+            for entry in frame.get('data') or ():
+                if str(entry.get('symbol') or '') != market.symbol:
                     continue
-            self._seen_exec_ids.add(exec_id)
-            if claims:
-                for slice_entry, s_pine, s_from, s_leg in \
-                        self._venue_bracket_claim_slices(entry, claims):
-                    event = self._fill_event(
-                        slice_entry, market, coid=coid, pine_id=s_pine,
-                        from_entry=s_from, leg_type=s_leg,
+                if str(entry.get('category') or market.category) != market.category:
+                    # The same symbol name can exist in several categories
+                    # (spot and linear BTCUSDT) — activity of the other
+                    # category must not be attributed to this run.
+                    continue
+                if str(entry.get('execType') or 'Trade') != 'Trade':
+                    # Non-trade executions (linear ``Funding`` / ``Settle`` /
+                    # ADL / bust / block-trade rows) carry no order fill of
+                    # the run: funding is a settle-coin cashflow the wallet
+                    # read reflects, the size-changing exotics surface
+                    # through the venue-authoritative position read. No
+                    # OrderEvent slot exists for a fill-less cash event
+                    # (cTrader skips swaps the same way); the position
+                    # ledger still learns them.
+                    self._note_non_trade_execution(entry, market)
+                    continue
+                exec_id = str(entry.get('execId') or '')
+                if not exec_id or exec_id in self._seen_exec_ids:
+                    continue
+                coid = str(entry.get('orderLinkId') or '')
+                pine_id, from_entry, leg_type = self._resolve_identity(
+                    coid or None, str(entry.get('orderId') or '') or None,
+                )
+                claims: list[tuple[str, str | None, LegType, float]] = []
+                ambiguous = False
+                if leg_type is None:
+                    # Second chance: a venue-materialised trading-stop close
+                    # carries no coid and an unknown orderId, but the durable
+                    # bracket-ownership row(s) prove it is ours — a pyramid's
+                    # shared 'Full' stop closes several exits in one order and
+                    # arrives as multiple claims.
+                    claims, ambiguous = self._attribute_venue_bracket_execution(
+                        entry, market,
                     )
-                    if event is not None:
-                        events.append(event)
-                continue
+                if leg_type is None and not claims:
+                    # External activity (manual trade, another bot): it must
+                    # not move this strategy's position (the engine adopts the
+                    # venue's position change). The balance invariant is the
+                    # guard that catches base-asset interference; a close of
+                    # the run's derivative share is reported.
+                    if self.store_ctx is not None:
+                        self.store_ctx.log_event(
+                            'external_activity_ignored',
+                            exchange_order_id=str(entry.get('orderId') or '') or None,
+                            payload={'exec_id': exec_id},
+                        )
+                    self._note_external_execution(entry, market, ambiguous=ambiguous)
+                    continue
+                if manager is not None and port is not None:
+                    execution = port.to_execution(entry)
+                    if execution is None or not manager.record_live_fill(execution):
+                        # Unparsable (already logged by the port) or a replay
+                        # the ledger already booked — do not emit.
+                        self._seen_exec_ids.add(exec_id)
+                        continue
+                self._seen_exec_ids.add(exec_id)
+                events.extend(self._book_own_execution(
+                    entry, market, coid=coid, pine_id=pine_id,
+                    from_entry=from_entry, leg_type=leg_type, claims=claims,
+                ))
+        if events:
+            self._close_entry_rows_when_flat(market)
+        return events
+
+    def _book_own_execution(
+            self, entry: dict, market: 'InstrumentInfo', *, coid: str,
+            pine_id: str | None, from_entry: str | None,
+            leg_type: LegType | None,
+            claims: list[tuple[str, str | None, LegType, float]],
+    ) -> list[OrderEvent]:
+        """Build the fill event(s) of one own execution and enter it into the ledger.
+
+        A venue-bracket execution with claims splits into one event per
+        owning exit; any other own execution is one event. The position
+        ledger learns the whole execution with the change its booking made
+        to the run's journal share.
+        """
+        before = self._journal_leg_shares() if market.category != CATEGORY_SPOT else {}
+        self._ledger_credit_taken = 0.0
+        events: list[OrderEvent] = []
+        if claims:
+            for slice_entry, s_pine, s_from, s_leg in \
+                    self._venue_bracket_claim_slices(entry, claims):
+                event = self._fill_event(
+                    slice_entry, market, coid=coid, pine_id=s_pine,
+                    from_entry=s_from, leg_type=s_leg,
+                )
+                if event is not None:
+                    events.append(event)
+        else:
             assert leg_type is not None
             event = self._fill_event(
                 entry, market, coid=coid, pine_id=pine_id,
@@ -536,8 +601,16 @@ class _EventStreamMixin(_BybitBase, ABC):
             )
             if event is not None:
                 events.append(event)
-        if events:
-            self._close_entry_rows_when_flat(market)
+        if market.category != CATEGORY_SPOT and self.store_ctx is not None:
+            after = self._journal_leg_shares()
+            self._note_share_start(entry, before, after, market)
+            self._note_own_execution(
+                entry, market,
+                reducing=bool(claims) or leg_type is not LegType.ENTRY,
+                share={idx: after.get(idx, 0.0) - before.get(idx, 0.0)
+                       for idx in set(before) | set(after)},
+                credit=self._ledger_credit_taken,
+            )
         return events
 
     def _attribute_venue_bracket_execution(
@@ -564,7 +637,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         shared position attribute, so when the ``tpslMode`` 'Full' stop
         fires it closes ALL of them in one venue order — measured live on
         cycle 31, where refusing left the whole journal exposure stale
-        and cascaded into a venue/book mismatch. When the slice equals
+        and cascaded into a venue/book mismatch. When the slice covers
         the rows' total quantity (grid tolerance), the fill is split
         row-by-row in insertion (FIFO) order — the TV semantics of every
         pyramid exit closing its own entry. A partial slice of a
@@ -573,6 +646,17 @@ class _EventStreamMixin(_BybitBase, ABC):
         refuse to guess and leave the disappearance pass to reconcile: no
         claims, ``ambiguous`` set — the execution may well be the bot's own,
         so it must never be read as someone else's close.
+
+        A ``Full`` stop closes the whole leg, foreign exposure merged into it
+        included, and the venue may fill it in several executions. The run
+        claims its own share — its journal share of the leg — across all of
+        them, whatever the rows cover: an entry with no exit of its own (or
+        a pyramid entry that filled before its exit was attached) is closed
+        by the same stop, and its part rides on the newest row's claim (the
+        core closes the run's trades FIFO). Only the rest is foreign. An
+        execution after the earlier ones of the same stop order took the
+        run's whole share claims nothing (zero-quantity claims: the stop is
+        still the run's own, it closed foreign exposure only).
         """
         if self.store_ctx is None:
             return [], False
@@ -584,6 +668,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         try:
             closed_size = float(entry.get('closedSize') or 0.0)
             exec_qty = float(entry.get('execQty') or 0.0)
+            exec_price = float(entry.get('execPrice') or 0.0)
         except (TypeError, ValueError):
             return [], False
         if closed_size <= 0.0 or exec_qty <= 0.0:
@@ -613,18 +698,35 @@ class _EventStreamMixin(_BybitBase, ABC):
             return [], False
         claims: list[tuple[str, str | None, LegType, float]]
         split = False
+        tolerance = market.qty_step / 2 if market.qty_step > 0 else _FILL_EPS
+        # What the earlier executions of this stop order already claimed:
+        # the journal share below is net of them.
+        claimed = self._venue_stop_claimed(entry)
+        # A give-up that ran ahead of this execution clamped the run's share
+        # off the journal, wholly or in part; its open credit is the part of
+        # the share the stop may still have closed. Both are net of the
+        # earlier executions: the fill booking takes the credit first.
+        share = (abs(self._journal_leg_shares().get(self._closed_leg(exec_side), 0.0))
+                 + self._ledger_reduce_credit_open(entry, exec_side, market))
         if len(candidates) == 1:
             only = candidates[0]
             assert only.pine_entry_id is not None
-            claims = [(only.pine_entry_id, only.from_entry, leg, exec_qty)]
+            claim_qty = exec_qty
+            if share > tolerance:
+                claim_qty = min(exec_qty, share)
+            elif claimed > tolerance:
+                claim_qty = 0.0
+            claims = [(only.pine_entry_id, only.from_entry, leg, claim_qty)]
         else:
             leg_ids = {
                 (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
                 for row in candidates
             }
-            total = sum(row.qty for row in candidates)
-            tolerance = market.qty_step / 2 if market.qty_step > 0 else _FILL_EPS
-            if len(leg_ids) != 1 or abs(total - exec_qty) > tolerance:
+            row_qtys = [self._ownership_wire_qty(row, market, exec_price)
+                        for row in candidates]
+            total = sum(row_qtys)
+            exhausted = claimed >= total - tolerance
+            if len(leg_ids) != 1 or (exec_qty < total - tolerance and not exhausted):
                 logger.warning(
                     "Bybit venue trading-stop execution %s matches %d live "
                     "bracket-ownership rows on %s (legs=%s, total=%s, "
@@ -635,10 +737,45 @@ class _EventStreamMixin(_BybitBase, ABC):
                 )
                 return [], True
             split = True
+            # The run's own part: its journal share, which the rows may not
+            # cover whole (an entry with no exit of its own, a pyramid entry
+            # that filled before its exit was attached); without one, what
+            # the rows left unclaimed.
+            if share > tolerance:
+                own = min(exec_qty, share)
+            else:
+                own = min(exec_qty, max(0.0, total - claimed))
             claims = []
-            for row in candidates:
+            used = claimed
+            left = own
+            for row, row_qty in zip(candidates, row_qtys):
                 assert row.pine_entry_id is not None
-                claims.append((row.pine_entry_id, row.from_entry, leg, row.qty))
+                part = min(max(0.0, row_qty - used), left)
+                used = max(0.0, used - row_qty)
+                left -= part
+                claims.append((row.pine_entry_id, row.from_entry, leg, part))
+            if left > 0.0:
+                # The core closes the run's trades FIFO whatever exit a fill
+                # names: the part no row covers rides on the newest exit.
+                pine_id, from_entry, _, part = claims[-1]
+                claims[-1] = (pine_id, from_entry, leg, part + left)
+        excess = exec_qty - sum(claim[3] for claim in claims)
+        if excess > tolerance:
+            # The shared stop also closed exposure the run does not own (a
+            # same-direction add someone else merged into the leg): only the
+            # run's share is booked, the rest is the foreign party's.
+            logger.warning(
+                "Bybit venue trading-stop execution %s on %s closed %s, %s "
+                "more than this run's share — booking only the run's part",
+                entry.get('execId'), market.symbol, exec_qty, excess,
+            )
+            self.store_ctx.log_event(
+                'venue_bracket_fill_foreign_excess',
+                exchange_order_id=str(entry.get('orderId') or '') or None,
+                payload={'exec_id': str(entry.get('execId') or ''),
+                         'exec_qty': exec_qty, 'excess': excess,
+                         'stop_order_type': str(entry.get('stopOrderType') or '')},
+            )
         for row, claim in zip(candidates, claims):
             self.store_ctx.log_event(
                 'venue_bracket_fill_attributed',
@@ -654,6 +791,51 @@ class _EventStreamMixin(_BybitBase, ABC):
                 },
             )
         return claims, False
+
+    def _ownership_wire_qty(
+            self, row: 'OrderRow', market: 'InstrumentInfo', exec_price: float,
+    ) -> float:
+        """A bracket-ownership row's quantity in the wire domain of the executions.
+
+        The row's ``qty`` is the core's base quantity; the attach records the
+        wire quantity beside it (:data:`BRACKET_OWN_WIRE_QTY_EXTRA`). On
+        inverse a row without it converts at its parent entry's anchor, else
+        at the execution price: a split in base would hand a contract-sized
+        fill almost wholly to the last exit.
+        """
+        raw = (row.extras or {}).get(BRACKET_OWN_WIRE_QTY_EXTRA)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return float(raw)
+        if not market.is_inverse:
+            return float(row.qty)
+        anchor: Decimal | None = None
+        if row.from_entry is not None:
+            entry_coid = self._entry_coid_for(row.from_entry)
+            if entry_coid is not None:
+                anchor = self._inverse_anchor_for(entry_coid)
+        price = float(anchor) if anchor is not None else exec_price
+        return float(row.qty) * price
+
+    def _venue_stop_claimed(self, entry: dict) -> float:
+        """What the other executions of ``entry``'s stop order claimed for the run.
+
+        Read from the ``venue_bracket_fill_attributed`` audit trail of the
+        run (every process instance), so an execution of the same stop that
+        arrives after a restart still sees the claims made before it.
+        """
+        order_id = str(entry.get('orderId') or '')
+        if not order_id or self.store_ctx is None:
+            return 0.0
+        exec_id = str(entry.get('execId') or '')
+        claimed = 0.0
+        for _ik, _coid, eoid, payload in \
+                self.store_ctx.iter_events_by_kind_for_run_id('venue_bracket_fill_attributed'):
+            if eoid != order_id or payload.get('exec_id') == exec_id:
+                continue
+            qty = payload.get('claim_qty')
+            if isinstance(qty, (int, float)) and not isinstance(qty, bool):
+                claimed += float(qty)
+        return claimed
 
     @staticmethod
     def _venue_bracket_claim_slices(
@@ -679,14 +861,25 @@ class _EventStreamMixin(_BybitBase, ABC):
         reconnect backfill produce the same ids for the same execution
         and a replay still dedups.
         """
-        if len(claims) == 1:
+        try:
+            exec_qty = float(entry.get('execQty') or 0.0)
+        except (TypeError, ValueError):
+            exec_qty = 0.0
+        total_qty = sum(claim[3] for claim in claims)
+        if total_qty <= _FILL_EPS:
+            # The run's stop closed foreign exposure only: no fill of the run.
+            return []
+        if len(claims) == 1 and abs(total_qty - exec_qty) <= _FILL_EPS:
             pine_id, from_entry, leg, _ = claims[0]
             return [(entry, pine_id, from_entry, leg)]
         try:
             total_fee = float(entry.get('execFee') or 0.0)
         except (TypeError, ValueError):
             total_fee = 0.0
-        total_qty = sum(claim[3] for claim in claims)
+        # The fee is pro-rated over the whole execution: a part closing
+        # foreign exposure carries its own share of it, never booked here.
+        if exec_qty > 0.0 and total_qty < exec_qty:
+            total_fee *= total_qty / exec_qty
         exec_id = str(entry.get('execId') or '')
         slices: list[tuple[dict, str, str | None, LegType]] = []
         fee_left = total_fee
@@ -696,9 +889,11 @@ class _EventStreamMixin(_BybitBase, ABC):
             else:
                 fee = total_fee * (qty / total_qty) if total_qty > 0 else 0.0
                 fee_left -= fee
+            slice_id = (exec_id if len(claims) == 1
+                        else f"{exec_id}#{pine_id}#{from_entry or ''}")
             slices.append((
                 {**entry, 'execQty': repr(qty), 'execFee': repr(fee),
-                 'execId': f"{exec_id}#{pine_id}#{from_entry or ''}"},
+                 'execId': slice_id},
                 pine_id, from_entry, leg,
             ))
         return slices
@@ -712,6 +907,9 @@ class _EventStreamMixin(_BybitBase, ABC):
         ledger (sub-grid fee dust counts as flat, matching
         :meth:`get_position`); linear reads the last-known venue position
         cache, which starts unknown — the sweep never fires on ignorance.
+        A one-way flat view the position ledger cannot explain yet waits for
+        its executions (:meth:`_sweep_waits_for_ledger`): it may show the
+        run's own close before that close is booked.
         A row still carrying the engine's ``defensive_close_pending``
         marker is left for a later sweep: the engine clears the marker
         when the defensive close settles, and closing the row before that
@@ -720,9 +918,8 @@ class _EventStreamMixin(_BybitBase, ABC):
         if self.store_ctx is None:
             return
         if market.category != CATEGORY_SPOT:
-            if not self._deriv_is_flat():
+            if not self._deriv_is_flat() or self._sweep_waits_for_ledger():
                 return
-            self._remember_swept_ownership()
         else:
             manager = self._spot_manager
             if manager is None:
@@ -873,9 +1070,9 @@ class _EventStreamMixin(_BybitBase, ABC):
         if row is None or row.closed_ts_ms is not None:
             return
         extras = dict(row.extras or {})
+        self._forget_protection(coid)
         if extras.get('kind') not in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING):
             self.store_ctx.close_order(coid)
-            self._forget_protection(coid)
             return
         if venue_cum_exec is None:
             if not extras.get(ENTRY_REMAINDER_CANCELLED_EXTRA):
@@ -932,6 +1129,10 @@ class _EventStreamMixin(_BybitBase, ABC):
         total_qty = self._dispatch_qty.get(coid, exec_qty)
         cumulative = self._filled_cum.get(coid, 0.0) + exec_qty
         self._filled_cum[coid] = cumulative
+        entry_credit_due = (leg_type is LegType.ENTRY
+                            and market.category != CATEGORY_SPOT
+                            and self._ledger_entry_credit_due(entry, market))
+        journal_before = self._run_owned_signed_size() if entry_credit_due else 0.0
         if self.store_ctx is not None and coid:
             # A MARKET entry / CLOSE that parked on an unknown-disposition
             # response and then filled never re-enters ``get_open_orders``,
@@ -960,6 +1161,12 @@ class _EventStreamMixin(_BybitBase, ABC):
                 self.store_ctx.upsert_order(coid, qty=trimmed)
         is_full = cumulative >= total_qty - _FILL_EPS
         fill_qty = exec_qty
+        reducing_deriv = (leg_type is not LegType.ENTRY
+                          and market.category != CATEGORY_SPOT)
+        # A reduce the position ledger already booked as venue truth (it
+        # gave up waiting for this very execution) is not netted twice.
+        credit = (self._ledger_reduce_credit(entry, side, exec_qty, market)
+                  if reducing_deriv else 0.0)
         # Linear execution rows carry no ``feeCurrency`` — the fee is
         # always the settle coin (empty for spot, where the row has it).
         fee_currency = str(entry.get('feeCurrency') or '') or market.settle_coin
@@ -992,12 +1199,18 @@ class _EventStreamMixin(_BybitBase, ABC):
             fill_qty = exec_qty / factor
             total_qty = total_qty / factor
             cumulative = cumulative / factor
-            self._apply_inverse_fill(side, exec_qty, fill_qty)
+            # The credited part left the mirror with the journal netting
+            # of the give-up that booked it ahead.
+            self._apply_inverse_fill(side, exec_qty - credit,
+                                     fill_qty * (exec_qty - credit) / exec_qty)
             # Inverse fees are charged in the settle coin, but the core
             # books the numeric fee in the quote-currency P&L domain —
             # normalize at the execution price (the fee's own fill).
             fee = fee * exec_price
             fee_currency = market.quote_coin
+        if coid and is_full:
+            # A fully filled order rests no more: nothing of it to guard.
+            self._forget_protection(coid)
         if self.store_ctx is not None and coid and is_full \
                 and leg_type is not LegType.ENTRY:
             # Exit / close rows are done once fully filled. ENTRY rows stay
@@ -1009,9 +1222,7 @@ class _EventStreamMixin(_BybitBase, ABC):
             # :meth:`_close_entry_rows_when_flat` closes them once the
             # ledger position is gone.
             self.store_ctx.close_order(coid)
-            self._forget_protection(coid)
-        if (leg_type is not LegType.ENTRY
-                and market.category != CATEGORY_SPOT):
+        if reducing_deriv:
             # Every derivative reducing fill — fanned close leg, venue-
             # materialised trading-stop or dispatched TP/SL exit leg — nets
             # the entry rows it consumed; without this the durable
@@ -1023,8 +1234,15 @@ class _EventStreamMixin(_BybitBase, ABC):
             # residue (measured on the inverse lane, cycle 47: book 465
             # contracts vs venue 2). Spot stays out: its rows belong to the
             # inventory-ledger machinery.
-            self._reduce_entry_ownership(side, exec_qty)
+            self._ledger_credit_taken += credit
+            self._reduce_entry_ownership(side, exec_qty - credit)
             self._forget_trading_stop_if_flat(side)
+        elif entry_credit_due:
+            # A late one-way entry against the run's position (a folded
+            # reversal) reduced it first; a give-up may have netted that
+            # reduce already.
+            self._ledger_credit_taken += self._ledger_entry_credit(
+                entry, side, exec_qty, journal_before, market)
         order = ExchangeOrder(
             id=order_id,
             symbol=self.symbol or market.symbol,
@@ -1067,12 +1285,16 @@ class _EventStreamMixin(_BybitBase, ABC):
         for entry in frame.get('data') or ():
             if str(entry.get('symbol') or '') != market.symbol:
                 continue
+            coid = str(entry.get('orderLinkId') or '')
+            if not coid:
+                # A position's partial TP/SL order: every status counts,
+                # the ones that end its resting too.
+                self._observe_foreign_tpsl_order(entry, market)
             event_type = _ORDER_STATUS_EVENTS.get(
                 str(entry.get('orderStatus') or ''),
             )
             if event_type is None:
                 continue
-            coid = str(entry.get('orderLinkId') or '')
             order_id = str(entry.get('orderId') or '')
             pine_id, from_entry, leg_type = self._resolve_identity(
                 coid or None, order_id or None,
@@ -1080,11 +1302,14 @@ class _EventStreamMixin(_BybitBase, ABC):
             if leg_type is None:
                 continue
             if event_type == 'created':
-                # Every resting-leg push is judged against the levels the bot
-                # set — never the ``amended`` relabel below: that memory is
-                # in-process, so the first push after a restart reads as
-                # ``created`` even when it carries an edit.
-                self._observe_exit_leg_push(entry, coid, leg_type, market)
+                # Every resting-order push is judged against the levels and
+                # quantities the bot set — never the ``amended`` relabel
+                # below: that memory is in-process, so the first push after
+                # a restart reads as ``created`` even when it carries an edit.
+                if leg_type is LegType.ENTRY:
+                    self._observe_entry_push(entry, coid, market)
+                else:
+                    self._observe_exit_leg_push(entry, coid, leg_type, market)
             if event_type == 'created' and order_id:
                 # Bybit re-pushes ``New`` / ``Untriggered`` on the SAME order id
                 # after an in-place amend (``POST /v5/order/amend``). The first
@@ -1173,6 +1398,11 @@ class _EventStreamMixin(_BybitBase, ABC):
         await self._note_unbooked_market_entries(market)
         events.extend(await self._run_deriv_fill_backfill(market))
         events.extend(await self._recover_unbooked_order_fills(market))
+        # Judge what the fresh views and recovered executions now prove, and
+        # give up the position intervals that stayed open past the grace; a
+        # flat sweep that waited for them runs now.
+        self._ledger_advance(market)
+        self._close_entry_rows_when_flat(market)
         return events
 
     async def _run_spot_reconcile(
@@ -1274,13 +1504,14 @@ class _EventStreamMixin(_BybitBase, ABC):
         """Recover missed derivative fills from the durable execution cursor.
 
         Reads ``/v5/execution/list`` from the time watermark forward (per
-        deriv category, ``execType=Trade``), walking gaps longer than the
+        deriv category, every ``execType``), walking gaps longer than the
         endpoint's 7-day span cap window by window, each window drained
         NEWEST-FIRST to completion before the watermark advances — exactly
-        the spot inventory port's discipline. Each execution row is a fill
+        the spot inventory port's discipline. Each ``Trade`` row is a fill
         the private PUSH stream may have dropped across a reconnect; it is
         translated by the SAME builder the live ``execution`` path uses
-        (:meth:`_fill_event`), so the emitted event shape is identical.
+        (:meth:`_fill_event`), so the emitted event shape is identical. The
+        other rows reach the position ledger only.
 
         Double-apply barriers, in order: the shared ``execId`` frontier
         (:attr:`_seen_exec_ids`) skips a fill the PUSH stream already
@@ -1295,6 +1526,10 @@ class _EventStreamMixin(_BybitBase, ABC):
         unadvanced and returns the events booked from the windows that DID
         drain; the next cadence pass re-reads. A
         :class:`BrokerManualInterventionError` propagates.
+
+        A pass that drained every window, at least the read overlap after the
+        private stream's latest open, lifts the position ledgers' outage
+        hold (:attr:`_ledger_stream_opened_ms`).
         """
         if self.store_ctx is None or market.category == CATEGORY_SPOT:
             return []
@@ -1304,6 +1539,7 @@ class _EventStreamMixin(_BybitBase, ABC):
             return []
         now_ms = int(epoch_time() * 1000)
         events: list[OrderEvent] = []
+        drained = False
         try:
             watermark = self._deriv_exec_watermark
             if watermark is None:
@@ -1348,9 +1584,10 @@ class _EventStreamMixin(_BybitBase, ABC):
                 entries, conclusive = await self._drain_deriv_exec_window(
                     market, start, window_end,
                 )
-                entries.sort(key=lambda e: int(e.get('execTime') or 0))
-                for entry in entries:
-                    events.extend(self._backfill_one_execution(entry, market))
+                entries.sort(key=execution_sort_key)
+                with self._ledger_batch(market):
+                    for entry in entries:
+                        events.extend(self._backfill_one_execution(entry, market))
                 if not conclusive:
                     # The window did not drain — leave the watermark where it
                     # is (the execIds seen so far are in the dedup frontier, a
@@ -1359,6 +1596,8 @@ class _EventStreamMixin(_BybitBase, ABC):
                 watermark = window_end
                 self._deriv_exec_watermark = window_end
                 self._persist_deriv_exec_watermark(market, window_end)
+            else:
+                drained = True
         except BrokerManualInterventionError:
             raise
         except Exception as exc:  # noqa: BLE001 - the backfill must not kill the stream
@@ -1366,6 +1605,15 @@ class _EventStreamMixin(_BybitBase, ABC):
                 "Bybit derivative fill backfill failed (transient): %s",
                 exc, exc_info=traceback_wanted(exc),
             )
+        opened_ms = self._ledger_stream_opened_ms
+        if drained and opened_ms is not None \
+                and now_ms >= opened_ms + EXECUTION_CURSOR_OVERLAP_MS:
+            # Every window up to now drained, the stream's outage included,
+            # and late enough that an execution the venue indexed late is in
+            # it too (the overlap re-read covers that much indexing lag): the
+            # position ledgers may prove intervals again. The caller's
+            # reconcile pass judges once the per-order fill recovery ran too.
+            self._ledger_stream_opened_ms = None
         if events:
             self._close_entry_rows_when_flat(market)
         return events
@@ -1408,9 +1656,10 @@ class _EventStreamMixin(_BybitBase, ABC):
             )
             if not conclusive:
                 continue
-            entries.sort(key=lambda e: int(e.get('execTime') or 0))
-            for entry in entries:
-                events.extend(self._backfill_one_execution(entry, market))
+            entries.sort(key=execution_sort_key)
+            with self._ledger_batch(market):
+                for entry in entries:
+                    events.extend(self._backfill_one_execution(entry, market))
             row = self.store_ctx.get_order(coid)
             if row is None or venue_filled_qty(row) >= float(cum_exec) - _FILL_EPS:
                 pending.pop(coid, None)
@@ -1424,9 +1673,11 @@ class _EventStreamMixin(_BybitBase, ABC):
         """Drain every execution page of one time window (newest-first API).
 
         Returns the raw execution rows and whether the window drained
-        completely. ``execType=Trade`` filters the query (non-trade rows —
-        funding / settle / ADL / bust — carry no order fill and have
-        unverified field shapes). A transport failure mid-pagination returns
+        completely. Every ``execType`` is read: the non-trade rows carry no
+        order fill of the run, but a size-changing one (ADL, takeover,
+        settlement, a moved position) the stream missed must still reach
+        the position ledger, which cannot prove the interval around it
+        without it. A transport failure mid-pagination returns
         ``conclusive=False`` so the caller never advances the watermark past
         a window it could not fully read.
         """
@@ -1439,7 +1690,6 @@ class _EventStreamMixin(_BybitBase, ABC):
                     'symbol': market.symbol,
                     'startTime': start_ms,
                     'endTime': end_ms,
-                    'execType': 'Trade',
                     'limit': EXECUTION_PAGE_LIMIT,
                     'cursor': cursor,
                 }, auth=True)
@@ -1467,8 +1717,10 @@ class _EventStreamMixin(_BybitBase, ABC):
         """Translate one backfilled execution row into fill event(s), or skip.
 
         Mirrors the per-row gate of :meth:`_translate_executions`: wrong
-        symbol / category / exec-type and already-seen ``execId`` are
-        dropped, an unattributable row is logged as foreign and skipped, and
+        symbol / category and already-seen ``execId`` are dropped, a
+        non-``Trade`` row goes to the position ledger only
+        (:meth:`_note_non_trade_execution`), an unattributable row is logged
+        as foreign and skipped, and
         the survivor goes through the shared :meth:`_fill_event` builder —
         a venue-bracket row closing a pyramid's shared 'Full' stop splits
         into one event per owning exit, exactly like the live stream. The
@@ -1482,6 +1734,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         if str(entry.get('category') or market.category) != market.category:
             return []
         if str(entry.get('execType') or 'Trade') != 'Trade':
+            self._note_non_trade_execution(entry, market)
             return []
         exec_id = str(entry.get('execId') or '')
         if not exec_id or exec_id in self._seen_exec_ids:
@@ -1526,23 +1779,10 @@ class _EventStreamMixin(_BybitBase, ABC):
                 self._seen_exec_ids.add(exec_id)
                 return []
         self._seen_exec_ids.add(exec_id)
-        if claims:
-            events: list[OrderEvent] = []
-            for slice_entry, s_pine, s_from, s_leg in \
-                    self._venue_bracket_claim_slices(entry, claims):
-                event = self._fill_event(
-                    slice_entry, market, coid=coid, pine_id=s_pine,
-                    from_entry=s_from, leg_type=s_leg,
-                )
-                if event is not None:
-                    events.append(event)
-            return events
-        assert leg_type is not None
-        event = self._fill_event(
+        return self._book_own_execution(
             entry, market, coid=coid, pine_id=pine_id,
-            from_entry=from_entry, leg_type=leg_type,
+            from_entry=from_entry, leg_type=leg_type, claims=claims,
         )
-        return [event] if event is not None else []
 
     def _load_deriv_exec_watermark(self, market: 'InstrumentInfo') -> int | None:
         """Read the persisted derivative execution watermark for this run.

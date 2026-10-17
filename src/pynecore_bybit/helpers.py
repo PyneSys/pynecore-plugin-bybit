@@ -136,6 +136,18 @@ ENTRY_REMAINDER_CANCELLED_EXTRA: str = 'remainder_cancelled'
 # cadence then reads the order by ``orderLinkId`` until it is settled.
 ENTRY_CANCEL_CUM_EXEC_EXTRA: str = 'cancel_cum_exec'
 
+# Row ``extras`` key holding every quantity (wire domain) the bot sent for a
+# guarded resting order: its dispatch and each own amend, recorded before the
+# request leaves. A venue view showing any other quantity was amended by
+# someone else; an amend whose outcome stayed unknown is still the bot's own
+# after a restart.
+OWN_ORDER_QTYS_EXTRA: str = 'own_order_qtys'
+
+# Bracket-ownership row ``extras`` key holding the trading stop's quantity in
+# the wire domain (contracts on inverse). The row's own ``qty`` is the core's
+# base quantity; a venue stop fire is split between the rows in wire units.
+BRACKET_OWN_WIRE_QTY_EXTRA: str = 'wire_qty'
+
 # ``GET /v5/order/realtime`` page size (server maximum for one page).
 OPEN_ORDERS_PAGE_LIMIT: int = 50
 
@@ -366,6 +378,23 @@ def venue_filled_qty(row: 'OrderRow') -> float:
 #: Protection-guard key prefix of a position trading stop; the suffix is the
 #: ``positionIdx``.
 TRADING_STOP_KEY_PREFIX = 'trading-stop:'
+
+
+def execution_sort_key(entry: dict) -> tuple[int, int]:
+    """Sort key of an execution row: venue time, then ``seq``.
+
+    Executions of one millisecond keep the venue's own order, which the
+    position ledger needs to tell an add from a close at the same instant.
+    """
+    try:
+        exec_ms = int(entry.get('execTime') or 0)
+    except (TypeError, ValueError):
+        exec_ms = 0
+    try:
+        seq = int(entry.get('seq') or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    return exec_ms, seq
 
 
 def trading_stop_key(position_idx: int) -> str:

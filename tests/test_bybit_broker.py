@@ -1266,7 +1266,7 @@ def __test_bybit_partial_entry_cancel_keeps_the_filled_exposure_owned__(tmp_path
     assert (row.extras or {}).get(ENTRY_REMAINDER_CANCELLED_EXTRA) is True
     assert plugin._tracked_refs(row) == set()
     plugin._position_mode = POSITION_MODE_HEDGE
-    assert plugin._run_owned_hedge_signed_size() == pytest.approx(0.004)
+    assert plugin._run_owned_signed_size() == pytest.approx(0.004)
 
     events = plugin._translate_executions(
         _execution_push(coid, 'e-late', '0.001'), market,
@@ -1289,7 +1289,7 @@ def __test_bybit_partial_entry_cancel_keeps_the_filled_exposure_owned__(tmp_path
     assert row.qty == pytest.approx(0.005)
     assert (row.extras or {}).get(ENTRY_CANCEL_CUM_EXEC_EXTRA) == pytest.approx(0.005)
     assert plugin._tracked_refs(row) == {('positions', 'BTCUSDT')}
-    assert plugin._run_owned_hedge_signed_size() == pytest.approx(0.005)
+    assert plugin._run_owned_signed_size() == pytest.approx(0.005)
 
 
 def __test_bybit_entry_cancelled_before_its_first_fill_is_delivered_stays_owned__(
@@ -1334,7 +1334,7 @@ def __test_bybit_entry_cancelled_before_its_first_fill_is_delivered_stays_owned_
     assert row is not None and row.closed_ts_ms is None
     assert row.filled_qty == pytest.approx(0.004)
     plugin._position_mode = POSITION_MODE_HEDGE
-    assert plugin._run_owned_hedge_signed_size() == pytest.approx(0.004)
+    assert plugin._run_owned_signed_size() == pytest.approx(0.004)
 
 
 def __test_bybit_partial_entry_cancel_push_normalizes_to_cum_exec__(tmp_path):
@@ -2533,6 +2533,13 @@ def __test_bybit_manual_close_without_stop_type_is_reported__(tmp_path):
     assert events == []
     assert len(list(plugin.store_ctx.iter_events_by_kind_for_run_id(
         'external_activity_ignored'))) == 1
+    # The verdict waits for the view the close caused: it proves no other
+    # execution of the leg is missing.
+    assert quarantines == []
+    plugin._translate_private_frame({'topic': 'position', 'data': [
+        {'symbol': 'BTCUSDT', 'category': 'linear', 'positionIdx': 2,
+         'size': '0', 'side': '', 'updatedTime': '1752600000600', 'seq': '100'},
+    ]}, market)
     assert quarantines == [QuarantineKind.EXTERNAL_INTERVENTION]
 
     plugin._translate_executions({

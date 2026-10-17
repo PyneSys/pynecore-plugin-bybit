@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 
+from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION
@@ -14,6 +15,7 @@ from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import BybitAdoptionBaselineError, BybitConnectionError
 from pynecore_bybit.models import InstrumentInfo
+from pynecore_bybit.positions import POSITION_MODE_HEDGE
 
 
 def main():
@@ -269,6 +271,109 @@ def __test_baseline_covers_exit_rows_too__(tmp_path):
     assert 'e-exit' in broker._seen_exec_ids
 
 
+def __test_baseline_nets_seeded_reducing_fills_out_of_the_entry_rows__(tmp_path):
+    # The run held 0.02 long; its 0.01 TP leg filled while the bot was down,
+    # and someone else holds 0.01 on the same one-way position, so the venue
+    # still shows 0.02. The venue clamp sees no excess there: the seeded TP
+    # fill itself must net the entry rows, or the run would own 0.02 of a
+    # leg that holds only 0.01 of its own.
+    broker = _AdoptionFake(
+        market=_linear_instrument(),
+        positions=[_pos(side='Buy', size='0.02')],
+        execs={'o1': [_exec('e1', '0.02')], 'otp': [_exec('e-tp', '0.01')]},
+        order_lookups={'c1': {'orderId': 'o1', 'orderStatus': 'Filled',
+                              'cumExecQty': '0.02'},
+                       'tp1': {'orderId': 'otp', 'orderStatus': 'Filled',
+                               'cumExecQty': '0.01'}},
+    )
+    _open(tmp_path, broker)
+    _seed(broker, 'c1', qty=0.02, filled_qty=0.02)
+    _seed(broker, 'tp1', qty=0.01, side='sell', kind='exit_leg',
+          exchange_order_id='otp')
+    _adopt(broker)
+    assert broker._run_owned_signed_size() == pytest.approx(0.01)
+    assert broker.store_ctx.get_order('tp1').closed_ts_ms is not None
+    assert _clamp_events(broker) == []
+
+
+def __test_helper_hedge_rows(buy: str, *, seq: int, sell: str = '0') -> list[dict]:
+    """Both hedge legs of the symbol, sequenced."""
+    return [
+        {'symbol': 'BTCUSDT', 'positionIdx': 1, 'size': buy,
+         'side': 'Buy' if float(buy) > 0 else '', 'avgPrice': '30000',
+         'updatedTime': '1700000000000', 'seq': seq},
+        {'symbol': 'BTCUSDT', 'positionIdx': 2, 'size': sell,
+         'side': 'Sell' if float(sell) > 0 else '', 'avgPrice': '30000',
+         'updatedTime': '1700000000000', 'seq': seq},
+    ]
+
+
+def __test_helper_give_up_before_restart(tmp_path, monkeypatch, *, view: str) -> _AdoptionFake:
+    """A hedge run long 0.02 whose leg falls to ``view`` with no execution known.
+
+    The position ledger gives the interval up past the grace: the journal
+    books the venue truth and a credit is journalled for the reduce.
+    """
+    clock = [1_752_600_000.0]
+    monkeypatch.setattr('pynecore_bybit.protection.epoch_time', lambda: clock[0])
+    first = _AdoptionFake(market=_linear_instrument())
+    first._position_mode = POSITION_MODE_HEDGE
+    _open(tmp_path, first)
+    _seed(first, 'c1', qty=0.02, filled_qty=0.02)
+    _seed(first, 'tp1', qty=0.01, side='sell', kind='exit_leg', exchange_order_id='otp')
+    first._adoption_baselined = True
+    first._ingest_position_sizes(__test_helper_hedge_rows('0.02', seq=50))
+    first._ledger_advance(first._market)
+    first._ingest_position_sizes(__test_helper_hedge_rows(view, seq=60))
+    first._ledger_advance(first._market)
+    clock[0] += first.fill_report_grace_s + 1
+    first._ledger_advance(first._market)
+    assert first._run_owned_signed_size() == pytest.approx(float(view))
+    return first
+
+
+def __test_restart_after_a_give_up_does_not_net_the_reduce_twice__(tmp_path, monkeypatch):
+    # The run's own TP of 0.01 filled at seq 60; the earlier process never
+    # saw its execution and booked the leg's fall as venue truth.
+    first = __test_helper_give_up_before_restart(tmp_path, monkeypatch, view='0.01')
+    fresh = _AdoptionFake(
+        market=_linear_instrument(),
+        positions=__test_helper_hedge_rows('0.01', seq=60),
+        execs={'o1': [{**_exec('e1', '0.02'), 'seq': '40'}],
+               'otp': [{**_exec('e-tp', '0.01'), 'seq': '60'}]},
+        order_lookups={'c1': {'orderId': 'o1', 'orderStatus': 'Filled', 'cumExecQty': '0.02'},
+                       'tp1': {'orderId': 'otp', 'orderStatus': 'Filled', 'cumExecQty': '0.01'}},
+    )
+    fresh._position_mode = POSITION_MODE_HEDGE
+    fresh.store_ctx = first.store_ctx
+    _adopt(fresh)
+    assert fresh._run_owned_signed_size() == pytest.approx(0.01)
+    legs = asyncio.run(fresh.fetch_raw_positions('BTCUSDT'))
+    assert [(leg.side, leg.qty) for leg in legs] == [('buy', pytest.approx(0.01))]
+    # The credit is spent: nothing an earlier process left is taken again.
+    assert fresh._load_persisted_ledger_credits() == {1: []}
+
+
+def __test_restart_credit_never_covers_a_later_own_reduce__(tmp_path, monkeypatch):
+    # The leg fell 0.01 at seq 60 with no execution known (a lost venue
+    # close); someone else then added 0.01, and the run's own TP of 0.01
+    # filled at seq 80 while the bot was down.
+    first = __test_helper_give_up_before_restart(tmp_path, monkeypatch, view='0.01')
+    fresh = _AdoptionFake(
+        market=_linear_instrument(),
+        positions=__test_helper_hedge_rows('0.01', seq=80),
+        execs={'o1': [{**_exec('e1', '0.02'), 'seq': '40'}],
+               'otp': [{**_exec('e-tp', '0.01'), 'seq': '80'}]},
+        order_lookups={'c1': {'orderId': 'o1', 'orderStatus': 'Filled', 'cumExecQty': '0.02'},
+                       'tp1': {'orderId': 'otp', 'orderStatus': 'Filled', 'cumExecQty': '0.01'}},
+    )
+    fresh._position_mode = POSITION_MODE_HEDGE
+    fresh.store_ctx = first.store_ctx
+    _adopt(fresh)
+    # The TP took the run's last 0.01: the 0.01 the leg holds is foreign.
+    assert fresh._run_owned_signed_size() == 0.0
+
+
 def __test_baseline_flat_adoption_still_seeds_live_rows__(tmp_path):
     # A flat venue at adoption: the pre-restart fills netted out (a close
     # consumed them), so the ownership clamp nets the seeded cursor back to
@@ -498,6 +603,29 @@ def __test_baseline_uses_parked_private_execution_while_rest_index_lags__(tmp_pa
     assert broker._replay_pre_adoption_frames(broker._market) == []
 
 
+def __test_baseline_counts_fill_seen_by_rest_and_parked_push_once__(tmp_path):
+    # One real 0.01 fill of a 0.02 entry reaches the startup window through
+    # BOTH the REST walk and a parked push, on a shared 0.03 position (0.02
+    # foreign). The fill's quantity must enter the cursor once: the venue
+    # clamp cannot catch a doubled cursor that the foreign exposure covers.
+    broker = _AdoptionFake(
+        market=_linear_instrument(),
+        positions=[_pos(side='Buy', size='0.03')],
+        execs={'o1': [_exec('e-both', '0.01')]},
+        order_lookups={'c11': {'orderId': 'o1', 'orderStatus': 'PartiallyFilled',
+                               'cumExecQty': '0.01'}},
+    )
+    _open(tmp_path, broker)
+    _seed(broker, 'c11', qty=0.02, filled_qty=0.0)
+    broker._pre_adoption_frames = [_exec_frame('e-both', '0.01', coid='c11')]
+
+    _adopt(broker)
+
+    assert broker._adoption_baselined is True
+    assert broker.store_ctx.get_order('c11').filled_qty == 0.01
+    assert 'e-both' in broker._seen_exec_ids
+
+
 def __test_baseline_retries_execution_index_lag_in_same_adoption__(tmp_path):
     # The order endpoint can expose cumExecQty before the execution index
     # publishes the corresponding row. The bounded adoption pass re-reads the
@@ -629,10 +757,49 @@ def __test_baseline_clamps_inherited_ownership_to_venue__(tmp_path):
     assert [coid for coid, _ in _clamp_events(broker)] == ['a', 'b']
 
 
-def __test_baseline_clamp_is_per_side_and_noop_when_covered__(tmp_path):
-    # The clamp compares per side: a buy entry fully covered by the venue's
-    # long leg is untouched (and emits no event), while a sell entry whose
-    # short leg is gone from the venue is netted away.
+def __test_baseline_hedge_clamp_is_per_side_and_noop_when_covered__(tmp_path):
+    # Hedge legs are separate positions, so the clamp compares per side: a
+    # buy entry fully covered by the venue's Buy leg is untouched (and emits
+    # no event), while a sell entry whose Sell leg is gone from the venue is
+    # netted away.
+    broker = _AdoptionFake(
+        market=_linear_instrument(),
+        positions=__test_helper_hedge_rows('0.02', seq=60),
+    )
+    broker._position_mode = POSITION_MODE_HEDGE
+    _open(tmp_path, broker)
+    _seed(broker, 'long1', qty=0.02, filled_qty=0.02, side='buy', exchange_order_id='')
+    _seed(broker, 'short1', qty=0.03, filled_qty=0.03, side='sell', exchange_order_id='')
+    _adopt(broker)
+    live = [r.client_order_id
+            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSDT')]
+    assert live == ['long1']
+    assert broker.store_ctx.get_order('long1').filled_qty == 0.02
+    assert [coid for coid, _ in _clamp_events(broker)] == ['short1']
+
+
+def __test_helper_fold_events(broker) -> list:
+    cur = broker.store_ctx._store._conn.execute(
+        "SELECT client_order_id FROM events "
+        "WHERE kind = 'adoption_baseline_folded' ORDER BY id",
+    )
+    return [coid for (coid,) in cur.fetchall()]
+
+
+def __test_helper_age_rows(broker, *coids: str) -> None:
+    """Give the rows strictly increasing creation times, in argument order."""
+    for offset, coid in enumerate(coids):
+        broker.store_ctx._store._conn.execute(
+            "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
+            (1_700_000_000_000 + offset * 1000, coid),
+        )
+
+
+def __test_baseline_oneway_clamp_folds_the_sides_first__(tmp_path):
+    # One-way: a long 2 entry, then a folded reversal (a short entry of 3)
+    # that closed it and opened 1 short. The venue now holds 2 long: the
+    # run's short 1 is gone, and the long is not the run's. Clamped side by
+    # side, the old long row would keep owning it.
     broker = _AdoptionFake(
         market=_inverse_instrument(),
         positions=[_inv_pos(side='Buy', size='2', avg='76455')],
@@ -642,12 +809,88 @@ def __test_baseline_clamp_is_per_side_and_noop_when_covered__(tmp_path):
           exchange_order_id='', extras={'anchor': '76455'})
     _seed(broker, 'short1', qty=3.0, filled_qty=3.0, side='sell',
           exchange_order_id='', extras={'anchor': '76455'})
+    __test_helper_age_rows(broker, 'long1', 'short1')
     _adopt(broker)
-    live = [r.client_order_id
-            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSD')]
-    assert live == ['long1']
-    assert broker.store_ctx.get_order('long1').filled_qty == 2.0
+    assert broker._run_owned_signed_size() == 0.0
+    assert [r.client_order_id
+            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSD')] == []
+    assert __test_helper_fold_events(broker) == ['long1', 'short1']
     assert [coid for coid, _ in _clamp_events(broker)] == ['short1']
+
+
+def __test_helper_reversal_restart(tmp_path, *, venue: str) -> _AdoptionFake:
+    """A one-way run that went long 0.02, then reversed short with a 0.04
+    sell (net short 0.02), restarting on a venue position of ``venue`` short
+    (``seq`` 60)."""
+    broker = _AdoptionFake(
+        market=_linear_instrument(),
+        positions=[{**_pos(side='Sell', size=venue), 'seq': 60}],
+        execs={'o1': [{**_exec('e1', '0.02'), 'seq': '40'}],
+               'orev': [{**_exec('e-rev', '0.04'), 'seq': '50'}]},
+        order_lookups={'c1': {'orderId': 'o1', 'orderStatus': 'Filled', 'cumExecQty': '0.02'},
+                       'rev': {'orderId': 'orev', 'orderStatus': 'Filled',
+                               'cumExecQty': '0.04'}},
+    )
+    _open(tmp_path, broker)
+    _seed(broker, 'c1', qty=0.02, filled_qty=0.02, exchange_order_id='o1')
+    _seed(broker, 'rev', qty=0.04, filled_qty=0.04, side='sell', exchange_order_id='orev')
+    __test_helper_age_rows(broker, 'c1', 'rev')
+    broker.quarantines = []
+    broker.quarantine_sink = (
+        lambda reason, ctx, *, kind: broker.quarantines.append((kind, ctx)))
+    _adopt(broker)
+    return broker
+
+
+def __test_baseline_oneway_reversal_keeps_the_run_share_under_a_foreign_add__(tmp_path):
+    # Someone else sold 0.01 on the same one-way position while the bot was
+    # down: the venue holds 0.03 short, of which 0.02 is the run's.
+    broker = __test_helper_reversal_restart(tmp_path, venue='0.03')
+    assert broker._run_owned_signed_size() == pytest.approx(-0.02)
+    assert broker._leg_ledgers[0].share == pytest.approx(-0.02)
+    assert _clamp_events(broker) == []
+    # The other party buys its own 0.01 back: the run's share is intact.
+    broker._translate_private_frame(__test_helper_oneway_exec(
+        'f-70', side='Buy', qty='0.01', seq=70), broker._market)
+    broker._translate_private_frame(__test_helper_oneway_view(
+        side='Sell', size='0.02', seq=70), broker._market)
+    assert broker.quarantines == []
+    assert broker._run_owned_signed_size() == pytest.approx(-0.02)
+    # A buy that then takes the leg below the run's 0.02 is an intervention.
+    broker._translate_private_frame(__test_helper_oneway_exec(
+        'f-80', side='Buy', qty='0.01', seq=80), broker._market)
+    broker._translate_private_frame(__test_helper_oneway_view(
+        side='Sell', size='0.01', seq=80), broker._market)
+    assert [kind for kind, _ in broker.quarantines] == [QuarantineKind.EXTERNAL_INTERVENTION]
+    assert broker.quarantines[0][1]['consumed'] == pytest.approx(0.01)
+
+
+def __test_baseline_oneway_reversal_clamps_the_net_to_the_venue__(tmp_path):
+    # Someone else bought 0.01 back from the run's short while the bot was
+    # down: the run keeps 0.01, never more and never less.
+    broker = __test_helper_reversal_restart(tmp_path, venue='0.01')
+    assert broker._run_owned_signed_size() == pytest.approx(-0.01)
+    assert [coid for coid, _ in _clamp_events(broker)] == ['rev']
+
+
+def __test_helper_oneway_exec(exec_id: str, *, side: str, qty: str, seq: int) -> dict:
+    """A foreign user execution on the one-way position, as a push frame."""
+    return {'topic': 'execution', 'data': [{
+        'symbol': 'BTCUSDT', 'category': 'linear', 'execType': 'Trade',
+        'execId': exec_id, 'orderId': f"order-{exec_id}", 'orderLinkId': '',
+        'side': side, 'execQty': qty, 'execPrice': '30000', 'execFee': '0',
+        'execTime': str(_VENUE_TIME_MS + 1000), 'closedSize': qty,
+        'stopOrderType': '', 'createType': 'CreateByUser', 'seq': str(seq),
+    }]}
+
+
+def __test_helper_oneway_view(*, side: str, size: str, seq: int) -> dict:
+    """A one-way position push without trading stops."""
+    return {'topic': 'position', 'data': [{
+        'symbol': 'BTCUSDT', 'category': 'linear', 'positionIdx': 0,
+        'side': side, 'size': size, 'takeProfit': '0', 'stopLoss': '0',
+        'trailingStop': '0', 'updatedTime': '1752600000000', 'seq': str(seq),
+    }]}
 
 
 # === Startup gate: fills racing the adoption baseline (F9) =================
