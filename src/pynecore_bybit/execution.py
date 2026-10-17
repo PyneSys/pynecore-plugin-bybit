@@ -1947,17 +1947,31 @@ class _ExecutionMixin(_BybitBase, ABC):
         working entry order(s) of the Pine id. Sources: the in-memory
         identity map (always current in-process) merged with the live
         BrokerStore rows (authoritative across restarts).
+
+        The identity map keeps every dispatch of the process (late events
+        still reverse-map through it), so a dispatch whose row is closed —
+        a filled or cancelled order — is not addressed. A script reuses its
+        ids for every new bracket: re-cancelling the filled leg of an
+        earlier one reads back ``Filled`` and reports the live bracket's
+        cancel as lost to a fill (measured live: bybit-spot cycle 309,
+        2026-10-17 — every spot full close after an earlier TP/SL fill was
+        withheld for the whole pre-clear fill wait).
         """
         want_exit = intent.from_entry is not None
         coids: list[str] = []
         for coid, (pine_id, from_entry, leg_type) in self._order_identity.items():
             if want_exit:
-                if (leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS)
+                if not (leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS)
                         and pine_id == intent.pine_id
                         and from_entry == intent.from_entry):
-                    coids.append(coid)
-            elif leg_type is LegType.ENTRY and pine_id == intent.pine_id:
-                coids.append(coid)
+                    continue
+            elif not (leg_type is LegType.ENTRY and pine_id == intent.pine_id):
+                continue
+            if self.store_ctx is not None:
+                row = self.store_ctx.get_order(coid)
+                if row is not None and row.closed_ts_ms is not None:
+                    continue
+            coids.append(coid)
         if self.store_ctx is not None:
             for row in self.store_ctx.iter_live_orders(symbol=None):
                 if row.client_order_id in coids:

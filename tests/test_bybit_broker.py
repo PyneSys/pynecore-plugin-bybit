@@ -3392,6 +3392,52 @@ def __test_cancel_with_outcome_transport_failure_raises_unknown__():
     assert plugin.calls[-1][0] == '/v5/order/cancel'
 
 
+def __test_cancel_addresses_only_the_live_dispatches_of_reused_ids__(tmp_path):
+    """A filled or cancelled dispatch under the same Pine ids is not cancelled again.
+
+    Replays bybit-spot cycle 309: the script reuses ``L-X`` / ``L`` for
+    every bracket. The identity map still held the TP leg an earlier
+    bracket had filled; re-cancelling it read back ``Filled`` and the
+    live bracket's cancel came back ``ALREADY_FILLED`` — the spot
+    full-close pre-clear then withheld the flat signal's close.
+    """
+    plugin = _FakeBrokerBybit()
+    _attach_store(plugin, tmp_path, "reused-ids")
+    plugin._broker_started = True
+    store = plugin.store_ctx
+    assert store is not None
+    dispatches = [
+        ('old-tp', 'L-X', 'L', LegType.TAKE_PROFIT, 'sell'),
+        ('old-sl', 'L-X', 'L', LegType.STOP_LOSS, 'sell'),
+        ('old-entry', 'L', None, LegType.ENTRY, 'buy'),
+        ('live-tp', 'L-X', 'L', LegType.TAKE_PROFIT, 'sell'),
+        ('live-sl', 'L-X', 'L', LegType.STOP_LOSS, 'sell'),
+        ('live-entry', 'L', None, LegType.ENTRY, 'buy'),
+    ]
+    for coid, pine_id, from_entry, leg_type, side in dispatches:
+        plugin._record_identity(coid, pine_id=pine_id, from_entry=from_entry,
+                                leg_type=leg_type, qty=0.01)
+        store.upsert_order(coid, symbol='BTCUSDT', side=side, qty=0.01, state='working')
+    for coid in ('old-tp', 'old-sl', 'old-entry'):
+        store.close_order(coid)
+
+    plugin._responses = [{}, {}]
+    outcome = asyncio.run(plugin.execute_cancel_with_outcome(DispatchEnvelope(
+        intent=CancelIntent(pine_id='L-X', symbol='BTCUSDT', from_entry='L'),
+        run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+    )))
+    assert outcome is CancelDispositionOutcome.CANCEL_CONFIRMED
+    assert [body['orderLinkId'] for _, _, body in plugin.calls] == ['live-tp', 'live-sl']
+
+    plugin.calls.clear()
+    plugin._responses = [{}]
+    assert asyncio.run(plugin.execute_cancel(DispatchEnvelope(
+        intent=CancelIntent(pine_id='L', symbol='BTCUSDT'),
+        run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+    ))) is True
+    assert [body['orderLinkId'] for _, _, body in plugin.calls] == ['live-entry']
+
+
 def __test_cancel_with_outcome_server_side_failure_stays_unknown__():
     """An ambiguous server-side reply is a venue answer: UNKNOWN is returned."""
     plugin = _FakeBrokerBybit(responses=[BybitAPIError("server error", ret_code=10016)])
