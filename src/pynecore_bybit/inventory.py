@@ -125,7 +125,34 @@ class _BybitSpotPort:
         self.product_id = market.symbol
         self.base_asset = market.base_coin
         self.quote_asset = market.quote_coin
-        self.position_dust_threshold = Decimal(market.qty_step_str)
+
+    @property
+    def position_dust_threshold(self) -> Decimal:
+        """Base quantity below which the plugin exposes no engine position.
+
+        The least sellable quantity (:meth:`min_sellable_base`): a net below
+        it can never be sold, and the manager compacts a whole fold below it
+        away. Before the first observed price the quantity-grid legs alone.
+        """
+        notional_floor = self._notional_floor()
+        floor = self._qty_floor()
+        if notional_floor is not None and notional_floor > floor:
+            floor = notional_floor
+        return floor
+
+    def _qty_floor(self) -> Decimal:
+        """``max(basePrecision, minOrderQty)``."""
+        market = self._market
+        floor = Decimal(market.qty_step_str)
+        min_qty = Decimal(str(market.min_order_qty))
+        return min_qty if min_qty > floor else floor
+
+    def _notional_floor(self) -> Decimal | None:
+        """``minOrderAmt`` at the last traded price; ``None`` without a price."""
+        price = self._plugin._last_price
+        if price is None or price <= 0:
+            return None
+        return Decimal(str(self._market.min_order_amt)) / Decimal(str(price))
 
     # --- SpotInventoryPort surface -----------------------------------------
 
@@ -142,16 +169,11 @@ class _BybitSpotPort:
         ``None`` before the first observed price — the manager skips the
         pass.
         """
-        market = self._market
-        floor = Decimal(market.qty_step_str)
-        min_qty = Decimal(str(market.min_order_qty))
-        if min_qty > floor:
-            floor = min_qty
-        if market.min_order_amt > 0:
-            price = self._plugin._last_price
-            if price is None or price <= 0:
+        floor = self._qty_floor()
+        if self._market.min_order_amt > 0:
+            notional_floor = self._notional_floor()
+            if notional_floor is None:
                 return None
-            notional_floor = Decimal(str(market.min_order_amt)) / Decimal(str(price))
             if notional_floor > floor:
                 floor = notional_floor
         return floor if floor > 0 else None

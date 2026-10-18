@@ -23,6 +23,7 @@ import asyncio
 import logging
 from abc import ABC
 from dataclasses import replace
+from decimal import Decimal
 
 from pynecore.core.broker.exceptions import (
     ExchangeCapabilityError,
@@ -439,10 +440,11 @@ class _StateMixin(_BybitBase, ABC):
         base units (see ``positions.py``).
 
         **Spot** synthesizes from the core inventory ledger.
-        ``None`` is an authoritative flat by engine contract. Sub-grid
+        ``None`` is an authoritative flat by engine contract. Unsellable
         dust counts as flat: Bybit charges the buy-side fee in the BASE
-        coin, so a full buy→sell round trip leaves a residue below
-        ``basePrecision`` that can never be sold — reporting it as a live
+        coin, so a full buy→sell round trip leaves a residue below the
+        least sellable quantity (the port's ``position_dust_threshold``,
+        the bound the engine books dust flat by) — reporting it as a live
         micro-long would keep ``strategy.position_size`` non-zero forever
         and block flat-gated re-entries. The exact ledger (and the
         balance invariant) keeps carrying the dust until the manager's
@@ -482,8 +484,9 @@ class _StateMixin(_BybitBase, ABC):
             vwap = manager.fold.vwap
             mark = float(vwap) if vwap is not None else 0.0
         position = manager.synthesize_position(mark)
-        if position is not None \
-                and market.qty_step > 0 and position.size < market.qty_step:
+        port = self._spot_port
+        if (position is not None and port is not None
+                and Decimal(str(position.size)) < port.position_dust_threshold):
             return None
         return position
 

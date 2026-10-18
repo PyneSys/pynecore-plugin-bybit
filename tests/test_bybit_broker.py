@@ -1467,6 +1467,72 @@ def __test_bybit_spot_port_min_sellable_floor__():
             == Decimal('0.0002'))
 
 
+def __test_bybit_spot_dust_threshold_is_the_least_sellable_quantity__():
+    """The engine books flat what the plugin reports flat: below a sellable sell.
+
+    The inventory compacts a fold below :meth:`min_sellable_base` away, so
+    the engine's dust threshold must be the same bound; the grid step alone
+    took a compacted fee residue for an external close (bybit-spot c313,
+    2026-10-18: three 0.00999 brackets over 0.009995 entries left 1.5e-05,
+    and ``minOrderAmt`` 5 USDC at ~2400 makes ~0.002 ETH unsellable).
+    """
+    plugin = _FakeBrokerBybit()
+    market = _instrument(qty_step_str='0.00001', qty_step=0.00001,
+                         min_order_qty=0.00001, min_order_amt=5.0)
+    port = spot_port_for(plugin, market)
+    plugin._last_price = 4000.0
+    assert port.position_dust_threshold == Decimal('0.00125')
+    # Before a price: the quantity-grid legs, never more.
+    plugin._last_price = None
+    assert port.position_dust_threshold == Decimal('0.00001')
+
+
+def __test_bybit_spot_fee_residue_below_the_least_sellable_reports_flat__(tmp_path):
+    from pynecore.core.broker.spot_inventory import SpotInventoryManager
+
+    plugin = _FakeBrokerBybit()
+    market = plugin._market
+    assert market is not None and market.min_order_amt == 5.0
+    plugin._broker_started = True
+    store = BrokerStore(tmp_path / "spot_dust.sqlite", plugin_name=plugin.plugin_name)
+    plugin.store_ctx = store.open_run(RunIdentity(
+        strategy_id="spot_dust", symbol="BTCUSDT", timeframe="1", account_id="acct-spot",
+    ), script_source="// spot dust")
+    port = spot_port_for(plugin, market)
+    manager = SpotInventoryManager(
+        plugin.store_ctx, port, account_id="acct-spot", symbol="BTCUSDT",
+        request_quarantine=lambda *_args, **_kw: None,
+    )
+    manager._started = True
+    plugin._spot_manager = manager
+    plugin._spot_port = port
+    plugin._last_price = 64000.0
+    plugin._record_identity('coid-buy', pine_id='L', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.001)
+    plugin._translate_executions({'topic': 'execution', 'data': [{
+        'symbol': 'BTCUSDT', 'category': 'spot', 'execType': 'Trade',
+        'execId': 'd-buy', 'orderId': '901', 'orderLinkId': 'coid-buy',
+        'side': 'Buy', 'execQty': '0.001', 'execPrice': '64000',
+        'execFee': '0.000001', 'feeCurrency': 'BTC', 'execTime': '1752600000000',
+    }]}, market)
+    position = asyncio.run(plugin.get_position('BTCUSDT'))
+    assert position is not None and position.size == pytest.approx(0.000999)
+    # The close is grid-quantized below the fee-netted holding: 5e-06 stays,
+    # five grid steps, but far below the 5-USDT minimum notional.
+    plugin._record_identity('coid-sell', pine_id=None, from_entry='L',
+                            leg_type=LegType.CLOSE, qty=0.000994)
+    plugin._translate_executions({'topic': 'execution', 'data': [{
+        'symbol': 'BTCUSDT', 'category': 'spot', 'execType': 'Trade',
+        'execId': 'd-sell', 'orderId': '902', 'orderLinkId': 'coid-sell',
+        'side': 'Sell', 'execQty': '0.000994', 'execPrice': '64000',
+        'execFee': '0.06', 'feeCurrency': 'USDT', 'execTime': '1752600000500',
+    }]}, market)
+    assert manager.fold.net_base == Decimal('0.000005')
+    assert asyncio.run(plugin.get_position('BTCUSDT')) is None
+    assert Decimal('0.000005') < port.position_dust_threshold
+    store.close()
+
+
 def __test_bybit_spot_port_execution_mapping__():
     """Inventory port: canonical deltas, fee inference and attribution"""
     plugin = _FakeBrokerBybit()
