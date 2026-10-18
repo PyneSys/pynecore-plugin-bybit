@@ -2646,6 +2646,15 @@ class _ExecutionMixin(_BybitBase, ABC):
             self._release_netting_ownership(row.client_order_id)
         return await self.execute_exit(new)
 
+    async def _known_order_id(self, coid: str) -> str:
+        """The venue ``orderId`` of ``coid``: its journal row, else a venue read."""
+        if self.store_ctx is not None:
+            row = self.store_ctx.get_order(coid)
+            if row is not None and row.exchange_order_id:
+                return row.exchange_order_id
+        existing = await self._lookup_order_by_coid(coid)
+        return str((existing or {}).get('orderId') or '')
+
     async def _amend_or_none(self, body: dict, *, coid: str) -> dict | None:
         """Run one ``/v5/order/amend``; ``None`` when the order is gone.
 
@@ -2663,8 +2672,12 @@ class _ExecutionMixin(_BybitBase, ABC):
                 # amend's goal state holds, an idempotent success (the
                 # engine's diff works in unrounded engine-domain values,
                 # so a tick-rounded / anchor-converted leg can land on
-                # its live values legitimately).
-                return {}
+                # its live values legitimately). The reject carries no
+                # ``orderId``, and the engine maps the leg by it: an empty
+                # id drops the leg from its mapping (measured live:
+                # bybit-inverse cycle 248, 2026-10-18 — the unchanged TP's
+                # own cancel was then logged as an external one).
+                return {'orderId': await self._known_order_id(coid)}
             if e.ret_code in ORDER_NOT_FOUND_CODES:
                 return None
             if e.ret_code in AMBIGUOUS_DISPOSITION_CODES:

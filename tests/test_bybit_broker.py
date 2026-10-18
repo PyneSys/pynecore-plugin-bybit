@@ -449,14 +449,18 @@ def __test_bybit_amend_to_current_values_is_an_idempotent_success__():
     """
     from pynecore_bybit.exceptions import BybitAPIError
 
+    # The reject carries no ``orderId``: the leg keeps the one the venue
+    # holds for it, or the engine's mapping loses the leg.
     plugin = _linear_plugin(responses=[
         BybitAPIError("Bybit API error on /v5/order/amend: retCode=10001 "
                       "retMsg='order not modified'", ret_code=10001),
+        {'list': [{'orderId': '777', 'orderLinkId': 'c-1'}]},
     ])
     result = asyncio.run(plugin._amend_or_none(
         {'category': 'linear', 'symbol': 'ETHUSDT', 'orderLinkId': 'c-1',
          'qty': '0.01'}, coid='c-1'))
-    assert result == {}
+    assert result == {'orderId': '777'}
+    assert plugin.calls[-1][0] == '/v5/order/realtime'
 
     plugin = _linear_plugin(responses=[
         BybitAPIError("Bybit API error on /v5/order/amend: retCode=10001 "
@@ -519,6 +523,42 @@ def __test_bybit_execute_exit_and_close__():
     assert order.reduce_only is True
     assert plugin._order_identity[body['orderLinkId']] == \
            (None, 'Long', LegType.CLOSE)
+
+
+def __test_bybit_exit_amend_keeps_the_order_id_of_an_unchanged_leg__(tmp_path):
+    """A leg the venue reports unchanged keeps its order id in the amend result.
+
+    Replays bybit-inverse cycle 248: the SL moved, the TP already stood at
+    its level. The engine maps the bracket by the returned ids, so an
+    empty TP id dropped that leg from the mapping.
+    """
+    from pynecore_bybit.exceptions import BybitAPIError
+
+    plugin = _FakeBrokerBybit(responses=[{'orderId': '201'}, {'orderId': '202'}])
+    _attach_store(plugin, tmp_path, "unchanged-leg")
+    plugin._broker_started = True
+
+    def _envelope(sl: float) -> DispatchEnvelope:
+        return DispatchEnvelope(
+            intent=ExitIntent(
+                pine_id='TP/SL', from_entry='Long', symbol='BTCUSDT', side='sell',
+                qty=0.001, tp_price=110000.0, sl_price=sl,
+            ),
+            run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+        )
+
+    old = _envelope(90000.0)
+    asyncio.run(plugin.execute_exit(old))
+    plugin.calls.clear()
+    plugin._responses = [
+        BybitAPIError("Bybit API error on /v5/order/amend: retCode=10001 "
+                      "retMsg='order not modified'", ret_code=10001),
+        {'orderId': '202'},
+    ]
+    legs = asyncio.run(plugin.modify_exit(old, _envelope(91000.0)))
+
+    assert [leg.id for leg in legs] == ['201', '202']
+    assert [endpoint for endpoint, _, _ in plugin.calls] == ['/v5/order/amend'] * 2
 
 
 def __test_bybit_duplicate_coid_adoption__():

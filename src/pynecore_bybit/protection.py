@@ -1575,7 +1575,8 @@ class _ProtectionMixin(_BybitBase, ABC):
         can retire the rows of a position someone else closed. A hedge leg
         is entered by its size, the one-way leg by its signed net. A row
         without a ``seq`` cannot be ordered against an execution and is
-        skipped.
+        skipped; one without a readable ``updatedTime`` is never taken for
+        an echo of the newest view.
         """
         for row in rows:
             seq = _parse_seq(row.get('seq'))
@@ -1586,12 +1587,16 @@ class _ProtectionMixin(_BybitBase, ABC):
                 size = self._position_row_size(row)
             except BybitPositionDataError:
                 continue
+            try:
+                updated_ms: int | None = self._position_row_updated_ms(row) or None
+            except BybitPositionDataError:
+                updated_ms = None
             if idx == _ONE_WAY_IDX and size > 0.0:
                 side = str(row.get('side') or '').lower()
                 if side not in ('buy', 'sell'):
                     continue
                 size = size if side == 'buy' else -size
-            self._leg_ledger(idx).add_view(seq, size)
+            self._leg_ledger(idx).add_view(seq, size, updated_ms)
 
     def _position_view_superseded(self, idx: int, row: dict) -> bool:
         """Whether a newer view of leg ``idx`` than ``row`` was already seen.

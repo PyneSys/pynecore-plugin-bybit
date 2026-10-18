@@ -14,9 +14,17 @@ The ledger judges that from evidence, never from timing:
   each fill of a symbol with one increasing cross sequence, and the position
   update a fill causes carries the fill's ``seq`` (executions concluded at
   the same time share one); an update without a fill (a setting, an order
-  event) carries the ``seq`` of the last transaction. So a view at ``seq`` V
-  shows the leg after every execution up to V, and the execution stamped V
-  is the last one before it.
+  event) carries the ``seq`` of the last transaction on linear, but the
+  symbol's current cross sequence on inverse — a ``seq`` no execution of
+  the account carries. So a view at ``seq`` V shows the leg after every
+  execution up to V, and the execution stamped V is the last one before it.
+- **A view repeating the newest one is its echo.** Every fill stamps the
+  position's ``updatedTime``, so a later view with the same size and
+  ``updatedTime`` as the newest view shows the same state: no execution of
+  the leg lies between them, whatever its ``seq``. It is not recorded, so
+  the fill-less updates inverse stamps with a foreign ``seq`` (and a REST
+  read, whose ``seq`` never names an execution) leave the interval to the
+  view of the fill itself.
 - **Complete intervals only.** From the cursor view C, the ledger advances to
   a later view V only when the evidence closes the interval: every view in
   ``(C, V]`` carries the ``seq`` of a known execution (the last transaction
@@ -302,6 +310,9 @@ class LegLedger:
     reduced (leg frame sign)."""
     latest_view_seq: int = 0
     """The newest view ``seq`` ever seen (a delayed view is older)."""
+    newest_view: tuple[int, float, int] | None = None
+    """``(seq, size, updatedTime)`` of the newest view recorded; ``None``
+    before one, or when it carried no ``updatedTime``."""
     doubt: float = 0.0
     """The part of the share (magnitude) no evidence proves the run still holds."""
     doubt_seq: int = 0
@@ -338,9 +349,20 @@ class LegLedger:
         return self.cursor_seq is not None and any(
             view[0] > self.cursor_seq for view in self.views)
 
-    def add_view(self, seq: int, size: float) -> None:
-        """Record one position view of the leg."""
+    def add_view(self, seq: int, size: float, updated_ms: int | None = None) -> None:
+        """Record one position view of the leg.
+
+        :param updated_ms: The view's ``updatedTime``; ``None`` when not
+            known. A later view repeating the size and ``updatedTime`` of
+            the newest view is its echo, and is not recorded.
+        """
         self.latest_view_seq = max(self.latest_view_seq, seq)
+        newest = self.newest_view
+        if (newest is not None and updated_ms is not None and seq > newest[0]
+                and size == newest[1] and updated_ms == newest[2]):
+            return
+        if newest is None or seq >= newest[0]:
+            self.newest_view = None if updated_ms is None else (seq, size, updated_ms)
         if self.cursor_seq is not None and seq <= self.cursor_seq:
             return
         self.views = [view for view in self.views if view[0] != seq]

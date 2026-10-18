@@ -543,6 +543,10 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     @abstractmethod
     def _position_row_index(row: dict) -> int: ...
 
+    @staticmethod
+    @abstractmethod
+    def _position_row_updated_ms(row: dict) -> int: ...
+
     @abstractmethod
     def _run_owned_signed_size(self) -> float: ...
 

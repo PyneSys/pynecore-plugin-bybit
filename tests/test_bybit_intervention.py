@@ -153,10 +153,11 @@ def _order_push(coid: str, *, status='Untriggered', trigger='90000', price='0',
 
 def _position_push(*, idx=0, side='Buy', size='0.002', tp='110000', sl='90000',
                    trail='5', seq='10') -> dict:
+    # Each view stamps its own ``updatedTime``: a repeated one marks an echo.
     return {'topic': 'position', 'data': [{
         'symbol': 'BTCUSDT', 'category': 'linear', 'positionIdx': idx,
         'side': side, 'size': size, 'takeProfit': tp, 'stopLoss': sl,
-        'trailingStop': trail, 'updatedTime': '1752600000000', 'seq': seq,
+        'trailingStop': trail, 'updatedTime': str(1752600000000 + int(seq)), 'seq': seq,
     }]}
 
 
@@ -2505,13 +2506,15 @@ def __test_helper_inverse_exec(exec_id: str, **overrides) -> dict:
 
 
 def __test_helper_inverse_view(*, size, seq, side=None, avg='82600',
-                               tp='0', sl='0', trail='0') -> dict:
+                               tp='0', sl='0', trail='0', updated=None) -> dict:
     if side is None:
         side = 'Buy' if float(size) > 0 else ''
+    if updated is None:
+        updated = 1752600000000 + int(seq)
     return {'topic': 'position', 'data': [{
         'symbol': 'BTCUSD', 'category': 'inverse', 'positionIdx': 0,
         'side': side, 'size': str(size), 'avgPrice': avg, 'takeProfit': tp,
-        'stopLoss': sl, 'trailingStop': trail, 'updatedTime': '1752600000000',
+        'stopLoss': sl, 'trailingStop': trail, 'updatedTime': str(updated),
         'seq': str(seq),
     }]}
 
@@ -2709,6 +2712,41 @@ def __test_inverse_late_own_reduce_after_a_give_up_moves_the_mirror_once__(
     assert plugin._inverse_net_contracts == 100.0
     assert plugin._inverse_net_base == pytest.approx(booked * 100 / 165, rel=1e-12)
     assert plugin._inverse_core_size('buy', 100.0, 82600.0) == plugin._inverse_net_base
+
+
+def __test_inverse_fill_less_views_never_give_up_the_ledger__(tmp_path, monkeypatch):
+    # Measured on the inverse stream (2026-10-18): the push of a fill carries
+    # its seq, then more pushes follow with the same size and ``updatedTime``
+    # but the symbol's later cross seq, which no execution of the account
+    # carries (an order event before a close does the same).
+    clock = __test_helper_clock(monkeypatch)
+    plugin = __test_helper_inverse_plugin(tmp_path, "inverse-echo")
+    plugin.store_ctx.upsert_order(
+        'tp-1', symbol='BTCUSD', side='sell', qty=65.0, filled_qty=0.0,
+        state='confirmed', intent_key="TP\x00Long", from_entry='Long',
+        exchange_order_id='venue-tp-1',
+        extras={'kind': 'exit_leg', 'leg': 'tp', 'exit_id': 'TP', 'anchor': '82500'},
+    )
+    _push(plugin, _exec_push(__test_helper_inverse_exec(
+        'tp-a', orderId='venue-tp-1', orderLinkId='tp-1', side='Sell', execQty='65',
+        closedSize='65', seq='60')))
+    _push(plugin, __test_helper_inverse_view(size=100, seq=60))
+    for seq in (75, 75, 90, 91):
+        _push(plugin, __test_helper_inverse_view(size=100, seq=seq,
+                                                 updated=1752600000060))
+    clock[0] += plugin.fill_report_grace_s + 1
+    plugin._ledger_advance(plugin._market)
+    assert __test_helper_audits(plugin, 'position_ledger_gap') == []
+    assert plugin._leg_ledgers[0].doubt == 0.0
+    assert plugin._run_owned_signed_size() == pytest.approx(100.0)
+    # The share stays proven: a manual close of it is reported in full, even
+    # one concluded in the millisecond of the last fill (a new size is never
+    # an echo).
+    _push(plugin, _exec_push(__test_helper_inverse_exec(
+        'm-1', side='Sell', execQty='100', closedSize='100', seq='120')))
+    _push(plugin, __test_helper_inverse_view(size=0, seq=120, updated=1752600000060))
+    assert _kinds(plugin) == [QuarantineKind.EXTERNAL_INTERVENTION]
+    assert plugin.quarantines[0][1]['consumed'] == pytest.approx(100.0)
 
 
 def __test_helper_inverse_pyramid(tmp_path, name: str) -> '_InterventionFake':
