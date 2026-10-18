@@ -245,7 +245,10 @@ class _EventStreamMixin(_BybitBase, ABC):
         iteration blocks on the frame queue only until the next reconcile
         deadline, so a quiet stream cannot starve the invariant check and
         a busy stream cannot starve it either (deadline checked at the
-        loop top).
+        loop top). While the stream is down the reconcile keeps its
+        cadence between the reconnect attempts: its REST reads and the
+        execution backfill are the only way a fill of the outage reaches
+        the engine before the stream is back.
         """
         await self._ensure_broker_started()
         market = await asyncio.to_thread(self._broker_market)
@@ -253,27 +256,46 @@ class _EventStreamMixin(_BybitBase, ABC):
         await self._observe_resume_baseline(market)
         loop = asyncio.get_running_loop()
         next_reconcile = loop.time() + RECONCILE_CADENCE_S
+        next_reconnect = loop.time()
+        reconnect_attempt = 0
         while True:
             self._raise_pending_halt()
             for event in self._replay_pre_adoption_frames(market):
                 yield event
             ws = self._private_ws
             if ws is None or not ws.is_open:
-                await self._open_private_ws(market)
                 if is_deriv:
                     # Until the backfill has re-read the window the stream
                     # was down (or not open yet), the position ledgers prove
-                    # nothing: the views of that window are lost too.
+                    # nothing: the views of that window are lost too. Armed
+                    # again on every pass of the outage, which lasts until now.
                     self._ledger_stream_opened_ms = int(epoch_time() * 1000)
-                    # A (re)connect closes the stream-gap: any fill that
-                    # landed while the private PUSH was down is read back
-                    # from the durable execution cursor. The first open at
-                    # startup only seeds the watermark (nothing prior is the
-                    # bot's gap); every later open recovers the outage window.
-                    for event in await self._run_deriv_fill_backfill(market):
-                        yield event
-            queue = self._private_events
-            assert queue is not None
+                if loop.time() >= next_reconnect:
+                    error = await self._open_private_ws(market)
+                    if error is None:
+                        if reconnect_attempt:
+                            logger.info("Bybit private WS reconnected after %d attempt(s)",
+                                        reconnect_attempt)
+                        reconnect_attempt = 0
+                        if is_deriv:
+                            self._ledger_stream_opened_ms = int(epoch_time() * 1000)
+                            # A (re)connect closes the stream-gap: any fill
+                            # that landed while the private PUSH was down is
+                            # read back from the durable execution cursor.
+                            # The first open at startup only seeds the
+                            # watermark (nothing prior is the bot's gap);
+                            # every later open recovers the outage window.
+                            for event in await self._run_deriv_fill_backfill(market):
+                                yield event
+                    else:
+                        delay = PRIVATE_WS_BACKOFF_S[
+                            min(reconnect_attempt, len(PRIVATE_WS_BACKOFF_S) - 1)]
+                        reconnect_attempt += 1
+                        logger.warning(
+                            "Bybit private WS connect failed (attempt %d, retry in %.0fs): %s",
+                            reconnect_attempt, delay, error,
+                        )
+                        next_reconnect = loop.time() + delay
             now = loop.time()
             if now >= next_reconcile:
                 recovered = (await self._run_deriv_reconcile(market)
@@ -282,6 +304,12 @@ class _EventStreamMixin(_BybitBase, ABC):
                 for event in recovered:
                     yield event
                 next_reconcile = loop.time() + RECONCILE_CADENCE_S
+                continue
+            queue = self._private_events
+            if queue is None:
+                # The stream is down: pace to the earlier of the next
+                # reconcile and the next reconnect attempt.
+                await asyncio.sleep(min(next_reconcile, next_reconnect) - now)
                 continue
             try:
                 frame = await asyncio.wait_for(queue.get(), timeout=next_reconcile - now)
@@ -395,70 +423,60 @@ class _EventStreamMixin(_BybitBase, ABC):
 
     # --- private transport ------------------------------------------------------
 
-    async def _open_private_ws(self, market: 'InstrumentInfo') -> None:
-        """(Re)open + authenticate the private stream, with bounded backoff.
+    async def _open_private_ws(self, market: 'InstrumentInfo') -> BybitError | None:
+        """One attempt to (re)open + authenticate the private stream.
 
         Never raises for transient trouble: credential validity was
         already proven by the account-identity latch at startup, so a
-        failing private connect is treated as recoverable and retried
-        forever — halting the bot on it would strand the user's open
-        exposure. The backoff sleep is the retry pacing tick, bounded by
-        :data:`PRIVATE_WS_BACKOFF_S`.
+        failing private connect is recoverable and :meth:`watch_orders`
+        retries it forever, paced by :data:`PRIVATE_WS_BACKOFF_S` — halting
+        the bot on it would strand the user's open exposure.
+
+        :return: ``None`` once the stream is open, else the connect error.
         """
-        attempt = 0
+        self._raise_pending_halt()
         host = self._hosts.ws_private
-        while True:
-            self._raise_pending_halt()
-            if not host:
-                raise BrokerManualInterventionError(
-                    f"Bybit region {self.config.region!r} has no private "
-                    f"stream host; set the ws_private_host override"
-                )
-            queue: asyncio.Queue[dict | None] = asyncio.Queue()
-
-            def _on_message(data: dict, q: asyncio.Queue = queue) -> None:
-                self._publish_private_account_update(data)
-                q.put_nowait(data)
-
-            async def _on_closed(q: asyncio.Queue = queue) -> None:
-                q.put_nowait(None)
-
-            ws = BybitWebSocket(
-                f"wss://{host}/v5/private",
-                on_message=_on_message,
-                on_closed=_on_closed,
+        if not host:
+            raise BrokerManualInterventionError(
+                f"Bybit region {self.config.region!r} has no private "
+                f"stream host; set the ws_private_host override"
             )
-            topics = list(PRIVATE_WS_TOPICS)
-            if market.category != CATEGORY_SPOT:
-                # The position topic feeds the last-known-size cache the
-                # entry-row flat sweep keys off; spot has no position object.
-                topics.append(PRIVATE_WS_TOPIC_POSITION)
-            try:
-                await ws.open(api_key=self.config.api_key,
-                              api_secret=self.config.api_secret)
-                await ws.subscribe(topics)
-            except asyncio.CancelledError:
-                await asyncio.shield(ws.close())
-                raise
-            except BybitError as e:
-                await ws.close()
-                delay = PRIVATE_WS_BACKOFF_S[min(attempt, len(PRIVATE_WS_BACKOFF_S) - 1)]
-                attempt += 1
-                logger.warning(
-                    "Bybit private WS connect failed (attempt %d, retry in %.0fs): %s",
-                    attempt, delay, e,
-                )
-                await asyncio.sleep(delay)
-                continue
-            except BaseException:
-                await ws.close()
-                raise
-            self._private_ws = ws
-            self._private_events = queue
-            self._private_account_updates_started.set()
-            if attempt:
-                logger.info("Bybit private WS reconnected after %d attempt(s)", attempt)
-            return
+        queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+        def _on_message(data: dict, q: asyncio.Queue = queue) -> None:
+            self._publish_private_account_update(data)
+            q.put_nowait(data)
+
+        async def _on_closed(q: asyncio.Queue = queue) -> None:
+            q.put_nowait(None)
+
+        ws = BybitWebSocket(
+            f"wss://{host}/v5/private",
+            on_message=_on_message,
+            on_closed=_on_closed,
+        )
+        topics = list(PRIVATE_WS_TOPICS)
+        if market.category != CATEGORY_SPOT:
+            # The position topic feeds the last-known-size cache the
+            # entry-row flat sweep keys off; spot has no position object.
+            topics.append(PRIVATE_WS_TOPIC_POSITION)
+        try:
+            await ws.open(api_key=self.config.api_key,
+                          api_secret=self.config.api_secret)
+            await ws.subscribe(topics)
+        except asyncio.CancelledError:
+            await asyncio.shield(ws.close())
+            raise
+        except BybitError as e:
+            await ws.close()
+            return e
+        except BaseException:
+            await ws.close()
+            raise
+        self._private_ws = ws
+        self._private_events = queue
+        self._private_account_updates_started.set()
+        return None
 
     async def _close_private_ws(self) -> None:
         """Drop the private transport (idempotent)."""

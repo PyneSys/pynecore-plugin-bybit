@@ -6,6 +6,8 @@ import logging
 import random
 import sqlite3
 import time
+from collections.abc import AsyncGenerator, Callable
+from typing import cast
 
 import pytest
 
@@ -82,7 +84,7 @@ class _InterventionFake(Bybit):
         self._broker_started = True
         self._position_mode = mode
         self.responses = list(responses or [])
-        self.during: dict = {}
+        self.during: dict[str, Callable[[dict], object]] = {}
         self.calls: list = []
         self.quarantines: list = []
         self.on_unexpected_cancel = 'stop'
@@ -1797,7 +1799,7 @@ def __test_stream_open_arms_the_ledger_outage_hold__(tmp_path, monkeypatch):
 
         monkeypatch.setattr(plugin, '_open_private_ws', fake_open)
         monkeypatch.setattr(plugin, '_run_deriv_fill_backfill', fake_backfill)
-        stream = plugin.watch_orders()
+        stream = cast(AsyncGenerator, plugin.watch_orders())
         task = asyncio.ensure_future(stream.__anext__())
         await opened.wait()
         task.cancel()
@@ -1806,6 +1808,51 @@ def __test_stream_open_arms_the_ledger_outage_hold__(tmp_path, monkeypatch):
 
     asyncio.run(_drive())
     assert len(holds) == 1 and holds[0] is not None
+
+
+def __test_reconcile_keeps_its_cadence_while_the_private_stream_is_down__(
+        tmp_path, monkeypatch):
+    """A fill of a private-stream outage reaches the engine before the stream is back.
+
+    The reconnect used to retry inside its own backoff loop, starving the
+    reconcile pass and its execution backfill for the whole outage
+    (measured live: bybit-inverse cycle 250, a reversal close filled while
+    the stream was down for 134s; its fill arrived only at the reconnect,
+    after two rejected close re-dispatches and a false "exchange shows
+    flat ... no fill explains it" ERROR).
+    """
+    import pynecore_bybit.events as events_module
+    plugin = __test_helper_ledger_plugin(
+        tmp_path, "outage-cadence", POSITION_MODE_ONE_WAY, owned=0.02, physical=0.02)
+    monkeypatch.setattr(events_module, 'RECONCILE_CADENCE_S', 0.01)
+    monkeypatch.setattr(events_module, 'PRIVATE_WS_BACKOFF_S', (3600.0,))
+    attempts: list[int] = []
+    holds: list = []
+
+    async def _drive() -> None:
+        reconciled = asyncio.Event()
+
+        async def fake_open(_market) -> BybitConnectionError:
+            attempts.append(1)
+            return BybitConnectionError("private stream down")
+
+        async def fake_reconcile(_market) -> list:
+            holds.append(plugin._ledger_stream_opened_ms)
+            reconciled.set()
+            return []
+
+        monkeypatch.setattr(plugin, '_open_private_ws', fake_open)
+        monkeypatch.setattr(plugin, '_run_deriv_reconcile', fake_reconcile)
+        stream = cast(AsyncGenerator, plugin.watch_orders())
+        task = asyncio.ensure_future(stream.__anext__())
+        await reconciled.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await stream.aclose()
+
+    asyncio.run(_drive())
+    assert attempts == [1]
+    assert holds and holds[0] is not None
 
 
 # --- interval completeness: executions that cancel each other out -----------
