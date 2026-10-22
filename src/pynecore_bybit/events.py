@@ -63,9 +63,12 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 from pynecore.core.broker.store_helpers import (
+    BRACKET_OWN_STATE_RELEASED,
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
+    EXTRAS_KEY_BRACKET_OWN_STATE,
+    STATE_BRACKET_OWN,
     iter_active_bracket_ownerships,
 )
 from pynecore.core.plugin import override
@@ -643,6 +646,39 @@ class _EventStreamMixin(_BybitBase, ABC):
             )
         return events
 
+    def _bracket_ownerships_live_at(self, entry: dict) -> list['OrderRow']:
+        """The bracket-ownership rows that were live when ``entry`` executed.
+
+        Every live row, plus each released row whose lifetime spans the
+        execution's ``execTime`` — written before it, released at or after
+        it: its bracket was attached when the stop fired, so the fire is the
+        run's own however late the execution is delivered. A row rolled back
+        after a refused attach never spans an earlier fire. Oldest first, the
+        order the pyramid split claims in. An execution without a readable
+        ``execTime`` sees the live rows only.
+        """
+        assert self.store_ctx is not None
+        rows = list(iter_active_bracket_ownerships(self.store_ctx))
+        try:
+            exec_ms = int(entry.get('execTime') or 0)
+        except (TypeError, ValueError):
+            exec_ms = 0
+        if exec_ms > 0:
+            # Measured live (cycle 309): a 15-minute network outage held the
+            # fired stop's execution back while the reversal cancelled the
+            # brackets and released their rows; the backfill delivered it
+            # afterwards, found no live row and dropped the run's own stop as
+            # external, leaving the book short against a flat venue.
+            rows.extend(
+                row for row in self.store_ctx.iter_orders_in_state_for_run_id(
+                    STATE_BRACKET_OWN)
+                if row.closed_ts_ms is not None
+                and row.created_ts_ms <= exec_ms <= row.closed_ts_ms
+                and (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_STATE)
+                == BRACKET_OWN_STATE_RELEASED
+            )
+        return sorted(rows, key=lambda row: row.created_ts_ms)
+
     def _attribute_venue_bracket_execution(
             self, entry: dict, market: 'InstrumentInfo',
     ) -> tuple[list[tuple[str, str | None, LegType, float]], bool]:
@@ -656,8 +692,9 @@ class _EventStreamMixin(_BybitBase, ABC):
         persisted BEFORE attaching (:data:`_VENUE_STOP_ORDER_LEG` explains
         the shape) proves the protection that fired is ours. Only a
         reduce execution (``closedSize > 0``) with a known
-        ``stopOrderType``, on this symbol, matching live ownership rows
-        of the execution's side, is claimed; a manual venue-UI close
+        ``stopOrderType``, on this symbol, matching ownership rows of the
+        execution's side that were live when it executed
+        (:meth:`_bracket_ownerships_live_at`), is claimed; a manual venue-UI close
         carries no ``stopOrderType`` and stays external.
 
         Returns ``(claims, ambiguous)``, the claims as ``(exit_id,
@@ -717,7 +754,7 @@ class _EventStreamMixin(_BybitBase, ABC):
         # run-scoped and a run trades exactly one symbol, so the unfiltered
         # walk is exact.
         candidates = [
-            row for row in iter_active_bracket_ownerships(self.store_ctx)
+            row for row in self._bracket_ownerships_live_at(entry)
             if (row.side or '').lower() == exec_side
             and row.pine_entry_id is not None
         ]

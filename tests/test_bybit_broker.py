@@ -2601,6 +2601,70 @@ def __test_bybit_venue_trading_stop_fill_attributes_in_backfill__(tmp_path):
         'external_activity_ignored')) == []
 
 
+def __test_bybit_late_stop_fill_of_a_released_bracket_is_the_runs_own__(tmp_path, monkeypatch):
+    """A stop that fired before its bracket was released stays the run's own.
+
+    Live incident (cycle 309): a network outage held the fired stop's execution
+    back while the reversal cancelled the pyramid's brackets and released their
+    ownership rows; the backfill delivered it afterwards and dropped it as
+    external. The rows were live when the stop fired, so the fill is split
+    across them like any pyramid stop, oldest bracket first — a released row
+    as much as a live one.
+    """
+    from pynecore.core.broker import storage
+    from pynecore.core.broker.store_helpers import (
+        BRACKET_OWN_STATE_RELEASED, update_bracket_ownership_state,
+    )
+    clock = iter(range(1_800_000_000_000, 1_800_000_001_000))
+    monkeypatch.setattr(storage, '_now_ms', lambda: next(clock))
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "released-late")
+    for exit_id, entry_id in (('S1-X', 'S1'), ('S2-X', 'S2')):
+        _seed_bracket_ownership(plugin, exit_id=exit_id, from_entry=entry_id,
+                                attach_coid=f"attach-{entry_id}")
+    update_bracket_ownership_state(
+        plugin.store_ctx, coid="attach-S1:2",
+        new_state=BRACKET_OWN_STATE_RELEASED, close_row=True)
+    released = plugin.store_ctx.get_order("attach-S1:2")
+    assert released is not None and released.closed_ts_ms is not None
+    market = plugin._market
+
+    events = plugin._backfill_one_execution(_venue_stop_execution(
+        execQty='0.04', closedSize='0.04', execTime=str(released.closed_ts_ms),
+    ), market)
+
+    assert [(event.pine_id, event.from_entry) for event in events] == [
+        ('S1-X', 'S1'), ('S2-X', 'S2')]
+    assert [event.fill_qty for event in events] == pytest.approx([0.02, 0.02])
+    assert list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored')) == []
+
+
+def __test_bybit_stop_fill_after_the_bracket_release_is_not_the_runs__(tmp_path):
+    """A stop executing after the run released its bracket is not the run's stop."""
+    from pynecore.core.broker.store_helpers import (
+        BRACKET_OWN_STATE_RELEASED, update_bracket_ownership_state,
+    )
+    plugin = _linear_plugin()
+    plugin._position_mode = POSITION_MODE_HEDGE
+    _attach_store(plugin, tmp_path, "released-before")
+    _seed_bracket_ownership(plugin)
+    update_bracket_ownership_state(
+        plugin.store_ctx, coid="attach-s:2",
+        new_state=BRACKET_OWN_STATE_RELEASED, close_row=True)
+    row = plugin.store_ctx.get_order("attach-s:2")
+    assert row is not None and row.closed_ts_ms is not None
+    market = plugin._market
+
+    events = plugin._backfill_one_execution(
+        _venue_stop_execution(execTime=str(row.closed_ts_ms + 1)), market)
+
+    assert events == []
+    assert len(list(plugin.store_ctx.iter_events_by_kind_for_run_id(
+        'external_activity_ignored'))) == 1
+
+
 def __test_bybit_manual_close_without_stop_type_is_reported__(tmp_path):
     """A venue-UI manual close carries no ``stopOrderType`` — someone else's close.
 
