@@ -43,11 +43,13 @@ graceful stop.
 import asyncio
 import logging
 from abc import ABC
+from collections.abc import Collection
 from decimal import Decimal, InvalidOperation
 from time import time as epoch_time
 from typing import TYPE_CHECKING
 
 from pynecore.core.broker.disappearance import (
+    MISSING_PENDING_EXTRA,
     DisappearanceTracker,
     MissingConfirmation,
     MissingResolution,
@@ -69,6 +71,7 @@ from pynecore.core.broker.store_helpers import (
     STATE_DISPOSITION_UNKNOWN,
     find_pending_dispatch,
 )
+from pynecore.core.plugin import override
 
 from ._base import _BybitBase
 from .events import _CANCEL_TYPE_REASONS
@@ -441,6 +444,30 @@ class _ReconcileMixin(_BybitBase, ABC):
         if not order_id or venue_filled_qty(row) >= float(cum_exec) - _FILL_EPS:
             return
         self._unbooked_fill_orders[row.client_order_id] = (order_id, cum_exec)
+
+    @override
+    def fill_recovery_pending(self, entry_ids: Collection[str]) -> bool:
+        """Whether a fill of the run that may explain a venue change is still owed.
+
+        Pending while the disappearance tracker holds a stamp on a row of the
+        entries (:meth:`BrokerPlugin.fill_recovery_pending`), while a close of
+        the run (a one-way close or a hedge close leg, whose rows name no
+        entry) is stamped missing and its venue order not confirmed yet, and
+        while the per-order recovery holds venue proof of executions it has
+        not booked (:attr:`_unbooked_fill_orders`): the run's own reduce is
+        the likeliest cause of a position the venue shows smaller.
+        """
+        if super().fill_recovery_pending(entry_ids):
+            return True
+        store = self.store_ctx
+        if store is None or not entry_ids:
+            return False
+        if self._unbooked_fill_orders:
+            return True
+        return any(
+            (row.extras or {}).get('kind') == 'close'
+            and MISSING_PENDING_EXTRA in (row.extras or {})
+            for row in store.iter_live_orders())
 
     async def _note_unbooked_market_entries(self, market: 'InstrumentInfo') -> None:
         """Queue the MARKET entries whose terminal order shows unbooked fills.

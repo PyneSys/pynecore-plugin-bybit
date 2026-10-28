@@ -1209,6 +1209,11 @@ class _PositionsMixin(_BybitBase, ABC):
         carries its deterministic :func:`~pynecore_bybit.helpers.wire_link_id`
         form (identity, lookup and the duplicate-reject adoption all key
         on the same mapped id).
+
+        The leg gets a persist-first close row under the wire id, like a
+        one-way close (:meth:`execute_close`): the disappearance pass tracks
+        it and the per-order fill recovery books a fill the stream dropped
+        and the execution list indexed past the backfill's read overlap.
         """
         market = await asyncio.to_thread(self._broker_market)
         idx = int(leg_id)
@@ -1217,16 +1222,32 @@ class _PositionsMixin(_BybitBase, ABC):
         link_id = wire_link_id(coid)
         self._record_identity(link_id, pine_id=None, from_entry=None,
                               leg_type=LegType.CLOSE, qty=float(qty))
-        await self._order_post('/v5/order/create', {
-            'category': market.category,
-            'symbol': market.symbol,
-            'side': side,
-            'orderType': 'Market',
-            'qty': format_decimal(qty),
-            'orderLinkId': link_id,
-            'reduceOnly': True,
-            'positionIdx': idx,
-        }, coid=link_id, context="close leg")
+        # Measured live (bybit cycle 335): a reversal's close leg filled while
+        # the private stream was down and the execution list had not indexed
+        # it a minute later; with no row of its own nothing proved the fill,
+        # and the flat venue was cleared as an unexplained external close.
+        emulator_row = self.store_ctx.get_order(coid) if self.store_ctx is not None else None
+        extras: dict = {'kind': 'close'}
+        self._persist_leg_row(
+            link_id, market=market, side=side.lower(), qty=qty,
+            intent_key=emulator_row.intent_key if emulator_row is not None else None,
+            extras=extras,
+        )
+        try:
+            result = await self._order_post('/v5/order/create', {
+                'category': market.category,
+                'symbol': market.symbol,
+                'side': side,
+                'orderType': 'Market',
+                'qty': format_decimal(qty),
+                'orderLinkId': link_id,
+                'reduceOnly': True,
+                'positionIdx': idx,
+            }, coid=link_id, context="close leg")
+        except Exception as exc:
+            self._mark_dispatch_failure(link_id, exc)
+            raise
+        self._confirm_row(link_id, str(result.get('orderId') or ''), extras)
 
     async def reject_out_of_range(
             self, envelope: DispatchEnvelope, qty: float,

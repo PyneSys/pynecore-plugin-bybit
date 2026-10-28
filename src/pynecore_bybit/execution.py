@@ -734,7 +734,7 @@ class _ExecutionMixin(_BybitBase, ABC):
 
     def _persist_leg_row(
             self, coid: str, *, market: InstrumentInfo, side: str,
-            qty: Decimal, intent_key: str, extras: dict,
+            qty: Decimal, intent_key: str | None, extras: dict,
             from_entry: str | None = None,
             sl_level: float | None = None, tp_level: float | None = None,
     ) -> None:

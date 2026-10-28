@@ -628,6 +628,20 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     ) -> 'tuple[str | None, str | None, LegType | None]': ...
 
     @abstractmethod
+    def _persist_leg_row(
+            self, coid: str, *, market: 'InstrumentInfo', side: str,
+            qty: 'Decimal', intent_key: str | None, extras: dict,
+            from_entry: str | None = None,
+            sl_level: float | None = None, tp_level: float | None = None,
+    ) -> None: ...
+
+    @abstractmethod
+    def _confirm_row(self, coid: str, order_id: str, extras: dict) -> None: ...
+
+    @abstractmethod
+    def _mark_dispatch_failure(self, coid: str, exc: Exception) -> None: ...
+
+    @abstractmethod
     async def _order_post(self, endpoint: str, body: dict[str, _JsonScalar], *,
                           coid: str, context: str) -> dict: ...
 

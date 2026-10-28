@@ -7,12 +7,13 @@ import time
 from decimal import Decimal
 
 from pynecore.core.broker import storage
-from pynecore.core.broker.disappearance import MissingResolution
+from pynecore.core.broker.disappearance import MISSING_PENDING_EXTRA, MissingResolution
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_OCA,
     CANCEL_REASON_VENUE_POSITION_CLEARED,
     CANCEL_REASON_VENUE_REDUCE_ONLY,
     CANCEL_REASON_VENUE_REJECTED,
+    LegType,
 )
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
@@ -72,7 +73,7 @@ class _BackfillFake(Bybit):
     ``retCode 10001`` so a walk that respected the cap is proven. ``fail_once``
     makes the first execution read raise a transport error (the mid-window
     failure path). Every execution request's ``(startTime, endTime, cursor)``
-    is recorded in ``exec_calls``.
+    is recorded in ``exec_calls``; every order-create body in ``created``.
     """
 
     def __init__(self, *, market: InstrumentInfo, executions=None,
@@ -85,9 +86,13 @@ class _BackfillFake(Bybit):
         self._exec_failures = 0
         self.orders: list[dict] = []
         self.lookups: list[str] = []
+        self.created: list[dict] = []
 
     def __call__(self, endpoint, params=None, *, method='get', body=None, auth=False):
         params = dict(params or {})
+        if endpoint == '/v5/order/create':
+            self.created.append(dict(body or {}))
+            return {'orderId': f"x-{(body or {})['orderLinkId']}"}
         if endpoint == '/v5/execution/list':
             start = int(params.get('startTime') or 0)
             end = int(params.get('endTime') or 0)
@@ -637,6 +642,60 @@ def __test_filled_order_finished_below_its_row_size_is_settled__(tmp_path, monke
     assert entry.closed_ts_ms is None and entry.qty == 0.0164
     short = broker.store_ctx.get_order('k3')
     assert short.closed_ts_ms is None and short.qty == 0.0165
+
+
+def __test_hedge_close_leg_fill_indexed_late_is_recovered__(tmp_path, monkeypatch):
+    """A close leg's fill the stream dropped and the window missed is still booked.
+
+    Measured live (bybit cycle 335): a reversal's close leg filled while the
+    private stream was down and the execution list did not show it within the
+    backfill's read overlap. The leg's own close row is what the vanished-order
+    confirmation and the per-order read work from; until the fill is booked the
+    engine's external-flatten verdict is held.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    broker.store_ctx.upsert_order(
+        'p0-c0:2', symbol='BTCUSDT.P', side='buy', qty=10.0, state='close_leg',
+        intent_key='__pyne_reversal_close__L', pine_entry_id='__pyne_reversal_close__L',
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, '_now_ms', lambda: now - 600_000)
+        asyncio.run(broker.close_leg('BTCUSDT', '2', 10, 'p0-c0:2'))
+    assert [body['orderLinkId'] for body in broker.created] == ['p0-c0_2']
+    row = broker.store_ctx.get_order('p0-c0_2')
+    assert row is not None and row.closed_ts_ms is None
+    assert (row.extras or {}).get('kind') == 'close'
+    assert row.exchange_order_id == 'x-p0-c0_2'
+    assert row.intent_key == '__pyne_reversal_close__L'
+    assert not broker.fill_recovery_pending({'S'})
+
+    broker._deriv_exec_watermark = now - 120_000
+    broker.executions.append(_exec(exec_id='el', order_id='x-p0-c0_2', coid='p0-c0_2',
+                                   qty=0.01, price=30000, ts_ms=now - 599_000,
+                                   symbol='BTCUSDT'))
+    assert _backfill(broker) == [], "the window cannot reach the late execution"
+
+    broker.store_ctx.upsert_order(
+        'p0-c0_2', extras={**(row.extras or {}), MISSING_PENDING_EXTRA: now / 1000})
+    assert broker.fill_recovery_pending({'S'}), "a stamped close of the run holds"
+    assert not broker.fill_recovery_pending(set())
+
+    broker.orders.append(_venue_order('p0-c0_2', status='Filled', cum_exec='0.01'))
+    verdict = asyncio.run(broker._confirm_vanished_order(
+        broker._market, broker.store_ctx.get_order('p0-c0_2')))
+    assert verdict.resolution is MissingResolution.FILLED
+    broker.store_ctx.upsert_order('p0-c0_2', extras=row.extras or {})
+    assert broker.fill_recovery_pending({'S'}), "venue proof of an unbooked fill holds"
+
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [(e.fill_id, e.event_type, e.leg_type) for e in events] == \
+           [('el', 'filled', LegType.CLOSE)]
+    assert broker.store_ctx.get_order('p0-c0_2').closed_ts_ms is not None
+    assert broker._unbooked_fill_orders == {}
+    assert not broker.fill_recovery_pending({'S'})
 
 
 def __test_unindexed_execution_stays_queued_until_the_venue_lists_it__(
