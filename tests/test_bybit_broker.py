@@ -2758,7 +2758,7 @@ def _trail_exit_envelope(*, bar_ts_ms: int = 1_752_600_000_000,
 def _active_netting_ownership_rows(plugin) -> list:
     from pynecore.core.broker.store_helpers import iter_active_bracket_ownerships
     return list(iter_active_bracket_ownerships(
-        plugin.store_ctx, symbol=plugin._market.symbol))
+        plugin.store_ctx))
 
 
 def __test_bybit_netting_trailing_attaches_the_trading_stop__(tmp_path):

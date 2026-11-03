@@ -61,6 +61,7 @@ from pynecore.core.broker.protection_guard import ProtectionLevels
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    LEDGER_ROW_STATES,
     PENDING_DISPATCH_STATES,
     iter_active_bracket_ownerships,
 )
@@ -614,8 +615,8 @@ class _PositionsMixin(_BybitBase, ABC):
         for _ in range(_ADOPTION_STABLE_ATTEMPTS):
             seeds: list[tuple] = []
             pass_index_lag: str | None = None
-            for row in self.store_ctx.iter_live_orders(symbol=market.symbol):
-                if row.state in PENDING_DISPATCH_STATES:
+            for row in self.store_ctx.iter_live_orders():
+                if row.state in PENDING_DISPATCH_STATES or row.state in LEDGER_ROW_STATES:
                     continue
                 # The conclusive lookup runs for EVERY walked row: it is the
                 # ``orderId`` fallback for a handle-less row, the
@@ -832,7 +833,7 @@ class _PositionsMixin(_BybitBase, ABC):
                 owned = self._entry_side_exposure(side)
                 self._reduce_entry_ownership(side, owned)
                 self._log_venue_closeout_while_down(entry, side, retired=owned)
-            self._clamp_entry_ownership_to_venue(market, verify)
+            self._clamp_entry_ownership_to_venue(verify)
             for side in {str(entry.get('side') or '').lower()
                          for entry in (*stop_executions, *closeouts)}:
                 # The venue clears a fired stop with the position it closed.
@@ -925,9 +926,7 @@ class _PositionsMixin(_BybitBase, ABC):
             },
         )
 
-    def _clamp_entry_ownership_to_venue(
-            self, market: InstrumentInfo, rows: list[dict],
-    ) -> None:
+    def _clamp_entry_ownership_to_venue(self, rows: list[dict]) -> None:
         """Clamp the live entry rows' owned exposure to the venue position.
 
         The per-order baseline can only RAISE a cursor: an entry's own
@@ -972,14 +971,14 @@ class _PositionsMixin(_BybitBase, ABC):
         if self._position_mode != POSITION_MODE_HEDGE:
             net = venue['buy'] - venue['sell']
             venue = {'buy': max(net, 0.0), 'sell': max(-net, 0.0)}
-            folded = min(sum(row.filled_qty for row in self._clampable_entry_rows(market, side))
+            folded = min(sum(row.filled_qty for row in self._clampable_entry_rows(side))
                          for side in ('buy', 'sell'))
             if folded > _FILL_EPS:
                 for side in ('buy', 'sell'):
-                    self._net_entry_rows_fifo(self._clampable_entry_rows(market, side),
+                    self._net_entry_rows_fifo(self._clampable_entry_rows(side),
                                               folded, 'adoption_baseline_folded')
         for side in ('buy', 'sell'):
-            live = self._clampable_entry_rows(market, side)
+            live = self._clampable_entry_rows(side)
             excess = sum(row.filled_qty for row in live) - venue[side]
             if excess <= _FILL_EPS:
                 continue
@@ -991,12 +990,12 @@ class _PositionsMixin(_BybitBase, ABC):
             )
             self._net_entry_rows_fifo(live, excess, 'adoption_baseline_clamped')
 
-    def _clampable_entry_rows(self, market: InstrumentInfo, side: str) -> list['OrderRow']:
+    def _clampable_entry_rows(self, side: str) -> list['OrderRow']:
         """The settled entry rows of ``side`` that own exposure, oldest first."""
         assert self.store_ctx is not None
         return sorted(
             (
-                row for row in self.store_ctx.iter_live_orders(symbol=market.symbol)
+                row for row in self.store_ctx.iter_live_orders()
                 if row.side == side
                 and row.state not in PENDING_DISPATCH_STATES
                 and (row.extras or {}).get('kind')

@@ -1653,15 +1653,13 @@ class _ExecutionMixin(_BybitBase, ABC):
         if snapshot.closed_ts_ms is not None:
             self.store_ctx.close_order(coid)
 
-    def _owned_netting_stop_rows(
-            self, symbol: str, pine_id: str, from_entry: str | None,
-    ) -> list:
+    def _owned_netting_stop_rows(self, pine_id: str, from_entry: str | None) -> list:
         """Active netting (leg id '0') ownership rows of one exit intent."""
         if self.store_ctx is None:
             return []
         return [
             row for row in iter_active_bracket_ownerships(
-                self.store_ctx, symbol=symbol, from_entry=from_entry)
+                self.store_ctx, from_entry=from_entry)
             if (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
             == _NETTING_LEG_ID
             and row.pine_entry_id == pine_id
@@ -1973,7 +1971,7 @@ class _ExecutionMixin(_BybitBase, ABC):
                     continue
             coids.append(coid)
         if self.store_ctx is not None:
-            for row in self.store_ctx.iter_live_orders(symbol=None):
+            for row in self.store_ctx.iter_live_orders():
                 if row.client_order_id in coids:
                     continue
                 extras = row.extras or {}
@@ -2013,8 +2011,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         # ownership row. Entry cancels (``from_entry`` None) never touch
         # the bracket (TV semantics: cancelling an entry leaves its exit).
         if intent.from_entry is not None:
-            for row in self._owned_netting_stop_rows(
-                    intent.symbol, intent.pine_id, intent.from_entry):
+            for row in self._owned_netting_stop_rows(intent.pine_id, intent.from_entry):
                 await self._clear_owned_trading_stop(market, row)
         return cancelled_any
 
@@ -2162,8 +2159,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         market = await asyncio.to_thread(self._broker_market)
         coids = self._live_coids_for_cancel(intent)
         owned = ([] if intent.from_entry is None
-                 else self._owned_netting_stop_rows(
-                     intent.symbol, intent.pine_id, intent.from_entry))
+                 else self._owned_netting_stop_rows(intent.pine_id, intent.from_entry))
         if not coids and not owned:
             return CancelDispositionOutcome.UNKNOWN
         outcomes: list[CancelDispositionOutcome] = []
@@ -2633,9 +2629,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         """
         old_intent = old.intent
         assert isinstance(old_intent, ExitIntent)
-        rows = self._owned_netting_stop_rows(
-            old_intent.symbol, old_intent.pine_id, old_intent.from_entry,
-        )
+        rows = self._owned_netting_stop_rows(old_intent.pine_id, old_intent.from_entry)
         if trail_new:
             return await self._execute_exit(new, supersedes=tuple(rows))
         await self._clear_position_trading_stop(
@@ -2708,7 +2702,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         if self.store_ctx is None:
             return []
         refs: list[str] = []
-        for row in self.store_ctx.iter_live_orders(symbol=context.symbol):
+        for row in self.store_ctx.iter_live_orders():
             extras = row.extras or {}
             if extras.get('kind') != 'exit_leg':
                 continue

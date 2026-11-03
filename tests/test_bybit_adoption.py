@@ -491,7 +491,7 @@ def __test_baseline_retires_unattributable_non_entry_row__(tmp_path):
     broker.store_ctx.record_envelope('x1', 1_700_000_000_000, 0)
     _adopt(broker)
     assert broker._adoption_baselined is True
-    assert list(broker.store_ctx.iter_live_orders(symbol='BTCUSDT')) == []
+    assert list(broker.store_ctx.iter_live_orders()) == []
     envelopes, _pending = broker.store_ctx.replay()
     assert 'x1' not in envelopes
 
@@ -509,7 +509,7 @@ def __test_baseline_keeps_unattributable_entry_row_with_fills__(tmp_path):
     _adopt(broker)
     assert broker._adoption_baselined is True
     live = [r.client_order_id
-            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSDT')]
+            for r in broker.store_ctx.iter_live_orders()]
     assert live == ['e1']
 
 
@@ -532,7 +532,7 @@ def __test_baseline_retires_dead_partial_exit_with_stale_handle__(tmp_path):
     _adopt(broker)
     assert broker._adoption_baselined is True
     assert 'e-exit' in broker._seen_exec_ids
-    assert list(broker.store_ctx.iter_live_orders(symbol='BTCUSDT')) == []
+    assert list(broker.store_ctx.iter_live_orders()) == []
     envelopes, _pending = broker.store_ctx.replay()
     assert 'x2' not in envelopes
 
@@ -557,7 +557,7 @@ def __test_baseline_normalizes_partially_filled_dead_entry__(tmp_path):
     assert row.filled_qty == 0.004
     assert row.qty == 0.004         # normalized: the full-fill owners take it
     live = [r.client_order_id
-            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSDT')]
+            for r in broker.store_ctx.iter_live_orders()]
     assert live == ['e2']
 
 
@@ -578,7 +578,7 @@ def __test_baseline_full_seed_completes_exit_intent__(tmp_path):
     broker.store_ctx.record_envelope('exit1', 1_700_000_000_000, 0)
     _adopt(broker)
     assert broker._adoption_baselined is True
-    assert list(broker.store_ctx.iter_live_orders(symbol='BTCUSDT')) == []
+    assert list(broker.store_ctx.iter_live_orders()) == []
     envelopes, _pending = broker.store_ctx.replay()
     assert 'exit1' not in envelopes
 
@@ -749,7 +749,7 @@ def __test_baseline_clamps_inherited_ownership_to_venue__(tmp_path):
     )
     _adopt(broker)
     live = [r.client_order_id
-            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSD')]
+            for r in broker.store_ctx.iter_live_orders()]
     assert live == ['b']                    # 'a' consumed whole (FIFO)
     row = broker.store_ctx.get_order('b')
     assert row.filled_qty == 1.0            # exactly the venue's live size
@@ -772,7 +772,7 @@ def __test_baseline_hedge_clamp_is_per_side_and_noop_when_covered__(tmp_path):
     _seed(broker, 'short1', qty=0.03, filled_qty=0.03, side='sell', exchange_order_id='')
     _adopt(broker)
     live = [r.client_order_id
-            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSDT')]
+            for r in broker.store_ctx.iter_live_orders()]
     assert live == ['long1']
     assert broker.store_ctx.get_order('long1').filled_qty == 0.02
     assert [coid for coid, _ in _clamp_events(broker)] == ['short1']
@@ -813,7 +813,7 @@ def __test_baseline_oneway_clamp_folds_the_sides_first__(tmp_path):
     _adopt(broker)
     assert broker._run_owned_signed_size() == 0.0
     assert [r.client_order_id
-            for r in broker.store_ctx.iter_live_orders(symbol='BTCUSD')] == []
+            for r in broker.store_ctx.iter_live_orders()] == []
     assert __test_helper_fold_events(broker) == ['long1', 'short1']
     assert [coid for coid, _ in _clamp_events(broker)] == ['short1']
 

@@ -490,7 +490,7 @@ class _ReconcileMixin(_BybitBase, ABC):
         checked = self._market_entries_checked
         now_ms = int(epoch_time() * 1000)
         candidates: set[str] = set()
-        for row in list(self.store_ctx.iter_live_orders(symbol=market.symbol)):
+        for row in list(self.store_ctx.iter_live_orders()):
             if ((row.extras or {}).get('kind') != ENTRY_KIND_POSITION
                     or (row.extras or {}).get(ENTRY_REMAINDER_CANCELLED_EXTRA)
                     or row.state in PENDING_DISPATCH_STATES
@@ -534,7 +534,7 @@ class _ReconcileMixin(_BybitBase, ABC):
         """
         if self.store_ctx is None:
             return
-        for row in list(self.store_ctx.iter_live_orders(symbol=market.symbol)):
+        for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
             if (not extras.get(ENTRY_REMAINDER_CANCELLED_EXTRA)
                     or ENTRY_CANCEL_CUM_EXEC_EXTRA in extras
@@ -800,7 +800,7 @@ class _ReconcileMixin(_BybitBase, ABC):
             return []
         return [
             other.client_order_id
-            for other in self.store_ctx.iter_live_orders(symbol=row.symbol)
+            for other in self.store_ctx.iter_live_orders()
             if other.client_order_id != row.client_order_id
             and self._is_settled_position(other)
         ]

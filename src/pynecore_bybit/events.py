@@ -1175,7 +1175,7 @@ class _EventStreamMixin(_BybitBase, ABC):
             net = manager.fold.net_base
             if net > 0 and (market.qty_step <= 0 or float(net) >= market.qty_step):
                 return
-        for row in self.store_ctx.iter_live_orders(symbol=market.symbol):
+        for row in self.store_ctx.iter_live_orders():
             extras = row.extras or {}
             if extras.get('kind') not in (ENTRY_KIND_POSITION,
                                           ENTRY_KIND_WORKING):
