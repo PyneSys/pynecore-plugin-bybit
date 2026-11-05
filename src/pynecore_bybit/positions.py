@@ -74,6 +74,7 @@ from .exceptions import (
     BybitAPIError,
     BybitError,
     BybitPositionDataError,
+    classify_read_error,
     is_benign_trading_stop_reject,
     map_broker_error,
     reject_error,
@@ -1145,7 +1146,20 @@ class _PositionsMixin(_BybitBase, ABC):
         The leg id is the ``positionIdx`` (the address ``close_leg`` and
         ``amend_bracket`` need); ``open_time`` comes from the broker's
         ``createdTime`` so the FIFO order is replay-stable.
+
+        A failed venue read raises the broker taxonomy
+        (:func:`~pynecore_bybit.exceptions.classify_read_error`), never a raw
+        plugin error: the core emulator calls this as the first step of a
+        hedge dispatch, where an untranslated transient fault halts the bot
+        instead of parking the dispatch for a retry.
         """
+        try:
+            return await self._fetch_raw_position_legs(symbol)
+        except BybitError as e:
+            raise classify_read_error(e) from e
+
+    async def _fetch_raw_position_legs(self, symbol: str) -> list[PositionLeg]:
+        """Read and parse the hedge legs of ``symbol`` (untranslated errors)."""
         market = await asyncio.to_thread(self._broker_market)
         if symbol not in (self.symbol, market.symbol):
             return []

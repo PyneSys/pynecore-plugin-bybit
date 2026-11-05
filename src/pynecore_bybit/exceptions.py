@@ -236,6 +236,24 @@ def map_broker_error(exc: BybitAPIError) -> BrokerError | None:
     return None
 
 
+def classify_read_error(exc: BybitError) -> BrokerError:
+    """Map a REST failure on a venue READ into the broker taxonomy.
+
+    Reads are idempotent, so everything transient collapses to
+    :class:`ExchangeConnectionError` (the engine parks the cycle and
+    retries next bar); credential/rate-limit rejects keep their
+    specific classes via :func:`map_broker_error`.
+
+    :param exc: The plugin error the read raised.
+    :return: The broker-taxonomy error to raise in its place.
+    """
+    if isinstance(exc, BybitAPIError):
+        mapped = map_broker_error(exc)
+        if mapped is not None:
+            return mapped
+    return ExchangeConnectionError(str(exc))
+
+
 def reject_error(exc: BybitAPIError) -> ExchangeOrderRejectedError:
     """Build the definitive order-reject for an unmapped trade ``retCode``."""
     return ExchangeOrderRejectedError(str(exc))

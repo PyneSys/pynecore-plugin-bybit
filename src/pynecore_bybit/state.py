@@ -25,10 +25,7 @@ from abc import ABC
 from dataclasses import replace
 from decimal import Decimal
 
-from pynecore.core.broker.exceptions import (
-    ExchangeCapabilityError,
-    ExchangeConnectionError,
-)
+from pynecore.core.broker.exceptions import ExchangeCapabilityError
 from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
@@ -41,10 +38,9 @@ from pynecore.core.plugin import override
 
 from ._base import _BybitBase, _JsonScalar
 from .exceptions import (
-    BybitAPIError,
     BybitConnectionError,
     BybitError,
-    map_broker_error,
+    classify_read_error,
 )
 from .helpers import (
     ACCOUNT_TYPE_UNIFIED,
@@ -395,7 +391,7 @@ class _StateMixin(_BybitBase, ABC):
                     'cursor': cursor,
                 }, auth=True)
             except BybitError as e:
-                raise self._classify_read_error(e) from e
+                raise classify_read_error(e) from e
             out.extend(parse_exchange_order(entry)
                        for entry in result.get('list') or [])
             cursor = result.get('nextPageCursor') or None
@@ -471,7 +467,7 @@ class _StateMixin(_BybitBase, ABC):
                     )
                 return await self._fetch_deriv_position(market)
             except BybitError as e:
-                raise self._classify_read_error(e) from e
+                raise classify_read_error(e) from e
         manager = self._spot_manager
         if manager is None:
             return None
@@ -499,7 +495,7 @@ class _StateMixin(_BybitBase, ABC):
                 'accountType': ACCOUNT_TYPE_UNIFIED,
             }, auth=True)
         except BybitError as e:
-            raise self._classify_read_error(e) from e
+            raise classify_read_error(e) from e
         balances: dict[str, float] = {}
         for account in result.get('list') or []:
             for coin in account.get('coin') or []:
@@ -523,18 +519,3 @@ class _StateMixin(_BybitBase, ABC):
                 if str(entry.get('coin') or '') == coin:
                     return entry
         return {}
-
-    @staticmethod
-    def _classify_read_error(e: BybitError) -> Exception:
-        """Map a REST failure on a state READ into the broker taxonomy.
-
-        Reads are idempotent, so everything transient collapses to
-        :class:`ExchangeConnectionError` (the engine parks the cycle and
-        retries next bar); credential/rate-limit rejects keep their
-        specific classes via :func:`map_broker_error`.
-        """
-        if isinstance(e, BybitAPIError):
-            mapped = map_broker_error(e)
-            if mapped is not None:
-                return mapped
-        return ExchangeConnectionError(str(e))

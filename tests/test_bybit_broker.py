@@ -12,9 +12,11 @@ from time import time as epoch_time
 import pytest
 
 from pynecore.core.broker.exceptions import (
+    AuthenticationError,
     BracketAttachAfterFillRejectedError,
     ClientOrderIdSpentError,
     ExchangeCapabilityError,
+    ExchangeConnectionError,
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -1961,6 +1963,29 @@ def __test_bybit_trading_stop_clear_failure_is_disposition_unknown__():
                 trail_offset=None, coid='coid-attach',
             ))
 
+
+
+def __test_bybit_position_port_read_failure_is_connection_error__():
+    """A failed hedge-leg read parks the dispatch instead of halting the bot"""
+    # Live halt, bybit c370 2026-11-05: a hedge-mode exit modify runs the core
+    # bracket fan-out inside the engine's dispatch bridge, whose first step is
+    # this read; a raw transport fault escaping it halted the run.
+    for response in (BybitConnectionError(
+            "Bybit HTTP transport error on /v5/position/list: Server "
+            "disconnected without sending a response"),
+            {'list': [_position_row(positionIdx=1, size='0.003', side='Buy',
+                                    avgPrice='100000', createdTime='soon')]}):
+        plugin = _linear_plugin(responses=[response])
+        with pytest.raises(ExchangeConnectionError) as raised:
+            asyncio.run(plugin.fetch_raw_positions('BTCUSDT'))
+        assert isinstance(raised.value.__cause__, BybitError)
+
+    # A credential reject keeps its own class (fails loud, no park loop).
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("API key is invalid", ret_code=10003),
+    ])
+    with pytest.raises(AuthenticationError):
+        asyncio.run(plugin.fetch_raw_positions('BTCUSDT'))
 
 def __test_bybit_linear_event_filters_and_flat_sweep__():
     """Category/execType filters and the position-cache flat sweep"""
