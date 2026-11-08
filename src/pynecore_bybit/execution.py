@@ -397,6 +397,29 @@ class _ExecutionMixin(_BybitBase, ABC):
 
     # --- sizing / pre-flight ----------------------------------------------------
 
+    def least_tradable_qty(self, price: float) -> float:
+        """Smallest base quantity one Bybit order can trade at ``price``.
+
+        Inverse: one step of whole USD contracts converted at ``price`` (the
+        book holds base units, the venue whole contracts). Linear: the quantity
+        grid step; a reduce-only order is not held to the minimum order
+        quantity, so the grid is the bound an exit meets. Spot: the least
+        sellable quantity of the inventory port (grid, minimum quantity and
+        minimum notional). ``0.0`` before the instrument is resolved.
+
+        :param price: The price the quantity would trade at.
+        :return: The least tradable quantity in base units.
+        """
+        market = self._market
+        if market is None:
+            return 0.0
+        if market.category == CATEGORY_SPOT:
+            port = self._spot_port
+            return 0.0 if port is None else float(port.position_dust_threshold)
+        if market.is_inverse:
+            return market.qty_step / price if price > 0.0 else 0.0
+        return market.qty_step
+
     @staticmethod
     def _quantize_or_skip(
             market: InstrumentInfo, qty: float, *,

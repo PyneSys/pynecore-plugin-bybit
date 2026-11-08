@@ -1472,7 +1472,7 @@ def __test_bybit_spot_port_min_sellable_floor__():
 def __test_bybit_spot_dust_threshold_is_the_least_sellable_quantity__():
     """The engine books flat what the plugin reports flat: below a sellable sell.
 
-    The inventory compacts a fold below :meth:`min_sellable_base` away, so
+    The inventory compacts a fold below :meth:`~_BybitSpotPort.min_sellable_base` away, so
     the engine's dust threshold must be the same bound; the grid step alone
     took a compacted fee residue for an external close (bybit-spot c313,
     2026-10-18: three 0.00999 brackets over 0.009995 entries left 1.5e-05,
@@ -1487,6 +1487,31 @@ def __test_bybit_spot_dust_threshold_is_the_least_sellable_quantity__():
     # Before a price: the quantity-grid legs, never more.
     plugin._last_price = None
     assert port.position_dust_threshold == Decimal('0.00001')
+
+
+def __test_bybit_least_tradable_qty_per_category__():
+    """The least quantity one order can trade, in the base units the book holds.
+
+    Inverse: one whole USD contract at the fill price (bybit-inverse c340
+    left 1.4e-6 BTC on a leg, under a hundredth of a contract at ~100k).
+    Linear: the quantity grid. Spot: the least sellable quantity.
+    """
+    inverse = _inverse_plugin()
+    assert inverse.least_tradable_qty(100_000.0) == pytest.approx(1e-5)
+    assert inverse.least_tradable_qty(0.0) == 0.0
+    linear = _linear_plugin()
+    assert linear.least_tradable_qty(100_000.0) == pytest.approx(0.001)
+
+    spot = _FakeBrokerBybit()
+    spot._market = _instrument(qty_step_str='0.00001', qty_step=0.00001,
+                               min_order_qty=0.00001, min_order_amt=5.0)
+    assert spot.least_tradable_qty(4000.0) == 0.0, "no inventory port yet"
+    spot._spot_port = spot_port_for(spot, spot._market)
+    spot._last_price = 4000.0
+    assert spot.least_tradable_qty(4000.0) == pytest.approx(0.00125)
+
+    spot._market = None
+    assert spot.least_tradable_qty(4000.0) == 0.0
 
 
 def __test_bybit_spot_fee_residue_below_the_least_sellable_reports_flat__(tmp_path):
