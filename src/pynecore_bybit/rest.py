@@ -2,7 +2,7 @@
 
 Thin signed ``httpx`` client over the Bybit v5 Open API. ``__call__`` runs
 the actual HTTP request synchronously (offline downloads via ``pyne data``
-are synchronous by contract); :meth:`_call` offloads it to a worker thread
+are synchronous by contract); :meth:`_RestMixin._call` offloads it to a worker thread
 for async callers so the network never blocks the event loop — the same
 split the Capital.com plugin uses.
 
@@ -11,8 +11,9 @@ Authentication is HMAC-SHA256 over ``timestamp + api_key + recv_window +
 endpoint is public, but the signer is already wired so the broker mix-ins
 only add endpoints, not transport machinery.
 
-State touched: ``_http_client`` (lazy, connection-pooled), ``_instruments``
-(the per-``(category, symbol)`` rule cache filled by the provider mix-in).
+State touched: ``_http_client`` (lazy, connection-pooled) with its request
+leases (``_http_lock``, ``_http_leases``), ``_instruments`` (the
+per-``(category, symbol)`` rule cache filled by the provider mix-in).
 """
 
 import asyncio
@@ -55,22 +56,38 @@ def _epoch_ms() -> int:
 class _RestMixin(_BybitBase, ABC):
     """REST surface: signed request dispatcher + async wrapper."""
 
-    def _get_http_client(self) -> httpx.Client:
-        """Return the shared ``httpx.Client``, building it on first use.
+    def _lease_http_client(self) -> httpx.Client:
+        """Return the shared ``httpx.Client`` for one request, building it on first use.
 
         Built lazily so plugin discovery / config generation never opens
         sockets. ``httpx.Client`` is thread-safe, so the async wrapper's
         worker threads may share it — connection pooling then works across
-        paged downloads instead of re-handshaking TLS per request.
+        paged downloads instead of re-handshaking TLS per request. Every
+        lease is returned with :meth:`~_RestMixin._release_http_client`, so
+        a retired client is closed only after its last request.
         """
-        client = self._http_client
-        if client is None:
-            client = httpx.Client(
-                base_url=f"https://{self._hosts.rest}",
-                timeout=REST_TIMEOUT_S,
-            )
-            self._http_client = client
-        return client
+        with self._http_lock:
+            client = self._http_client
+            if client is None:
+                client = httpx.Client(
+                    base_url=f"https://{self._hosts.rest}",
+                    timeout=REST_TIMEOUT_S,
+                )
+                self._http_client = client
+            self._http_leases[client] = self._http_leases.get(client, 0) + 1
+            return client
+
+    def _release_http_client(self, client: httpx.Client) -> None:
+        """End one request's lease; close the client if it was retired meanwhile."""
+        with self._http_lock:
+            left = self._http_leases.get(client, 1) - 1
+            if left > 0:
+                self._http_leases[client] = left
+                return
+            self._http_leases.pop(client, None)
+            if client is self._http_client:
+                return
+        client.close()
 
     def __call__(
         self,
@@ -117,8 +134,9 @@ class _RestMixin(_BybitBase, ABC):
             headers = dict(base_headers)
             if auth:
                 headers.update(self._sign_headers(payload or "", recv_window_ms))
+            client = self._lease_http_client()
             try:
-                res = self._get_http_client().request(
+                res = client.request(
                     method_lc.upper(),
                     endpoint,
                     params=query or None,
@@ -127,6 +145,8 @@ class _RestMixin(_BybitBase, ABC):
                 )
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 raise BybitConnectionError(f"Bybit HTTP transport error on {endpoint}: {e}") from e
+            finally:
+                self._release_http_client(client)
             try:
                 envelope = res.json()
             except JSONDecodeError as e:
@@ -218,8 +238,18 @@ class _RestMixin(_BybitBase, ABC):
         }
 
     def _close_http_client(self) -> None:
-        """Close and drop the pooled HTTP client (idempotent)."""
-        client = self._http_client
-        if client is not None:
+        """Drop the pooled HTTP client and close it once no request uses it (idempotent).
+
+        The feed and the broker share the client, and the feed's reconnect
+        retires it while broker reads run in worker threads: closing it at
+        once would close their sockets under them (``ReadError: [Errno 9]
+        Bad file descriptor`` on Linux). A request still holding a lease
+        finishes on the retired client, which its last lease then closes;
+        new requests build a fresh one.
+        """
+        with self._http_lock:
+            client = self._http_client
             self._http_client = None
-            client.close()
+            if client is None or client in self._http_leases:
+                return
+        client.close()

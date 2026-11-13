@@ -156,3 +156,87 @@ def __test_quarantine_latched_during_a_timestamp_retry_refuses_the_retry__() -> 
     with pytest.raises(VenueWritesQuarantinedError):
         plugin("/v5/order/create", method="post", body={"category": "linear"}, auth=True)
     assert [request.method for request in requests] == ["POST"]
+
+
+def __test_helper_plugin(handle) -> Bybit:
+    plugin = Bybit(
+        symbol="ETHPERP",
+        timeframe="1",
+        config=BybitConfig(api_key="demo-key", api_secret="demo-secret", demo=True),
+    )
+    plugin._http_client = httpx.Client(
+        base_url="https://api-demo.bybit.com",
+        transport=httpx.MockTransport(handle),
+    )
+    return plugin
+
+
+def __test_a_close_during_a_request_lets_that_request_finish_on_its_client__() -> None:
+    seen: list[bool] = []
+    holder: list[Bybit] = []
+    clients: list[httpx.Client] = []
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        # The feed's reconnect retires the shared client while this request runs.
+        holder[0]._close_http_client()
+        seen.append(clients[0].is_closed)
+        return httpx.Response(200, json={"retCode": 0, "retMsg": "OK", "result": {"list": []}})
+
+    plugin = __test_helper_plugin(handle)
+    holder.append(plugin)
+    client = plugin._http_client
+    assert client is not None
+    clients.append(client)
+
+    assert plugin("/v5/position/list", {"category": "linear"}, auth=True) == {"list": []}
+
+    assert seen == [False]
+    assert client.is_closed
+    assert plugin._http_client is None
+    assert plugin._http_leases == {}
+
+
+def __test_a_retired_client_closes_only_after_its_last_lease__() -> None:
+    plugin = __test_helper_plugin(lambda _request: httpx.Response(200))
+    first = plugin._lease_http_client()
+    second = plugin._lease_http_client()
+    assert first is second
+
+    plugin._close_http_client()
+    assert not first.is_closed
+    plugin._release_http_client(first)
+    assert not first.is_closed
+    plugin._release_http_client(second)
+    assert first.is_closed
+    assert plugin._http_leases == {}
+
+
+def __test_a_request_after_a_close_builds_a_fresh_client__() -> None:
+    plugin = __test_helper_plugin(lambda _request: httpx.Response(200))
+    retired = plugin._lease_http_client()
+    plugin._close_http_client()
+
+    fresh = plugin._lease_http_client()
+    try:
+        assert fresh is not retired
+        assert plugin._http_client is fresh
+        assert not retired.is_closed
+    finally:
+        plugin._release_http_client(fresh)
+        plugin._release_http_client(retired)
+        plugin._close_http_client()
+    assert retired.is_closed
+    assert fresh.is_closed
+
+
+def __test_an_idle_client_closes_at_once_and_a_live_one_stays_open__() -> None:
+    plugin = __test_helper_plugin(lambda _request: httpx.Response(200))
+    client = plugin._lease_http_client()
+    plugin._release_http_client(client)
+    assert not client.is_closed
+    assert plugin._http_client is client
+
+    plugin._close_http_client()
+    assert client.is_closed
+    assert plugin._http_client is None
+    plugin._close_http_client()

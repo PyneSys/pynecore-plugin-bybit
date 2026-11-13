@@ -14,7 +14,7 @@ table in :mod:`.hosts` encodes that.
 Consumer pattern mirrors the Coinbase plugin: closed bars (and reconnect
 backfill bars) travel through an ordered queue, the forming bar coalesces
 into a single snapshot slot so a busy symbol cannot flood memory, and an
-event wakes :meth:`watch_ohlcv`. A staleness watchdog force-closes the
+event wakes :meth:`_LiveProviderMixin.watch_ohlcv`. A staleness watchdog force-closes the
 transport when even pongs stop arriving; the framework then drives the
 ``disconnect()`` -> ``connect()`` -> ``on_reconnect()`` cycle, and
 ``on_reconnect`` REST-backfills the bars missed while offline.
@@ -113,7 +113,9 @@ class _LiveProviderMixin(_BybitBase, ABC):
         self._data_ready = None
         self._pending_closed = None
         # Drop the pooled HTTP client too: on a final shutdown it must not
-        # linger, and a reconnect cycle only pays one extra TLS handshake.
+        # linger, and a reconnect cycle only pays one extra TLS handshake. The
+        # broker side shares it, so it is closed once the requests still
+        # running on it end.
         self._close_http_client()
 
     @property

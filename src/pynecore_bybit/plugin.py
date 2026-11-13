@@ -17,6 +17,7 @@ maps the Pine base denomination onto whole-USD contracts at dispatch.
 """
 import asyncio
 import os
+import threading
 from pathlib import Path
 
 from ._base import _BybitBase
@@ -102,6 +103,8 @@ class Bybit(
 
         # REST state (built lazily by ``_RestMixin``).
         self._http_client = None
+        self._http_lock = threading.Lock()
+        self._http_leases = {}
 
         # Instrument resolution caches.
         self._instruments = {}

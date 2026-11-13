@@ -6,7 +6,7 @@ from :class:`_BybitBase` so static analysers (PyCharm, pyright) can resolve
 warnings. The class declares:
 
 * Every instance attribute the constructor sets, as a class-level type
-  annotation. The runtime ``__init__`` of the final :class:`Bybit` class
+  annotation. The runtime ``__init__`` of the final :class:`~pynecore_bybit.plugin.Bybit` class
   assigns concrete values; the annotations exist purely for the type
   system.
 
@@ -29,6 +29,7 @@ from pynecore.types.ohlcv import OHLCV
 from .config import BybitConfig
 
 if TYPE_CHECKING:
+    import threading
     from contextlib import AbstractContextManager
     from decimal import Decimal
     from typing import Callable
@@ -111,6 +112,10 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # Pooled HTTP client, built lazily on first request so plugin
     # discovery / config generation never opens sockets.
     _http_client: 'httpx.Client | None'
+    # Guards the client and its leases: the requests running on each client
+    # (a retired one included), so it is closed only after its last request.
+    _http_lock: 'threading.Lock'
+    _http_leases: 'dict[httpx.Client, int]'
 
     # --- Instrument resolution state (provider.py) ---
     # Normalized instrument-rule cache keyed by ``(category, symbol)``,
@@ -431,7 +436,10 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
                     auth: bool = False) -> dict: ...
 
     @abstractmethod
-    def _get_http_client(self) -> 'httpx.Client': ...
+    def _lease_http_client(self) -> 'httpx.Client': ...
+
+    @abstractmethod
+    def _release_http_client(self, client: 'httpx.Client') -> None: ...
 
     @abstractmethod
     def _sign_headers(self, payload: str, recv_window_ms: int) -> dict[str, str]: ...
