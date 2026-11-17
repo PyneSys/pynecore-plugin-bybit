@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     import httpx
 
     from pynecore.core.broker.disappearance import DisappearanceTracker
+    from pynecore.core.broker.parked_dispatch import ParkedDispatchResolver
     from pynecore.core.broker.models import (
         DispatchEnvelope,
         EntryIntent,
@@ -214,11 +215,11 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # the private execution stream (the ledger dedups durably; this saves
     # the store round-trip on the common echo).
     _seen_exec_ids: 'set[str]'
-    # Consecutive conclusive not-found ``orderLinkId`` lookups per parked
-    # ``disposition_unknown`` dispatch (:meth:`_resolve_parked_dispatches`).
-    # In-memory only: a restart re-counts from zero, its startup recovery
-    # pass owns the parked rows there.
-    _parked_lookup_misses: 'dict[str, int]'
+    # The core rule releasing a parked ``disposition_unknown`` dispatch the
+    # venue never accepted (:meth:`_resolve_parked_dispatches`). Its miss
+    # streaks are in memory only: a restart re-counts from zero, its startup
+    # recovery pass owns the parked rows there.
+    _parked_resolver: 'ParkedDispatchResolver'
     # Derivative rows the venue reports more fills for than their
     # ``filled_qty`` cursor holds, keyed by client order id:
     # ``(orderId, venue cumExecQty)`` in the wire domain. Noted from the

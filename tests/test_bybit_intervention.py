@@ -651,6 +651,51 @@ def __test_manual_close_reports_once__(tmp_path):
     assert len(plugin.quarantines) == 1
 
 
+def __test_manual_close_before_the_operator_resume_is_accepted__(tmp_path):
+    # The operator resumed the bot after the close: the backfill of the next
+    # process finds the execution, dated before the resume, and accepts it.
+    plugin = _manual_plugin(tmp_path, "manual-resume")
+    plugin.operator_resume_ts_ms = 1_752_600_001_000
+    _push(plugin, __test_helper_view(size=0, seq=100))
+    events = plugin._backfill_one_execution(
+        _close_exec(createType='CreateByUser'), plugin._market)
+    assert events == []
+    assert plugin.quarantines == []
+    accepted = __test_helper_audits(plugin, 'external_intervention_accepted_by_resume')
+    assert len(accepted) == 1
+    assert accepted[0]['changed_at_ms'] == 1_752_600_000_500
+    # The run's share follows the venue all the same.
+    assert len(__test_helper_audits(plugin, 'own_share_clamped')) == 1
+
+
+def __test_manual_close_order_filling_across_the_resume_reports_the_later_fill__(tmp_path):
+    # One manual close order fills in two parts: the first before the resume
+    # (accepted), the second after it (a new intervention).
+    plugin = _manual_plugin(tmp_path, "manual-across-resume")
+    plugin.operator_resume_ts_ms = 1_752_600_001_000
+    _push(plugin, __test_helper_view(size=0.01, seq=100))
+    plugin._backfill_one_execution(
+        _close_exec(createType='CreateByUser', execQty='0.01', closedSize='0.01'),
+        plugin._market)
+    assert plugin.quarantines == []
+    assert len(__test_helper_audits(plugin, 'external_intervention_accepted_by_resume')) == 1
+    _push(plugin, __test_helper_view(size=0, seq=101))
+    plugin._backfill_one_execution(
+        _close_exec(createType='CreateByUser', execId='m-2', execQty='0.01',
+                    closedSize='0.01', execTime='1752600001500', seq='101'),
+        plugin._market)
+    assert _kinds(plugin) == [QuarantineKind.EXTERNAL_INTERVENTION]
+
+
+def __test_manual_close_after_the_operator_resume_reports__(tmp_path):
+    plugin = _manual_plugin(tmp_path, "manual-after-resume")
+    plugin.operator_resume_ts_ms = 1_752_600_000_000
+    _push(plugin, __test_helper_view(size=0, seq=100))
+    plugin._backfill_one_execution(
+        _close_exec(createType='CreateByUser'), plugin._market)
+    assert _kinds(plugin) == [QuarantineKind.EXTERNAL_INTERVENTION]
+
+
 def __test_manual_close_from_the_backfill_reports__(tmp_path):
     plugin = _manual_plugin(tmp_path, "manual-backfill")
     _push(plugin, __test_helper_view(size=0, seq=100))

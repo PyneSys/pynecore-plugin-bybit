@@ -20,6 +20,8 @@ import os
 import threading
 from pathlib import Path
 
+from pynecore.core.broker.parked_dispatch import ParkedDispatchResolver
+
 from ._base import _BybitBase
 from .config import BybitConfig
 from .events import _EventStreamMixin
@@ -29,7 +31,12 @@ from .live_provider import _LiveProviderMixin
 from .positions import _PositionsMixin
 from .protection import _ProtectionMixin
 from .provider import _ProviderMixin
-from .reconcile import _ReconcileMixin
+from .reconcile import (
+    _PARKED_DISPATCH_GRACE_S,
+    _PARKED_DISPATCH_MISSES_TO_REJECT,
+    _ReconcileMixin,
+    logger as reconcile_logger,
+)
 from .recovery import _RecoveryMixin
 from .rest import _RestMixin
 from .state import _StateMixin
@@ -133,7 +140,11 @@ class Bybit(
         self._broker_start_lock = asyncio.Lock()
         self._order_identity = {}
         self._seen_exec_ids = set()
-        self._parked_lookup_misses = {}
+        self._parked_resolver = ParkedDispatchResolver(
+            venue="Bybit", log=reconcile_logger,
+            grace_s=_PARKED_DISPATCH_GRACE_S,
+            misses_to_reject=_PARKED_DISPATCH_MISSES_TO_REJECT,
+        )
         self._unbooked_fill_orders = {}
         self._market_entries_checked = set()
         self._created_order_ids = set()

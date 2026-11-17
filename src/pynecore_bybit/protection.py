@@ -2451,10 +2451,21 @@ class _ProtectionMixin(_BybitBase, ABC):
             self, idx: int, event: LegEvent, outcome: LegOutcome,
             market: 'InstrumentInfo',
     ) -> None:
-        """Report a user-side execution that took the leg below the run's share."""
+        """Report a user-side execution that took the leg below the run's share.
+
+        The execution's venue time goes along, so a close made before an
+        operator resume is accepted by it: a catch-up read after a restart
+        finds such a close as well. An accepted execution is deduplicated on
+        its own id, not on its order's: a later execution of the same order
+        after the resume is a new intervention and must still be reported.
+        """
         entry = event.entry or {}
         order_id = str(entry.get('orderId') or '') or None
-        key = order_id or event.exec_id
+        changed_at_ms = _parse_ms(entry.get('execTime'))
+        resume_ts_ms = self.operator_resume_ts_ms
+        accepted = (changed_at_ms is not None and resume_ts_ms is not None
+                    and changed_at_ms <= resume_ts_ms)
+        key = event.exec_id if accepted else (order_id or event.exec_id)
         if self.store_ctx is not None:
             self.store_ctx.log_event('own_share_clamped', exchange_order_id=order_id,
                                      payload={'exec_id': event.exec_id,
@@ -2485,6 +2496,7 @@ class _ProtectionMixin(_BybitBase, ABC):
                 'unproven': outcome.doubtful,
             },
             exchange_order_id=order_id,
+            changed_at_ms=changed_at_ms,
         )
 
     def _owned_entry_rows(self) -> list:

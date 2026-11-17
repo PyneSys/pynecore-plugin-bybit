@@ -691,7 +691,7 @@ def __test_parked_not_found_is_rejected_after_consecutive_misses__(tmp_path, cap
     _park_unknown(broker, 'p1')
     _resolve(broker, passes=2)
     assert broker.store_ctx.get_order('p1').state == 'disposition_unknown'
-    assert broker._parked_lookup_misses == {'p1': 2}
+    assert broker._parked_resolver.misses == {'p1': 2}
     with caplog.at_level(logging.WARNING, logger='pynecore_bybit'):
         _resolve(broker)
     row = broker.store_ctx.get_order('p1')
@@ -700,7 +700,7 @@ def __test_parked_not_found_is_rejected_after_consecutive_misses__(tmp_path, cap
     assert 'p1' not in _live_coids(broker)
     assert _resolution_of(broker.store_ctx, 'p1') == 'rejected'
     assert 'p1' in _parked_coids(broker.store_ctx)     # engine consumes + drops it
-    assert broker._parked_lookup_misses == {}
+    assert broker._parked_resolver.misses == {}
     records = [r for r in caplog.records if 'resolved as rejected' in r.getMessage()]
     assert len(records) == 1
     assert 'not found on the venue' in records[0].getMessage()
@@ -728,7 +728,7 @@ def __test_parked_transport_failure_keeps_the_miss_streak__(tmp_path):
     broker.down = True
     _resolve(broker, passes=5)
     assert broker.store_ctx.get_order('p2').state == 'disposition_unknown'
-    assert broker._parked_lookup_misses == {'p2': 2}
+    assert broker._parked_resolver.misses == {'p2': 2}
     assert _resolution_of(broker.store_ctx, 'p2') is None
 
 
@@ -744,7 +744,7 @@ def __test_parked_found_live_resets_the_streak_and_stays_parked__(tmp_path):
     row = broker.store_ctx.get_order('p3')
     assert row.state == 'disposition_unknown'
     assert row.exchange_order_id is None
-    assert broker._parked_lookup_misses == {}
+    assert broker._parked_resolver.misses == {}
     assert _resolution_of(broker.store_ctx, 'p3') is None
 
 
