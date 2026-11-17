@@ -173,24 +173,35 @@ class _Venue(Bybit):
 class _Runner:
     """Mimics the core live loop's consumption of the provider stream.
 
-    Records the closed bars the plugin actually delivered and, separately,
-    the ones the core monotonicity guard had to drop — a non-empty
-    ``dropped`` means the PLUGIN re-served settled history.
+    Socket bars and history bars pass the same closed-bar cursor, as in the
+    core's ``_splice_closed``. Records the closed bars handed on (with their
+    close price), the closed bars the cursor had to drop, and every forming
+    update the plugin delivered.
     """
 
     def __init__(self):
         self.closed: list[int] = []
+        self.closes: dict[int, float] = {}
         self.dropped: list[int] = []
+        self.forming: list[tuple[int, float]] = []
         self.last_confirmed: int | None = None
 
     def feed(self, bar: OHLCV) -> None:
         if not bar.is_closed:
+            self.forming.append((bar.timestamp, bar.close))
             return
         if self.last_confirmed is not None and bar.timestamp <= self.last_confirmed:
             self.dropped.append(bar.timestamp)
             return
         self.last_confirmed = bar.timestamp
         self.closed.append(bar.timestamp)
+        self.closes[bar.timestamp] = bar.close
+
+    async def fill(self, plugin: '_Venue') -> None:
+        """The core's history fill: the closed bars after its own cursor."""
+        assert self.last_confirmed is not None
+        for bar in await plugin.backfill_closed_bars('BTCUSDT', '1', self.last_confirmed):
+            self.feed(bar)
 
 
 async def _drain(plugin: _Venue, runner: _Runner) -> bool:
@@ -212,12 +223,13 @@ async def _drain(plugin: _Venue, runner: _Runner) -> bool:
 
 
 async def _reconnect(plugin: _Venue, runner: _Runner, *, attempts: int = 8) -> int:
-    """Replay the live runner's reconnect loop verbatim.
+    """Replay the live runner's reconnect loop with the core's gap fill.
 
     ``on_disconnect`` -> ``disconnect`` -> ``connect`` -> ``on_reconnect``,
-    retried on any exception. The runner does NOT drain the queue between a
-    failed attempt and the next ``disconnect()`` — that queue is thrown
-    away — so this driver must not drain there either.
+    then the history fill after the runner's cursor before any socket bar
+    is read; a failure anywhere is another attempt. The runner does NOT
+    drain the queue between a failed attempt and the next ``disconnect()``
+    — that queue is thrown away — so this driver must not drain there either.
 
     :return: The number of attempts the reconnect took.
     """
@@ -230,6 +242,7 @@ async def _reconnect(plugin: _Venue, runner: _Runner, *, attempts: int = 8) -> i
         try:
             await plugin.connect()
             await plugin.on_reconnect()
+            await runner.fill(plugin)
         except Exception:  # noqa: BLE001 - "Reconnect failed", next attempt
             continue
         await _drain(plugin, runner)
@@ -261,7 +274,7 @@ async def _start_live(plugin: _Venue, runner: _Runner) -> None:
     assert runner.closed == [_bar(0)]
 
 
-# === (a) Outage bars arrive via backfill, seam stays clean ==================
+# === (a) Outage bars arrive via the history fill, seam stays clean ==========
 
 def __test_bybit_outage_bars_backfilled_in_order__(monkeypatch):
     """Bars that close during an outage are delivered once, in order."""
@@ -286,14 +299,14 @@ def __test_bybit_outage_bars_backfilled_in_order__(monkeypatch):
     _run(scenario, monkeypatch)
 
 
-# === (b) Reconnect backfill re-serving pre-outage bars ======================
+# === (b) History answer re-serving pre-outage bars ==========================
 
 def __test_bybit_backfill_overlap_not_re_emitted__(monkeypatch):
-    """Overlap from the backfill window is dropped by the PLUGIN, not the core.
+    """Overlap in the kline answer is dropped by the PLUGIN, not the core.
 
-    The plugin's contract is the strong one: bars at or before the newest
-    closed bar it already emitted never reach the runner at all, so the
-    core's monotonicity guard never has to fire.
+    ``backfill_closed_bars`` returns only bars strictly after ``since_ms``,
+    so the venue re-serving older bars never reaches the runner and the
+    core's cursor never has to fire.
     """
 
     async def scenario(plugin, runner):
@@ -315,9 +328,10 @@ def __test_bybit_backfill_overlap_not_re_emitted__(monkeypatch):
 def __test_bybit_seam_bar_emitted_exactly_once__(monkeypatch):
     """The bar spanning the reconnect boundary is neither lost nor doubled.
 
-    The re-subscribed stream re-pushes the ``confirm`` snapshot of the last
-    closed bar while the backfill is still in flight; that same bar also
-    comes back from REST. Exactly one copy may reach the runner.
+    The re-subscribed stream pushes the ``confirm`` snapshot of the last
+    closed bar before the history fill runs; that same bar also comes back
+    from REST. The plugin hands both on as they come; the core's closed-bar
+    cursor lets exactly one copy through.
     """
 
     async def scenario(plugin, runner):
@@ -327,17 +341,18 @@ def __test_bybit_seam_bar_emitted_exactly_once__(monkeypatch):
         assert await _drain(plugin, runner)
         plugin.advance_to(3)
 
-        # Hand-driven reconnect so the WS can push mid-backfill.
+        # Hand-driven reconnect so the WS can push before the history fill.
         await plugin.on_disconnect()
         await plugin.disconnect()
         await plugin.connect()
         # Fresh subscription replays bar 2's close before REST answers.
         plugin.ws.push(_bar(2), confirm=True)
         await plugin.on_reconnect()
+        await runner.fill(plugin)
         await _drain(plugin, runner)
 
         assert runner.closed == [_bar(0), _bar(1), _bar(2)]
-        assert runner.dropped == []
+        assert runner.dropped == [_bar(2)]
 
     _run(scenario, monkeypatch)
 
@@ -354,7 +369,7 @@ def __test_bybit_no_bar_lost_across_failed_reconnects__(monkeypatch):
         assert await _drain(plugin, runner)
         plugin.advance_to(5)
         plugin.connect_failures = 2  # attempts 1-2 never open a socket
-        plugin.rest_failures = 1     # attempt 3 dies inside the backfill
+        plugin.rest_failures = 1     # attempt 3 dies inside the history fill
 
         assert await _reconnect(plugin, runner) == 4
         assert runner.closed == [_bar(k) for k in range(5)]
@@ -364,12 +379,11 @@ def __test_bybit_no_bar_lost_across_failed_reconnects__(monkeypatch):
 
 
 def __test_bybit_partial_backfill_page_failure_keeps_gap__(monkeypatch):
-    """A REST failure on the SECOND backfill page loses nothing.
+    """A REST failure on the SECOND kline page loses nothing.
 
-    The first page's bars are already queued and the cursor has advanced
-    past them, but the runner never drains that queue: it goes straight
-    back into ``disconnect()``, which throws the queue away. The cursor
-    must therefore rewind so the retry re-fetches the whole gap.
+    The query raises instead of answering with the first page alone, so
+    the core neither splices a partial gap nor moves its cursor, and the
+    next reconnect round re-fetches the whole gap.
     """
 
     async def scenario(plugin, runner):
@@ -395,8 +409,8 @@ def __test_bybit_drop_at_bar_boundary_delivers_once__(monkeypatch):
     """A bar closing at the very moment of the drop arrives exactly once.
 
     Two variants of the same instant: the ``confirm`` frame slips through
-    just before the socket dies (the backfill must not repeat it), and it
-    does not (the backfill must supply it).
+    just before the socket dies (the history fill must not repeat it), and
+    it does not (the history fill must supply it).
     """
 
     async def confirm_arrived(plugin, runner):
@@ -431,11 +445,11 @@ def __test_bybit_drop_at_bar_boundary_delivers_once__(monkeypatch):
 # === Drop before the stream's first close ===================================
 
 def __test_bybit_gap_after_startup_backfill_only__(monkeypatch):
-    """A drop before the first live close still backfills the gap.
+    """A drop before the first live close still fills the gap.
 
-    The startup-gap query hands the runner every bar up to ``since_ms``;
-    that is the newest closed bar the run holds, so it — not "nothing" —
-    is where a reconnect backfill has to resume from.
+    The socket never delivered a frame, so the plugin holds no cursor; the
+    reconnect fill resumes from the core's, which the startup query left
+    at the warmup's last bar.
     """
 
     async def scenario(plugin, runner):
@@ -462,11 +476,11 @@ def __test_bybit_gap_after_startup_backfill_only__(monkeypatch):
 
 
 def __test_bybit_gap_with_only_a_forming_bar_seen__(monkeypatch):
-    """A drop after only forming ticks still backfills the gap.
+    """A drop after only forming ticks still fills the gap.
 
-    Nothing has closed on the stream yet, so the cursor is unset; the bar
-    seen forming is the first one that can close while offline, and every
-    bar before it came from the warmup history.
+    Nothing has closed on the stream yet; the fill resumes from the core's
+    cursor at the warmup's last bar, and the forming bar seen before the
+    drop comes back as a closed bar from the history.
     """
 
     async def scenario(plugin, runner):
@@ -489,10 +503,52 @@ def __test_bybit_gap_with_only_a_forming_bar_seen__(monkeypatch):
     _run(scenario, monkeypatch)
 
 
+# === Nothing from before the outage leaks into the resumed stream ===========
+
+def __test_bybit_reconnect_forwards_no_pre_outage_state__(monkeypatch):
+    """The resumed stream carries no pre-outage partial and no stale close.
+
+    A forming update of bar 1 is still undelivered when the socket dies; the
+    reconnect must not hand it on, neither as a forming update nor as bar 1's
+    close (bar 1's close is the history's). The fresh subscription then
+    re-pushes bar 0's close and a forming snapshot of the settled bar 0: the
+    plugin drops both itself, since bar 0 is not newer than the newest close
+    it handed on.
+    """
+    partial = 777.0
+
+    async def scenario(plugin, runner):
+        await _start_live(plugin, runner)
+        plugin.ws.push(_bar(1), confirm=False, close=partial)
+        await plugin.ws.die()
+        assert await _drain(plugin, runner)
+        plugin.advance_to(3)
+
+        await plugin.on_disconnect()
+        await plugin.disconnect()
+        await plugin.connect()
+        plugin.ws.push(_bar(0), confirm=True, close=partial)
+        plugin.ws.push(_bar(0), confirm=False, close=partial)
+        assert plugin._update_queue.empty()
+        assert plugin._latest_snapshot is None
+        forming_before = len(runner.forming)
+        await runner.fill(plugin)
+        plugin.ws.push(_bar(3), confirm=False)
+        await _drain(plugin, runner)
+
+        assert runner.closed == [_bar(0), _bar(1), _bar(2)]
+        assert runner.dropped == []
+        assert runner.closes[_bar(1)] == 100.5
+        assert runner.forming[forming_before:] == [(_bar(3), 100.5)]
+        assert all(close != partial for _, close in runner.forming)
+
+    _run(scenario, monkeypatch)
+
+
 # === Sanity: no reconnect, no spurious REST =================================
 
 def __test_bybit_clean_stream_never_backfills__(monkeypatch):
-    """Without a drop the plugin serves the stream alone — no REST at all."""
+    """Without a drop the plugin serves the stream alone — no REST of its own."""
 
     async def scenario(plugin, runner):
         await _start_live(plugin, runner)

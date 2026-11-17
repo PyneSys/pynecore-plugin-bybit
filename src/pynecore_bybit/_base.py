@@ -132,9 +132,9 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # Public market-stream connection. ``None`` until ``connect()`` has run
     # (and again after ``disconnect()`` / a watchdog force-close).
     _public_ws: 'BybitWebSocket | None'
-    # Async queue carrying authoritative ``OHLCV`` events — closed bars and
-    # reconnect-backfill bars in emission order — plus a ``None`` sentinel
-    # when the stream is force-closed so ``watch_ohlcv`` can re-raise.
+    # Async queue carrying the socket's closed bars in emission order, plus a
+    # ``None`` sentinel when the stream is force-closed so ``watch_ohlcv`` can
+    # re-raise.
     # Intra-bar (forming) snapshots do NOT go here; see ``_latest_snapshot``.
     _update_queue: 'asyncio.Queue[OHLCV | None] | None'
     # Coalesced forming-bar snapshot: only the newest intra-bar update
@@ -147,19 +147,11 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     _data_ready: 'asyncio.Event | None'
     # Stale-feed watchdog task. Cancelled on disconnect.
     _watchdog_task: 'asyncio.Task | None'
-    # Most recent closed bar's open timestamp (epoch milliseconds, the unit
-    # both the Bybit kline API and OHLCV records use). Sizes the reconnect
-    # REST backfill window and guards closed-bar duplicates.
+    # Open timestamp of the newest closed bar the socket delivered (epoch
+    # milliseconds, the unit both the Bybit kline API and OHLCV records use).
+    # Kept across reconnects: guards against the venue's re-pushed confirm of
+    # an already-closed bar and its forming re-push of a settled slot.
     _last_closed_bar_ts: int | None
-    # Newest bar open observed on the kline stream, forming bars included.
-    # Until the stream closes its first bar there is no closed-bar cursor,
-    # and this is the only anchor a reconnect backfill has: the bar seen
-    # forming is the first one that can close while offline.
-    _stream_bar_ts: int | None
-    # Holding pen for WS closed bars while a reconnect backfill is pending
-    # (``None`` = no backfill pending). See ``connect()`` for the ordering
-    # invariant it protects.
-    _pending_closed: 'list[OHLCV] | None'
     # Most recent trade price observed on the kline stream (forming or
     # closed bar close). Feeds the spot position mark and the market-order
     # minimum-notional pre-check; ``None`` before the first push.
@@ -466,12 +458,6 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
 
     @abstractmethod
     async def _feed_watchdog_loop(self) -> None: ...
-
-    @abstractmethod
-    async def _backfill_gap(self) -> None: ...
-
-    @abstractmethod
-    def _release_pending_closed(self) -> None: ...
 
     @abstractmethod
     def _enqueue_closed(self, queue: 'asyncio.Queue[OHLCV | None]', bar: OHLCV) -> None: ...

@@ -7,11 +7,12 @@ from datetime import UTC, datetime
 import pytest
 
 from pynecore.core.ohlcv import OHLCVReader
-from pynecore.types.ohlcv import OHLCV
 import pynecore_bybit.live_provider as live_provider_module
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import (
+    BybitAPIError,
     BybitConnectionError,
+    BybitError,
     BybitSymbolError,
     BybitUnsupportedTimeframeError,
 )
@@ -317,7 +318,7 @@ def __test_bybit_download_paging__(tmp_path):
 
 
 def __test_bybit_ws_dispatch__():
-    """Kline pushes: confirm -> queue, forming -> snapshot slot, pending hold"""
+    """Kline pushes: confirm -> queue, forming -> snapshot slot, duplicate drop"""
 
     def _push(ts, confirm, close='101'):
         return {
@@ -350,21 +351,20 @@ def __test_bybit_ws_dispatch__():
         plugin._on_ws_message(_push(60_000, True))
         assert plugin._update_queue.empty()
 
-        # Pending mode (reconnect backfill in flight) holds closed bars back,
-        # then releases them in order after the backfill.
-        plugin._pending_closed = []
-        plugin._on_ws_message(_push(240_000, True))
+        # A close goes on at once, in arrival order, never held back.
+        plugin._on_ws_message(_push(120_000, True))
+        assert plugin._update_queue.get_nowait().timestamp == 120_000
+        # A forming bar NEWER than the close must survive it; the
+        # stale-snapshot clearing only drops same-or-older ones.
+        plugin._on_ws_message(_push(240_000, False))
         plugin._on_ws_message(_push(180_000, True))
-        assert plugin._update_queue.empty()
-        # A forming bar NEWER than every released close must survive the
-        # release; the stale-snapshot clearing only drops same-or-older ones.
-        plugin._on_ws_message(_push(300_000, False))
-        plugin._release_pending_closed()
         assert plugin._update_queue.get_nowait().timestamp == 180_000
-        assert plugin._update_queue.get_nowait().timestamp == 240_000
-        assert plugin._pending_closed is None
-        assert plugin._latest_snapshot is not None
-        assert plugin._latest_snapshot.timestamp == 300_000
+        forming = await plugin.watch_ohlcv('BTCUSDT', '1')
+        assert not forming.is_closed and forming.timestamp == 240_000
+        # A close older than the newest one already handed on is dropped.
+        plugin._on_ws_message(_push(120_000, True))
+        assert plugin._update_queue.empty()
+        assert plugin._last_closed_bar_ts == 180_000
 
         # Sentinel surfacing: watch_ohlcv raises ConnectionError.
         await plugin._on_ws_closed()
@@ -412,6 +412,40 @@ def __test_bybit_ws_stale_forming_repush_is_dropped__():
     assert plugin._latest_snapshot is not None
     assert plugin._latest_snapshot.timestamp == 180_000
     assert plugin._last_price == 101.2
+
+
+def __test_bybit_ws_stale_confirm_repush_keeps_current_price__():
+    """A re-pushed confirm of a settled bar leaves the price cache and the snapshot alone.
+
+    The confirm is dropped from the stream; its close is an old trade, so it
+    must not replace the forming bar's price that the market-order
+    minimum-notional check and the spot position mark read.
+    """
+
+    def _push(ts, confirm, close):
+        return {
+            'topic': 'kline.1.BTCUSDT',
+            'data': [{'start': str(ts), 'open': '100', 'high': '160',
+                      'low': '99', 'close': close, 'volume': '3',
+                      'confirm': confirm}],
+        }
+
+    plugin = _FakeRestBybit(symbol='BTCUSDT', timeframe='1')
+    plugin._update_queue = asyncio.Queue()
+    plugin._data_ready = asyncio.Event()
+
+    plugin._on_ws_message(_push(120_000, True, close='100'))
+    assert plugin._update_queue.get_nowait().timestamp == 120_000
+    plugin._on_ws_message(_push(180_000, False, close='150'))
+    assert plugin._last_price == 150.0
+
+    plugin._on_ws_message(_push(120_000, True, close='100'))
+    plugin._on_ws_message(_push(60_000, True, close='90'))
+    assert plugin._update_queue.empty()
+    assert plugin._last_price == 150.0
+    snapshot = plugin._latest_snapshot
+    assert snapshot is not None and snapshot.timestamp == 180_000
+    assert snapshot.close == 150.0
 
 
 def __test_bybit_ws_close_awaits_tasks__():
@@ -480,89 +514,138 @@ def __test_bybit_ws_open_maps_handshake_parser_errors__(monkeypatch):
     asyncio.run(scenario(ValueError("invalid HTTP status line: garbage")))
 
 
-def __test_bybit_reconnect_backfill__(monkeypatch):
-    """Backfill pages beyond one kline request; a REST failure keeps the gap"""
-    # Freeze the backfill clock mid-minute so a wall-clock minute boundary
-    # during the test cannot open an extra (uncanned) request window.
+def _kline_row(ts):
+    return [str(ts), '100', '101', '99', '100.5', '2.5', '250']
+
+
+def _frozen_minute(monkeypatch) -> int:
+    """Freeze the plugin clock 30 s into the current minute; return the minute's open.
+
+    A wall-clock minute boundary during the test cannot open an extra
+    (uncanned) request window then.
+    """
     now_s = int(datetime.now(UTC).timestamp()) // 60 * 60
     monkeypatch.setattr(live_provider_module, 'epoch_time', lambda: now_s + 30)
-    now = now_s * 1000
+    return now_s * 1000
 
-    def _row(ts):
-        return [str(ts), '100', '101', '99', '100.5', '2.5', '250']
 
-    async def paged_scenario():
-        gap_bars = KLINE_LIMIT + 2
-        last_closed = now - (gap_bars + 1) * 60_000
-        first_window = range(last_closed + 60_000,
-                             last_closed + 60_000 + KLINE_LIMIT * 60_000, 60_000)
-        second_window = range(last_closed + 60_000 + KLINE_LIMIT * 60_000, now, 60_000)
+class _ScriptedRestBybit(_FakeRestBybit):
+    """Canned REST fake whose response list may also hold exceptions to raise."""
 
-        plugin = _FakeRestBybit(
-            [{'list': [_row(ts) for ts in reversed(first_window)]},
-             {'list': [_row(ts) for ts in reversed(second_window)]}],
-            symbol='BTCUSDT', timeframe='1',
-        )
-        plugin._market = _instrument('spot', 'BTCUSDT')
-        plugin._update_queue = asyncio.Queue()
-        plugin._data_ready = asyncio.Event()
-        plugin._last_closed_bar_ts = last_closed
-        plugin._pending_closed = []
+    def __call__(self, endpoint, params=None, *, method='get', body=None, auth=False):
+        response = super().__call__(endpoint, params, method=method, body=body, auth=auth)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
-        await plugin.on_reconnect()
 
-        assert len(plugin.calls) == 2
-        timestamps = []
-        while not plugin._update_queue.empty():
-            timestamps.append(plugin._update_queue.get_nowait().timestamp)
-        assert timestamps == list(range(last_closed + 60_000, now, 60_000))
-        assert plugin._last_closed_bar_ts == now - 60_000
-        assert plugin._pending_closed is None
+def _live_plugin(responses, *, last_closed: int | None) -> _ScriptedRestBybit:
+    """A connected-looking plugin whose stream has closed ``last_closed``."""
+    plugin = _ScriptedRestBybit(responses, symbol='BTCUSDT', timeframe='1')
+    plugin._market = _instrument('spot', 'BTCUSDT')
+    plugin._update_queue = asyncio.Queue()
+    plugin._data_ready = asyncio.Event()
+    plugin._last_closed_bar_ts = last_closed
+    return plugin
 
-    async def failing_scenario():
-        class _FailingRest(_FakeRestBybit):
-            def __call__(self, endpoint, params=None, *, method='get',
-                         body=None, auth=False):
-                raise BybitConnectionError("REST down")
 
-        class _FakeWS:
-            def __init__(self):
-                self.closed = False
+def _stream_state(plugin) -> tuple:
+    """Every piece of plugin state the live stream reads or writes."""
+    queue = plugin._update_queue
+    return (plugin._last_closed_bar_ts, plugin._latest_snapshot, plugin._last_price,
+            None if queue is None else queue.qsize(), plugin._public_ws)
 
-            async def close(self):
-                self.closed = True
 
-        now = int(datetime.now(UTC).timestamp()) // 60 * 60 * 1000
-        plugin = _FailingRest(symbol='BTCUSDT', timeframe='1')
-        plugin._market = _instrument('spot', 'BTCUSDT')
-        plugin._update_queue = asyncio.Queue()
-        plugin._data_ready = asyncio.Event()
-        plugin._last_closed_bar_ts = now - 600_000
-        held = OHLCV(timestamp=now - 60_000, open=100.0, high=101.0, low=99.0,
-                     close=100.5, volume=1.0, is_closed=True)
-        plugin._pending_closed = [held]
-        ws = _FakeWS()
-        plugin._public_ws = ws
+def __test_bybit_backfill_closed_bars_pages_ascending__(monkeypatch):
+    """Closed bars strictly after ``since_ms``, ascending, across request pages.
 
-        # The failure must propagate WITHOUT advancing the closed-bar cursor
-        # or releasing held bars — otherwise the gap would be silently lost
-        # forever. The live runner swallows the on_reconnect error and
-        # resumes watching, so the transport must be force-closed and the
-        # sentinel queued: watch_ohlcv then raises ConnectionError, which
-        # drives the runner into another full reconnect + backfill cycle.
-        with pytest.raises(BybitConnectionError):
-            await plugin.on_reconnect()
-        assert plugin._last_closed_bar_ts == now - 600_000
-        assert plugin._pending_closed is None
-        assert ws.closed and plugin._public_ws is None
-        # The queued sentinel makes the consumer raise, which is what sends
-        # the runner into another full reconnect + backfill cycle.
-        with pytest.raises(ConnectionError):
-            await plugin.watch_ohlcv('BTCUSDT', '1')
-        assert plugin._last_closed_bar_ts == now - 600_000
+    The venue serves each page newest first; the first page re-serves the
+    ``since_ms`` bar itself and the last one carries the still-forming bar.
+    Neither comes back.
+    """
+    now = _frozen_minute(monkeypatch)
+    since = now - (KLINE_LIMIT + 3) * 60_000
+    first_page = range(since, since + (KLINE_LIMIT + 1) * 60_000, 60_000)
+    second_page = range(since + (KLINE_LIMIT + 1) * 60_000, now + 60_000, 60_000)
+    plugin = _live_plugin(
+        [{'list': [_kline_row(ts) for ts in reversed(first_page)]},
+         {'list': [_kline_row(ts) for ts in reversed(second_page)]}],
+        last_closed=None,
+    )
 
-    asyncio.run(paged_scenario())
-    asyncio.run(failing_scenario())
+    bars = asyncio.run(plugin.backfill_closed_bars('BTCUSDT', '1', since))
+
+    assert [b.timestamp for b in bars] == list(range(since + 60_000, now, 60_000))
+    assert all(b.is_closed for b in bars)
+    assert len(plugin.calls) == 2
+    for endpoint, params in plugin.calls:
+        assert endpoint == '/v5/market/kline'
+        assert params['end'] - params['start'] <= (KLINE_LIMIT - 1) * 60_000
+    assert plugin.calls[0][1]['start'] == since + 60_000
+
+
+def __test_bybit_backfill_closed_bars_nothing_closed_yet__(monkeypatch):
+    """With only the forming bar after ``since_ms`` the answer is empty, no request sent."""
+    now = _frozen_minute(monkeypatch)
+    plugin = _live_plugin([], last_closed=None)
+    assert asyncio.run(plugin.backfill_closed_bars('BTCUSDT', '1', now - 60_000)) == []
+    assert plugin.calls == []
+
+
+def __test_bybit_backfill_closed_bars_is_a_pure_query__(monkeypatch):
+    """Repeated calls return the same bars and leave the stream state untouched.
+
+    Holds wherever the stream's own closed-bar cursor stands: unset, behind
+    the query window, or past it.
+    """
+    now = _frozen_minute(monkeypatch)
+    since = now - 4 * 60_000
+    page = {'list': [_kline_row(ts) for ts in range(now, since - 60_000, -60_000)]}
+    for last_closed in (None, since - 60_000, now - 60_000):
+        plugin = _live_plugin([page, page, page], last_closed=last_closed)
+        before = _stream_state(plugin)
+
+        async def scenario():
+            return [await plugin.backfill_closed_bars('BTCUSDT', '1', since)
+                    for _ in range(3)]
+
+        answers = asyncio.run(scenario())
+
+        assert [b.timestamp for b in answers[0]] == [since + 60_000, since + 120_000,
+                                                     since + 180_000]
+        assert answers[1] == answers[0] and answers[2] == answers[0]
+        assert _stream_state(plugin) == before
+
+
+def __test_bybit_backfill_closed_bars_raises_unanswered_query__(monkeypatch):
+    """A request the venue did not answer raises; no partial answer, no state change.
+
+    An empty list would tell the framework the venue has no bar there, and it
+    would go on over a gap it never saw.
+    """
+    now = _frozen_minute(monkeypatch)
+    since = now - (KLINE_LIMIT + 3) * 60_000
+    first_page = {'list': [_kline_row(ts) for ts in
+                           range(since + KLINE_LIMIT * 60_000, since, -60_000)]}
+    cases = {
+        'transport': [BybitConnectionError("REST down")],
+        'venue error': [BybitAPIError("busy", ret_code=10006)],
+        'no bar list': [{}],
+        'second page': [first_page, BybitConnectionError("REST down")],
+    }
+    for name, responses in cases.items():
+        plugin = _live_plugin(responses, last_closed=since)
+        before = _stream_state(plugin)
+        with pytest.raises(BybitError):
+            asyncio.run(plugin.backfill_closed_bars('BTCUSDT', '1', since))
+        assert _stream_state(plugin) == before, name
+        assert plugin._update_queue.empty(), name
+
+
+def __test_bybit_history_attributes__():
+    """The measured venue properties the framework's stream recovery works with."""
+    assert Bybit.history_has_idle_bars is True
+    assert Bybit.history_publish_lag == 3.0
 
 
 def __test_bybit_ohlcv_path__(tmp_path):
