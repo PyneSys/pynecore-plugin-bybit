@@ -184,18 +184,28 @@ def is_trading_stop_level_crossed_reject(exc: BybitAPIError) -> bool:
     return exc.ret_code == 10001 and "base_price" in str(exc)
 
 
+#: Lower-cased ``retMsg`` phrases of a 10001 amend reject whose order already
+#: matches the request (:func:`is_order_amend_unchanged_reject`).
+_AMEND_UNCHANGED_PHRASES = ("order not modified", "order remains unchanged")
+
+
 def is_order_amend_unchanged_reject(exc: BybitAPIError) -> bool:
     """Whether a ``/v5/order/amend`` reject means the order already matches.
 
     Re-sending an order's current price/qty rejects with the GENERIC
-    parameter code 10001 and ``retMsg`` "order not modified" (measured
-    live on the global demo, 2026-08-21, BTCUSD inverse exit amend) —
-    the order-amend equivalent of the trading-stop path's 34040. The
-    amend's goal state already holds, so it is an idempotent success.
-    The code alone is not safe to swallow (10001 also covers genuinely
-    malformed requests), so the message is matched too.
+    parameter code 10001 and a ``retMsg`` saying so: "order not modified"
+    on derivatives (measured live on the global demo, 2026-08-21, BTCUSD
+    inverse exit amend), "The order remains unchanged as the parameters
+    entered match the existing ones." on spot (bybit-spot cycle 454,
+    2026-11-19, an ETHUSDT exit qty that rounds to the live one) — the
+    order-amend equivalent of the trading-stop path's 34040. The amend's
+    goal state already holds, so it is an idempotent success. The code
+    alone is not safe to swallow (10001 also covers genuinely malformed
+    requests), so the message is matched too.
     """
-    return exc.ret_code == 10001 and "order not modified" in str(exc).lower()
+    message = str(exc).lower()
+    return exc.ret_code == 10001 and any(
+        phrase in message for phrase in _AMEND_UNCHANGED_PHRASES)
 
 
 def is_reduce_only_zero_position_reject(exc: BybitAPIError) -> bool:

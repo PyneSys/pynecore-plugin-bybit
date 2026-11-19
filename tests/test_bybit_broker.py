@@ -464,6 +464,19 @@ def __test_bybit_amend_to_current_values_is_an_idempotent_success__():
     assert result == {'orderId': '777'}
     assert plugin.calls[-1][0] == '/v5/order/realtime'
 
+    # Spot words it differently (bybit-spot cycle 454: an exit qty that
+    # rounds to the live one).
+    plugin = _linear_plugin(responses=[
+        BybitAPIError("Bybit API error on /v5/order/amend: retCode=10001 "
+                      "retMsg='The order remains unchanged as the parameters "
+                      "entered match the existing ones.'", ret_code=10001),
+        {'list': [{'orderId': '778', 'orderLinkId': 'c-3'}]},
+    ])
+    result = asyncio.run(plugin._amend_or_none(
+        {'category': 'spot', 'symbol': 'ETHUSDT', 'orderLinkId': 'c-3',
+         'qty': '0.0099975'}, coid='c-3'))
+    assert result == {'orderId': '778'}
+
     plugin = _linear_plugin(responses=[
         BybitAPIError("Bybit API error on /v5/order/amend: retCode=10001 "
                       "retMsg='params error'", ret_code=10001),
