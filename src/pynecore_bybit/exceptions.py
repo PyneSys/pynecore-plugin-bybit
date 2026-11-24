@@ -184,6 +184,18 @@ def is_trading_stop_level_crossed_reject(exc: BybitAPIError) -> bool:
     return exc.ret_code == 10001 and "base_price" in str(exc)
 
 
+#: The conditional-order rejects of a trigger the last price already passed:
+#: 110092 "expect Rising, but trigger_price <= current" (a buy stop), 110093
+#: "expect Falling, but trigger_price >= current" (a sell stop). Measured on
+#: the demo, 2026-11-23, SOLUSDT linear, ``triggerBy=LastPrice``.
+TRIGGER_CROSSED_CODES = frozenset({110092, 110093})
+
+
+def is_trigger_crossed_reject(exc: BybitAPIError) -> bool:
+    """Whether an order create was refused because its trigger is already crossed."""
+    return exc.ret_code in TRIGGER_CROSSED_CODES
+
+
 #: Lower-cased ``retMsg`` phrases of a 10001 amend reject whose order already
 #: matches the request (:func:`is_order_amend_unchanged_reject`).
 _AMEND_UNCHANGED_PHRASES = ("order not modified", "order remains unchanged")

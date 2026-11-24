@@ -214,6 +214,14 @@ class _StateMixin(_BybitBase, ABC):
         - ``short_selling`` UNSUPPORTED — the spot ledger models
           long-only exposure (mutually exclusive with the inventory
           port by core contract).
+        - ``stop_limit_order`` SOFTWARE — a spot conditional order has no
+          trigger direction: the venue takes it from the price at
+          placement, and it accepts a trigger the price already passed
+          (measured on the demo, 2026-11-23, SOLUSDT: a Buy Limit
+          ``orderFilter=StopOrder`` with the trigger below the last price
+          was accepted). A stop the price crosses while the order travels
+          would arm the other way round, waiting for a pullback. The
+          engine's watch triggers it on the chart's last-trade price instead.
 
         **Linear / inverse** — the position-based profile:
         ``reduce_only`` / ``fetch_position`` / ``short_selling`` NATIVE
@@ -226,7 +234,10 @@ class _StateMixin(_BybitBase, ABC):
         (``_execute_exit_trading_stop``), on a hedge account through the
         core one-way emulation's per-leg ``amend_bracket`` replication;
         both arm the trailing immediately (the emulator's activation
-        compromise — ``activePrice`` is not demo-verifiable). Inverse
+        compromise — ``activePrice`` is not demo-verifiable).
+        ``stop_limit_order`` NATIVE: a Pine stop-limit order rests as a
+        conditional Limit order whose trigger direction and last-trade
+        trigger the plugin sets (see the execution mix-in). Inverse
         shares the linear profile: the venue primitives are the same
         endpoints; only the qty denomination differs (whole USD
         contracts — mapped in the execution/positions mix-ins).
@@ -247,9 +258,11 @@ class _StateMixin(_BybitBase, ABC):
                 fetch_position=CapabilityLevel.SOFTWARE,
                 idempotency=CapabilityLevel.NATIVE,
                 short_selling=CapabilityLevel.UNSUPPORTED,
+                stop_limit_order=CapabilityLevel.SOFTWARE,
             )
         return ExchangeCapabilities(
             stop_order=CapabilityLevel.NATIVE,
+            stop_limit_order=CapabilityLevel.NATIVE,
             trailing_stop=CapabilityLevel.NATIVE,
             tp_sl_bracket=CapabilityLevel.SOFTWARE,
             partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,

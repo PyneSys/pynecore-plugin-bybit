@@ -309,46 +309,46 @@ def __test_bybit_execute_entry__():
     assert exc.value.reason == 'below_min_notional'
 
 
-def __test_bybit_both_set_stop_limit_stays_dormant__():
-    """A both-set stop-limit whose limit is marketable rests behind the stop.
+def __test_bybit_stop_limit_rests_as_a_conditional_limit__():
+    """A Pine stop-limit order rests behind its stop on either side of the limit.
 
-    Regression: a Pine ``strategy.entry(stop=, limit=)`` reaches the plugin as
-    a LIMIT entry that still carries the stop. When the limit is on the
-    marketable side (a buy limit at/above the market, a sell limit at/below
-    it), a plain resting limit would fill instantly — before the stop is ever
-    crossed. It must instead be placed as a native conditional (trigger) order
-    at the stop level so it stays dormant until the trigger fires.
+    A Pine ``strategy.entry(stop=, limit=)`` is one stop-limit order: nothing
+    fills before the stop triggers (a pullback to the limit does not open the
+    position), then it is a plain limit. On linear / inverse it goes out as a
+    conditional Limit on the last trade, whatever side of the market the limit
+    is on.
     """
-    # Spot BUY stop-limit: stop 2030.5, limit 2032.43, market 1933.8. The
-    # limit is above the market (marketable) -> conditional StopOrder.
-    plugin = _FakeBrokerBybit(responses=[{'orderId': '701'}])
-    plugin._last_price = 1933.8
-    orders = asyncio.run(plugin.execute_entry(_entry_envelope(
-        side='buy', qty=0.01, order_type=OrderType.LIMIT,
-        stop=2030.5, limit=2032.43,
-    )))
-    _, _, body = plugin.calls[-1]
-    assert body['orderType'] == 'Limit'
-    assert body['price'] == '2032.43'
-    assert body['triggerPrice'] == '2030.5'
-    assert body['orderFilter'] == 'StopOrder'  # spot conditional
-    assert orders[0].id == '701'
-
-    # Linear BUY stop-limit: trigger direction follows the side (rise).
+    # BUY, marketable limit above the stop: triggers on a rise.
     plugin = _linear_plugin(responses=[{'orderId': '702'}])
     plugin._last_price = 1933.8
-    asyncio.run(plugin.execute_entry(_entry_envelope(
+    orders = asyncio.run(plugin.execute_entry(_entry_envelope(
         side='buy', qty=0.01, order_type=OrderType.LIMIT,
         stop=2030.5, limit=2032.4,
     )))
     _, _, body = plugin.calls[-1]
+    assert body['orderType'] == 'Limit'
+    assert body['price'] == '2032.4'
     assert body['triggerPrice'] == '2030.5'
     assert body['triggerDirection'] == 1  # buy triggers on a rise
+    assert body['triggerBy'] == 'LastPrice'
     assert 'orderFilter' not in body
+    assert orders[0].id == '702'
 
-    # Linear SELL stop-limit: stop below the market, limit at/below it ->
-    # marketable -> conditional, triggers on a fall.
+    # BUY, limit BELOW the market (a pullback price): still behind the stop.
     plugin = _linear_plugin(responses=[{'orderId': '703'}])
+    plugin._last_price = 2100.0
+    asyncio.run(plugin.execute_entry(_entry_envelope(
+        side='buy', qty=0.01, order_type=OrderType.LIMIT,
+        stop=2200.0, limit=2000.0,
+    )))
+    _, _, body = plugin.calls[-1]
+    assert body['price'] == '2000'
+    assert body['triggerPrice'] == '2200'
+    assert body['triggerDirection'] == 1
+    assert body['triggerBy'] == 'LastPrice'
+
+    # SELL stop-limit: triggers on a fall.
+    plugin = _linear_plugin(responses=[{'orderId': '704'}])
     plugin._last_price = 2100.0
     asyncio.run(plugin.execute_entry(_entry_envelope(
         side='sell', qty=0.01, order_type=OrderType.LIMIT,
@@ -357,30 +357,66 @@ def __test_bybit_both_set_stop_limit_stays_dormant__():
     _, _, body = plugin.calls[-1]
     assert body['triggerPrice'] == '2000'
     assert body['triggerDirection'] == 2  # sell triggers on a fall
+    assert body['triggerBy'] == 'LastPrice'
 
-    # Non-marketable OCO pullback leg (buy limit below the market) stays a
-    # plain resting limit — no trigger is attached.
-    plugin = _linear_plugin(responses=[{'orderId': '704'}])
-    plugin._last_price = 2100.0
-    asyncio.run(plugin.execute_entry(_entry_envelope(
-        side='buy', qty=0.01, order_type=OrderType.LIMIT,
-        stop=2200.0, limit=2000.0,
-    )))
-    _, _, body = plugin.calls[-1]
-    assert 'triggerPrice' not in body
-    assert 'triggerDirection' not in body
+
+def __test_bybit_spot_stop_limit_is_left_to_the_engine__():
+    """Spot declares the stop-limit SOFTWARE and refuses one sent anyway.
+
+    Measured on the demo (2026-11-23, SOLUSDT): a spot conditional Buy Limit
+    whose trigger is below the last price is accepted, its direction taken
+    from the price at placement — a stop crossed in flight would arm the
+    wrong way round.
+    """
+    plugin = _FakeBrokerBybit(responses=[{'orderId': '701'}])
+    assert plugin.get_capabilities().stop_limit_order is CapabilityLevel.SOFTWARE
+    plugin._last_price = 1933.8
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(plugin.execute_entry(_entry_envelope(
+            side='buy', qty=0.01, order_type=OrderType.LIMIT,
+            stop=2030.5, limit=2032.43,
+        )))
+    assert not plugin.calls
+    linear = _linear_plugin()
+    assert linear.get_capabilities().stop_limit_order is CapabilityLevel.NATIVE
+
+
+@pytest.mark.parametrize("ret_code,side,stop,limit", [
+    (110092, 'buy', 2030.5, 2032.4),
+    (110093, 'sell', 2000.0, 1999.0),
+])
+def __test_bybit_crossed_entry_trigger_reject_flags_level_crossed__(ret_code, side, stop, limit):
+    """110092 / 110093 on an entry: the trigger was already crossed.
+
+    Measured on the demo (2026-11-23, SOLUSDT linear, ``triggerBy=LastPrice``):
+    "expect Rising, but trigger_price <= current" for a buy, "expect Falling,
+    but trigger_price >= current" for a sell. The engine then sends the order
+    as Pine has it by then (a stop-limit as its plain limit).
+    """
+    plugin = _linear_plugin(responses=[BybitAPIError("expect Rising", ret_code=ret_code)])
+    with pytest.raises(ExchangeOrderRejectedError) as exc:
+        asyncio.run(plugin.execute_entry(_entry_envelope(
+            side=side, qty=0.01, order_type=OrderType.LIMIT, stop=stop, limit=limit,
+        )))
+    assert exc.value.level_crossed
+
+
+def __test_bybit_other_entry_reject_is_not_level_crossed__():
+    """Any other definitive entry reject keeps ``level_crossed`` unset."""
+    plugin = _linear_plugin(responses=[BybitAPIError("params error", ret_code=10001)])
+    with pytest.raises(ExchangeOrderRejectedError) as exc:
+        asyncio.run(plugin.execute_entry(_entry_envelope(
+            side='buy', qty=0.01, order_type=OrderType.LIMIT, stop=2030.5, limit=2032.4,
+        )))
+    assert not exc.value.level_crossed
 
 
 def __test_bybit_already_crossed_stop_limit_activates_now__():
-    """An already-crossed stop-limit drops the trigger and goes live at once.
+    """A stop-limit whose stop the chart's last price already reached is a
+    plain limit at once.
 
-    Regression: a Pine ``strategy.entry(stop=, limit=)`` whose stop is already
-    satisfied at submission (a buy stop at/below the current price, a sell stop
-    at/above it) cannot rest behind a native rising/falling trigger — Bybit
-    rejects it with retCode 110092 ("expect Rising, but trigger_price <=
-    current"), which used to loop as a per-tick reject storm. The activated
-    child is the plain marketable limit, so the trigger must be dropped and the
-    limit sent live immediately.
+    In Pine a stop already passed at placement triggers immediately; a native
+    trigger on it would be refused (110092 / 110093).
     """
     # Linear BUY: stop 1939.78 BELOW the market 1941.72 -> already crossed.
     plugin = _linear_plugin(responses=[{'orderId': '751'}])
@@ -408,21 +444,9 @@ def __test_bybit_already_crossed_stop_limit_activates_now__():
     assert 'triggerPrice' not in body
     assert 'triggerDirection' not in body
 
-    # Spot BUY already crossed: plain limit, no StopOrder filter.
-    plugin = _FakeBrokerBybit(responses=[{'orderId': '753'}])
-    plugin._last_price = 1941.72
-    asyncio.run(plugin.execute_entry(_entry_envelope(
-        side='buy', qty=0.01, order_type=OrderType.LIMIT,
-        stop=1939.78, limit=1943.68,
-    )))
-    _, _, body = plugin.calls[-1]
-    assert body['orderType'] == 'Limit'
-    assert 'triggerPrice' not in body
-    assert 'orderFilter' not in body
-
 
 def __test_bybit_both_set_stop_limit_amend_keeps_trigger__():
-    """Amending a dormant stop-limit keeps its trigger in step with the stop."""
+    """Amending a stop-limit before its trigger keeps the trigger in step with the stop."""
     plugin = _linear_plugin(responses=[{'orderId': '801'}])
     plugin._last_price = 1933.8
     old = _entry_envelope(

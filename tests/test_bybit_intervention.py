@@ -3060,13 +3060,14 @@ def __test_foreign_cancel_of_resting_entry_routes_to_the_policy__(tmp_path):
 
 
 def __test_stop_limit_entry_is_not_guarded__(tmp_path):
-    for name, last in (('resting', None), ('dormant', 94000.0)):
+    for name, last, conditional in (('no-price', None, True), ('below-stop', 94000.0, True),
+                                    ('crossed', 97000.0, False)):
         plugin = _InterventionFake(responses=[{'orderId': '700'}, {'orderId': '700'}])
         _attach_store(plugin, tmp_path, f"stop-limit-{name}")
         plugin._last_price = last
         envelope = __test_helper_entry_envelope(limit=95000.0, stop=96000.0)
         asyncio.run(plugin.execute_entry(envelope))
-        assert ('triggerPrice' in plugin.calls[-1][2]) == (name == 'dormant'), name
+        assert ('triggerPrice' in plugin.calls[-1][2]) is conditional, name
         coid = envelope.client_order_id(KIND_ENTRY)
         assert not plugin._protection_guard().known(coid), name
         # No venue view of it is judged, triggered or not.

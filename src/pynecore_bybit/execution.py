@@ -87,7 +87,7 @@ from pynecore.core.broker.exceptions import (
 from pynecore.core.broker.idempotency import (
     KIND_CLOSE,
     KIND_ENTRY,
-    KIND_ENTRY_STOP,
+    KIND_ENTRY_TRIGGERED,
     KIND_EXIT_SL,
     KIND_EXIT_TP,
 )
@@ -129,6 +129,7 @@ from .exceptions import (
     is_order_amend_unchanged_reject,
     is_reduce_only_zero_position_reject,
     is_trading_stop_level_crossed_reject,
+    is_trigger_crossed_reject,
     is_trading_stop_zero_position_reject,
     map_broker_error,
     reject_error,
@@ -316,6 +317,10 @@ class _ExecutionMixin(_BybitBase, ABC):
             mapped = map_broker_error(e)
             if mapped is not None:
                 raise mapped from e
+            if context == "entry" and is_trigger_crossed_reject(e):
+                # A stop or stop-limit entry whose trigger the last trade
+                # already passed: in Pine it is triggered at once.
+                raise ExchangeOrderRejectedError(str(e), level_crossed=True) from e
             raise reject_error(e) from e
         except BybitError as e:
             raise OrderDispositionUnknownError(
@@ -840,50 +845,38 @@ class _ExecutionMixin(_BybitBase, ABC):
             return round_price(intent.stop, market.tick_size_str)
         return None
 
-    def _stop_limit_dormancy_trigger(
+    def _stop_limit_trigger(
             self, intent: EntryIntent, market: InstrumentInfo,
     ) -> Decimal | None:
-        """Trigger price that keeps a both-set stop-limit entry dormant.
+        """The trigger of a Pine stop-limit order, ``None`` when it has none.
 
-        A Pine ``strategy.entry(limit=, stop=)`` reaches this plugin as a
-        ``LIMIT`` entry that still carries the ``stop`` price; the engine arms
-        a software price-watch on the stop side. The native LIMIT leg is only
-        a safe resting order while it is *non-marketable* (the OCO pullback
-        leg: a buy limit below the market, a sell limit above it). When the
-        limit is on the marketable side — a genuine stop-limit whose limit
-        sits at or beyond the current price — a plain resting limit would fill
-        immediately, before the stop is ever crossed, opening the position at
-        the wrong time.
+        The engine sends a stop-limit order with both prices here only on
+        linear / inverse (``stop_limit_order`` NATIVE). It rests as a
+        conditional Limit order that the venue triggers when the last trade
+        reaches the stop (``triggerBy=LastPrice``, the chart's price), and
+        then works as a plain limit — resting at its limit when it cannot
+        fill at once.
 
-        Return the rounded stop level so the caller can place the limit as a
-        native conditional (trigger) order that stays dormant until the stop
-        is crossed. Return ``None`` when the limit rests safely on its own (or
-        the current price is unknown), leaving the plain-limit path untouched.
+        A stop the chart's last price already reached is triggered, so the
+        order goes out as its plain limit at once (``None``). A stop crossed
+        since that price was seen is refused by the venue (110092 / 110093)
+        and the engine sends the plain limit then.
 
-        Also return ``None`` when the stop is ALREADY crossed at submission —
-        a buy stop whose trigger sits at or below the current price, a sell
-        stop at or above it. Bybit refuses such a native trigger outright
-        (retCode 110092: "expect Rising, but trigger_price <= current"), which
-        would otherwise loop as a per-tick reject storm. An already-satisfied
-        stop is equivalent to its activated child: drop the trigger and let the
-        plain (marketable) limit go live immediately, exactly as the venue
-        would after activating the child order.
+        :raises ExchangeOrderRejectedError: For a stop-limit order on spot,
+            where the engine emulates it (a spot conditional order takes its
+            trigger direction from the price at placement).
         """
         if intent.stop is None or intent.limit is None:
             return None
+        if market.category == CATEGORY_SPOT:
+            raise ExchangeOrderRejectedError(
+                f"Bybit spot has no stop-limit order; the engine emulates it "
+                f"(id={intent.pine_id!r})"
+            )
         last = self._last_price
-        if last is None or last <= 0:
-            return None
-        limit = float(intent.limit)
-        marketable = limit >= last if intent.side == 'buy' else limit <= last
-        if not marketable:
-            return None
         stop = float(intent.stop)
-        # A buy trigger rises to the stop, a sell trigger falls to it; the
-        # condition is already met when the current price has reached the
-        # level, so no native trigger can rest — activate the limit now.
-        already_crossed = last >= stop if intent.side == 'buy' else last <= stop
-        if already_crossed:
+        if last is not None and last > 0 and (
+                last >= stop if intent.side == 'buy' else last <= stop):
             return None
         return round_price(intent.stop, market.tick_size_str)
 
@@ -895,14 +888,12 @@ class _ExecutionMixin(_BybitBase, ABC):
 
         A limit entry its limit price, a stop entry its trigger. A market
         entry rests nowhere (``None``). A stop-limit entry — a ``LIMIT``
-        intent that still carries its ``stop`` (see
-        :meth:`_stop_limit_dormancy_trigger`) — is not guarded at all
-        (``None``), neither its levels nor its quantity: a known blind spot,
-        a foreign edit of it goes unseen. Whether it rests as a plain limit
-        or as a dormant conditional one depends on the price at each
-        placement, and the venue's view of a conditional limit order, before
-        and after its trigger fired, is unverified: a guess there would judge
-        the bot's own order as edited.
+        intent that still carries its ``stop`` (a conditional Limit order) —
+        is not guarded at all (``None``), neither its levels nor its
+        quantity: a known blind spot, a foreign edit of it goes unseen. The
+        venue's view of a conditional limit order, before and after its
+        trigger fired, is unverified: a guess there would judge the bot's own
+        order as edited.
         """
         if intent.order_type is OrderType.LIMIT and intent.limit is not None:
             if intent.stop is not None:
@@ -932,7 +923,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         value converts back to base at the same anchor.
         """
         coid = envelope.client_order_id(
-            KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
+            KIND_ENTRY_TRIGGERED if intent.triggered_entry else KIND_ENTRY,
         )
         label = (f"{market.symbol} {intent.side.upper()} entry "
                  f"id={intent.pine_id!r}")
@@ -966,24 +957,13 @@ class _ExecutionMixin(_BybitBase, ABC):
             body['price'] = format_decimal(limit_price)
             body['timeInForce'] = 'GTC'
             price = limit_price
-            # Both-set stop-limit dormancy: a marketable limit would fill
-            # instantly as a plain resting order, before the stop trigger.
-            # Gate it behind a native conditional trigger at the stop level so
-            # it cannot execute until the stop is crossed. The engine's
-            # software STOP watch still owns the OCA cascade; its cancel
-            # disposition gate arbitrates the cross exactly as for a plain
-            # resting limit, so no double-fill race is introduced.
-            dormancy_trigger = self._stop_limit_dormancy_trigger(intent, market)
-            if dormancy_trigger is not None:
-                body['triggerPrice'] = format_decimal(dormancy_trigger)
-                if is_spot:
-                    body['orderFilter'] = 'StopOrder'
-                else:
-                    # A buy stop-limit triggers on a rise to the stop, a sell
-                    # stop-limit on a fall to it.
-                    body['triggerDirection'] = (TRIGGER_DIRECTION_RISE
-                                                if intent.side == 'buy'
-                                                else TRIGGER_DIRECTION_FALL)
+            trigger = self._stop_limit_trigger(intent, market)
+            if trigger is not None:
+                body['triggerPrice'] = format_decimal(trigger)
+                body['triggerBy'] = 'LastPrice'
+                body['triggerDirection'] = (TRIGGER_DIRECTION_RISE
+                                            if intent.side == 'buy'
+                                            else TRIGGER_DIRECTION_FALL)
         else:  # STOP — conditional market entry
             if intent.stop is None:
                 raise ExchangeOrderRejectedError(
@@ -2341,7 +2321,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         old_intent = old.intent
         assert isinstance(old_intent, EntryIntent)
         old_coid = old.client_order_id(
-            KIND_ENTRY_STOP if old_intent.stop_fired_market else KIND_ENTRY,
+            KIND_ENTRY_TRIGGERED if old_intent.triggered_entry else KIND_ENTRY,
         )
         market = await asyncio.to_thread(self._broker_market)
         label = (f"{market.symbol} {intent.side.upper()} entry amend "
@@ -2384,14 +2364,10 @@ class _ExecutionMixin(_BybitBase, ABC):
             limit_price = round_price(intent.limit, market.tick_size_str)
             body['price'] = format_decimal(limit_price)
             price = limit_price
-            # Keep a both-set stop-limit's dormancy trigger in step with the
-            # amended stop. If the order flipped between conditional and plain
-            # (e.g. the limit is no longer marketable), the amend endpoint
-            # rejects the mismatched field and ``_amend_or_none`` falls back to
-            # cancel+recreate, which re-evaluates dormancy cleanly.
-            dormancy_trigger = self._stop_limit_dormancy_trigger(intent, market)
-            if dormancy_trigger is not None:
-                body['triggerPrice'] = format_decimal(dormancy_trigger)
+            # Keep a stop-limit order's trigger in step with the amended stop.
+            trigger = self._stop_limit_trigger(intent, market)
+            if trigger is not None:
+                body['triggerPrice'] = format_decimal(trigger)
         elif intent.order_type is OrderType.STOP and intent.stop is not None:
             body['triggerPrice'] = format_decimal(
                 round_price(intent.stop, market.tick_size_str),
