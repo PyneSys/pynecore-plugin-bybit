@@ -57,6 +57,7 @@ from pynecore.core.broker.models import (
     OrderType,
     PositionLeg,
 )
+from pynecore.core.broker.one_way_emulator import close_leg_row_client_order_id
 from pynecore.core.broker.protection_guard import ProtectionLevels
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
@@ -1150,6 +1151,13 @@ class _PositionsMixin(_BybitBase, ABC):
         ``entry_id``: each exit of the side protects it, and the core merges
         their levels into the one bracket the leg holds.
 
+        A leg's ``qty`` is the run's own share of the venue position
+        (:meth:`_scope_hedge_rows_to_run`). When the venue position is larger
+        — it also holds exposure this run does not own — its size is reported
+        as ``venue_qty``: the trading stop is an attribute of the whole
+        position, so the core then keeps it off the leg and guards the run's
+        share in software.
+
         A failed venue read raises the broker taxonomy
         (:func:`~pynecore_bybit.exceptions.classify_read_error`), never a raw
         plugin error: the core emulator calls this as the first step of a
@@ -1168,7 +1176,12 @@ class _PositionsMixin(_BybitBase, ABC):
             return []
         rows = await self._fetch_position_rows(market)
         self._ingest_position_sizes(rows)
+        # The baseline may report a newer, verified snapshot than the first
+        # read: the venue size comes from the same rows the run's share does.
         rows = await self._apply_adoption_baseline(market, rows)
+        venue_sizes = {
+            self._position_row_index(row): self._position_row_size(row) for row in rows
+        }
         rows = self._scope_hedge_rows_to_run(rows)
         legs: list[PositionLeg] = []
         for row in rows:
@@ -1178,6 +1191,7 @@ class _PositionsMixin(_BybitBase, ABC):
             side = str(row.get('side') or '').lower()
             if side not in ('buy', 'sell'):
                 continue
+            venue_size = venue_sizes.get(self._position_row_index(row), size)
             legs.append(PositionLeg(
                 leg_id=str(self._position_row_index(row)),
                 symbol=symbol,
@@ -1190,6 +1204,7 @@ class _PositionsMixin(_BybitBase, ABC):
                 unrealized_pnl=_wire_float(
                     row.get('unrealisedPnl'), field='unrealisedPnl',
                 ),
+                venue_qty=venue_size if venue_size > size + _FILL_EPS else None,
             ))
         legs.sort(key=lambda leg: leg.open_time)
         return legs
@@ -1242,7 +1257,8 @@ class _PositionsMixin(_BybitBase, ABC):
         # the private stream was down and the execution list had not indexed
         # it a minute later; with no row of its own nothing proved the fill,
         # and the flat venue was cleared as an unexplained external close.
-        emulator_row = self.store_ctx.get_order(coid) if self.store_ctx is not None else None
+        emulator_row = (self.store_ctx.get_order(close_leg_row_client_order_id(coid))
+                        if self.store_ctx is not None else None)
         extras: dict = {'kind': 'close'}
         self._persist_leg_row(
             link_id, market=market, side=side.lower(), qty=qty,
@@ -1307,6 +1323,7 @@ class _PositionsMixin(_BybitBase, ABC):
             tp_price: float | None,
             sl_price: float | None,
             trail_offset: float | None,
+            qty: float,
             coid: str,
     ) -> None:
         """Write the whole bracket of ONE hedge leg.
@@ -1324,17 +1341,19 @@ class _PositionsMixin(_BybitBase, ABC):
         — both benign no-ops (see
         :func:`~pynecore_bybit.exceptions.is_benign_trading_stop_reject`).
 
-        A transport or server-side failure leaves the outcome unknown. On an
-        attach it raises :class:`ExchangeOrderRejectedError`, so the emulator
-        flattens the leg rather than trust it protected. On a clear it raises
-        :class:`OrderDispositionUnknownError`: the emulator's persist-first
-        ``clearing`` row then re-drives the clear on the next sync. A clear is
-        an all-``None`` write, or one sent under the clear id of a ``clearing``
-        ownership row of the leg: retiring one exit while others still own
-        the leg carries their levels
-        (:meth:`~_BybitBase._trading_stop_write_owner`).
+        ``qty`` is unused: the trading stop is written ``tpslMode=Full`` and
+        covers the whole venue position, which is all the core ever asks of
+        this port (``sized_leg_bracket`` is declared ``SOFTWARE``, so a leg
+        that needs less protected never reaches this call).
+
+        A transport or server-side failure leaves the outcome unknown, for an
+        attach as for a clear: the request may have reached the venue and may
+        still take effect. It raises :class:`OrderDispositionUnknownError`;
+        the emulator then writes the leg nothing else until
+        :meth:`bracket_matches` tells it what the leg holds, and repeats the
+        write when the leg does not show it.
         """
-        del side  # Bybit derives the protective side from the leg itself.
+        del side, qty  # Bybit derives the protective side from the leg itself.
         market = await asyncio.to_thread(self._broker_market)
         idx = int(leg_id)
         tp = (round_price(tp_price, market.tick_size_str)
@@ -1359,10 +1378,7 @@ class _PositionsMixin(_BybitBase, ABC):
             float(trail) if trail is not None else None,
         )
         cleared = levels == ProtectionLevels()
-        row_coid, retiring = self._trading_stop_write_owner(leg_id, coid)
-        # A retirement keeps the levels of the exits that still own the leg,
-        # so it is told apart from an attach by its coid, not by its levels.
-        clearing = cleared or retiring
+        row_coid, _retiring = self._trading_stop_write_owner(leg_id, coid)
         write = self._expect_protection(key, levels, row_coid=row_coid)
         try:
             await self._call('/v5/position/trading-stop', method='post',
@@ -1383,18 +1399,10 @@ class _PositionsMixin(_BybitBase, ABC):
                     self._guard_cleared_trading_stop(key, idx)
                 return
             if e.ret_code in AMBIGUOUS_DISPOSITION_CODES:
-                if clearing:
-                    raise OrderDispositionUnknownError(
-                        f"Bybit trading-stop clear on leg {leg_id}: server-side "
-                        f"failure (retCode={e.ret_code}); disposition unknown",
-                        client_order_id=coid, cause=e,
-                    ) from e
-                # Server-side failure — surface as a rejection so the
-                # emulator's attach path runs its defensive flatten instead
-                # of trusting an unprotected leg.
-                raise ExchangeOrderRejectedError(
-                    f"Bybit trading-stop server-side failure on leg {leg_id} "
-                    f"(retCode={e.ret_code})"
+                raise OrderDispositionUnknownError(
+                    f"Bybit trading-stop write on leg {leg_id}: server-side "
+                    f"failure (retCode={e.ret_code}); disposition unknown",
+                    client_order_id=coid, cause=e,
                 ) from e
             mapped = map_broker_error(e)
             if mapped is not None:
@@ -1403,16 +1411,84 @@ class _PositionsMixin(_BybitBase, ABC):
         except BaseException as e:
             self._settle_protection(key, None, write=write)
             if isinstance(e, BybitError):
-                if clearing:
-                    raise OrderDispositionUnknownError(
-                        f"Bybit trading-stop clear on leg {leg_id}: transport "
-                        f"failure; disposition unknown",
-                        client_order_id=coid, cause=e,
-                    ) from e
-                raise ExchangeOrderRejectedError(
-                    f"Bybit trading-stop transport failure on leg {leg_id}: {e}"
+                raise OrderDispositionUnknownError(
+                    f"Bybit trading-stop write on leg {leg_id}: transport "
+                    f"failure; disposition unknown",
+                    client_order_id=coid, cause=e,
                 ) from e
             raise
         self._settle_protection(key, levels, write=write)
         if cleared:
             self._guard_cleared_trading_stop(key, idx)
+
+    async def bracket_matches(
+            self, symbol: str, leg_id: str, *,
+            side: str,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_offset: float | None,
+            qty: float,
+    ) -> bool | None:
+        """Whether hedge leg ``leg_id`` holds exactly the trading stop this amend writes.
+
+        Reads the position row from the venue and compares its ``takeProfit``,
+        ``stopLoss`` and ``trailingStop`` with the amend's levels after the
+        same tick rounding :meth:`amend_bracket` applies. A trailing amend
+        whose take-profit and distance the row holds, but whose ``stopLoss``
+        differs, cannot be told apart: Bybit may have trailed the stop since
+        the write, or the write may never have landed over an earlier stop
+        with the same distance. That case answers ``None``; a differing
+        take-profit or distance is ``False``. A flat or missing row holds
+        nothing and matches no write.
+
+        A failed read raises the broker taxonomy, like
+        :meth:`fetch_raw_positions`.
+        """
+        del side, qty
+        idx = int(leg_id)
+        try:
+            market = await asyncio.to_thread(self._broker_market)
+            if symbol not in (self.symbol, market.symbol):
+                return False
+            rows = await self._fetch_position_rows(market)
+            row = next(
+                (row for row in rows
+                 if self._position_row_index(row) == idx
+                 and self._position_row_size(row) > 0.0),
+                None,
+            )
+            if row is None:
+                return False
+            held = trading_stop_levels(
+                _wire_float(row.get('takeProfit'), field='takeProfit') or None,
+                _wire_float(row.get('stopLoss'), field='stopLoss') or None,
+                _wire_float(row.get('trailingStop'), field='trailingStop') or None,
+            )
+        except BybitError as e:
+            raise classify_read_error(e) from e
+
+        def rounded(level: float | None) -> float | None:
+            return (float(round_price(level, market.tick_size_str))
+                    if level is not None else None)
+
+        wanted = trading_stop_levels(
+            rounded(tp_price), rounded(sl_price), rounded(trail_offset),
+        )
+        tolerance = float(market.tick_size_str) / 2.0
+        if wanted.trailing:
+            if not (held.trailing
+                    and _same_level(held.limit, wanted.limit, tolerance)
+                    and _same_level(held.trail_distance, wanted.trail_distance, tolerance)):
+                return False
+            return True if _same_level(held.stop, wanted.stop, tolerance) else None
+        return (not held.trailing
+                and _same_level(held.limit, wanted.limit, tolerance)
+                and _same_level(held.stop, wanted.stop, tolerance))
+
+
+def _same_level(held: float | None, wanted: float | None, tolerance: float) -> bool:
+    """Whether two optional price levels are both absent or within ``tolerance``."""
+    if held is None or wanted is None:
+        return held is wanted
+    return abs(held - wanted) <= tolerance
+

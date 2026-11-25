@@ -443,11 +443,12 @@ class _RecoveryMixin(_BybitBase, ABC):
 
     async def _order_executions(
             self, market: InstrumentInfo, order_id: str, from_ms: int,
-            until_ms: int | None = None,
+            until_ms: int | None = None, *, order_link_id: str | None = None,
     ) -> tuple[list[dict], bool]:
         """Read every ``Trade`` execution of one order, deduplicated by ``execId``.
 
-        Filtered by ``orderId``, so the read does not depend on any time
+        Filtered by ``orderId`` (or, when ``order_id`` is empty, by
+        ``order_link_id``), so the read does not depend on any time
         watermark: the walk covers contiguous 7-day windows (the endpoint's
         span cap) from ``from_ms`` to the present, or to ``until_ms`` when
         that VENUE-clocked timestamp lies later than the local clock.
@@ -457,7 +458,11 @@ class _RecoveryMixin(_BybitBase, ABC):
             still returned).
         """
         entries: list[dict] = []
-        if not order_id:
+        if order_id:
+            order_filter = {'orderId': order_id}
+        elif order_link_id:
+            order_filter = {'orderLinkId': order_link_id}
+        else:
             return entries, False
         ids: set[str] = set()
         now_ms = int(epoch_time() * 1000)
@@ -472,7 +477,7 @@ class _RecoveryMixin(_BybitBase, ABC):
                     result = await self._call('/v5/execution/list', {
                         'category': market.category,
                         'symbol': market.symbol,
-                        'orderId': order_id,
+                        **order_filter,
                         'startTime': start,
                         'endTime': end,
                         'execType': 'Trade',
@@ -491,7 +496,8 @@ class _RecoveryMixin(_BybitBase, ABC):
                 start = end
         except BybitError as exc:
             logger.warning(
-                "Bybit: execution read failed for order %s: %s", order_id, exc,
+                "Bybit: execution read failed for order %s: %s",
+                order_id or order_link_id, exc,
                 exc_info=traceback_wanted(exc),
             )
             return entries, False

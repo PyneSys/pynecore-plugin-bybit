@@ -72,7 +72,8 @@ are the robustness milestone, mirroring the cTrader plugin's phasing.
 import asyncio
 import logging
 from abc import ABC
-from decimal import Decimal, InvalidOperation
+from collections.abc import Sequence
+from decimal import ROUND_UP, Decimal, InvalidOperation
 from time import time as epoch_time
 from typing import TYPE_CHECKING
 
@@ -137,6 +138,7 @@ from .exceptions import (
 from .helpers import (
     BRACKET_OWN_WIRE_QTY_EXTRA,
     CATEGORY_SPOT,
+    EXECUTION_SINCE_SKEW_MS,
     TRIGGER_DIRECTION_FALL,
     TRIGGER_DIRECTION_RISE,
     base_to_contracts,
@@ -148,6 +150,7 @@ from .helpers import (
     round_price,
     trading_stop_key,
     trading_stop_levels,
+    wire_link_id,
 )
 from .models import InstrumentInfo
 from .positions import HEDGE_IDX_BUY, HEDGE_IDX_SELL, POSITION_MODE_HEDGE
@@ -185,6 +188,14 @@ _DEAD_ORDER_STATUSES = frozenset({
 #: retry (whose original was created at ~the same instant as this
 #: instance's persist-first dispatch row) can never be misread as spent.
 _SPENT_COID_SKEW_MS = 5_000
+
+#: Age (ms since a close send's persist-first row was written) before an
+#: empty venue read settles that send as never received. Bybit books an order
+#: asynchronously, so a POST that landed moments before a crash can be absent
+#: from both order endpoints and the execution list for a while. Same window
+#: as the parked-dispatch resolver's grace for that indexing lag
+#: (``_PARKED_DISPATCH_GRACE_S`` in :mod:`~pynecore_bybit.reconcile`).
+_CLOSE_SEND_VISIBILITY_GRACE_MS = 30_000
 
 #: Row extras flag of a dispatch retired by :meth:`_retire_spent_dispatch`:
 #: the venue order under its ``orderLinkId`` is a prior instance's, never
@@ -344,6 +355,107 @@ class _ExecutionMixin(_BybitBase, ABC):
             if entries:
                 return entries[0]
         return None
+
+    async def close_leg_executed(
+            self, symbol: str, leg_id: str, coids: Sequence[str], since_ms: int,
+    ) -> int | None:
+        """What the reduce-only orders sent under ``coids`` executed, in grid steps.
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` primitive. Each send
+        is settled on its own (:meth:`_close_send_executed`); the answer is the
+        sum of the sends' executed wire quantities, or ``None`` as soon as one
+        send cannot be settled yet.
+        """
+        del symbol, leg_id
+        market = await asyncio.to_thread(self._broker_market)
+        executed = Decimal(0)
+        for coid in coids:
+            send_executed = await self._close_send_executed(market, coid, since_ms)
+            if send_executed is None:
+                return None
+            executed += send_executed
+        step = Decimal(market.qty_step_str)
+        return int((executed / step).to_integral_value(ROUND_UP))
+
+    async def _close_send_executed(
+            self, market: InstrumentInfo, coid: str, since_ms: int,
+    ) -> Decimal | None:
+        """What ONE close send under ``coid`` executed (wire quantity), or ``None``.
+
+        A send is one reduce-only order whose ``orderLinkId`` is the coid's
+        wire form. Its answer is decided from three readings, in this order:
+
+        1. The persist-first row, looked up across every process instance of
+           the run (:meth:`~pynecore.core.broker.storage.RunContext.get_order_for_run_id`),
+           present (this or a prior instance) or absent; it only dates the
+           send. An absent row is a send the retention purge cleaned up (a
+           closed row is purged while the pending close that sent it lives
+           on) or one whose crash came before the row write (then no POST
+           followed). The row's state is never evidence: ``rejected`` is
+           written both for a POST the venue refused and by the parked-
+           dispatch resolver after repeated absent order lookups, which does
+           not prove that the order never landed.
+        2. The order object (:meth:`_confirm_lookup`, open set then history):
+           visible and working, visible and terminal (``Filled`` or one of
+           :data:`_DEAD_ORDER_STATUSES`), not visible, or the read failed.
+           A not-visible order is not working (a live order always appears in
+           the open set): it never reached the venue, or aged out of the
+           documented 24 h history retention of a Cancelled / Rejected order.
+        3. For a not-visible order only, its own executions by ``orderLinkId``
+           from ``since_ms`` on (:meth:`_order_executions`): found, none, or
+           the read failed; and the send's age against
+           :data:`_CLOSE_SEND_VISIBILITY_GRACE_MS`, from the row's write (or
+           ``since_ms`` without a row). Bybit books an order asynchronously,
+           so inside the grace an order that landed just before a crash may
+           be missing from every endpoint.
+
+        Decision table (first matching line wins):
+
+        =================  ============  =======  ===============
+        Order              Executions    Age      Answer
+        =================  ============  =======  ===============
+        read failed        (not read)    any      ``None``
+        visible, working   (not read)    any      ``None``
+        visible, terminal  (not read)    any      ``cumExecQty``
+        not visible        (not read)    inside   ``None``
+        not visible        read failed   past     ``None``
+        not visible        found         past     sum ``execQty``
+        not visible        none          past     ``0``
+        =================  ============  =======  ===============
+
+        The table is the same for every row case (present, prior instance,
+        purged, ``rejected``, never written); the row only sets the age. A
+        POST the venue refused leaves nothing under the id, so it settles as
+        ``0`` once the grace has passed. An order :meth:`_confirm_lookup`
+        reports as a prior instance's (created before this instance's own row
+        of the id) is treated as not visible, and
+        its executions after ``since_ms`` count: per the port contract an
+        over-count is the safe direction. ``None`` means the core sends
+        nothing and asks again on its next sync.
+        """
+        link_id = wire_link_id(coid)
+        row = (self.store_ctx.get_order_for_run_id(link_id)
+               if self.store_ctx is not None else None)
+        order, conclusive = await self._confirm_lookup(market, link_id)
+        if not conclusive:
+            return None
+        if order is not None:
+            status = str(order.get('orderStatus') or '')
+            if status != 'Filled' and status not in _DEAD_ORDER_STATUSES:
+                return None
+            return Decimal(str(order.get('cumExecQty') or '0'))
+        sent_ms = row.created_ts_ms if row is not None else since_ms
+        if int(epoch_time() * 1000) - sent_ms < _CLOSE_SEND_VISIBILITY_GRACE_MS:
+            return None
+        entries, complete = await self._order_executions(
+            market, '', since_ms - EXECUTION_SINCE_SKEW_MS, order_link_id=link_id,
+        )
+        if not complete:
+            return None
+        executed = Decimal(0)
+        for entry in entries:
+            executed += Decimal(str(entry.get('execQty') or '0'))
+        return executed
 
     def _duplicate_original_is_spent(self, coid: str, existing: dict) -> bool:
         """Whether a duplicate-reject original is a spent prior-instance order.

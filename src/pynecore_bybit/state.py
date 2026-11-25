@@ -273,6 +273,11 @@ class _StateMixin(_BybitBase, ABC):
             reduce_only=CapabilityLevel.NATIVE,
             watch_orders=CapabilityLevel.NATIVE,
             fetch_position=CapabilityLevel.NATIVE,
+            # The hedge-leg bracket is the position's ``tpslMode=Full`` trading
+            # stop, which always covers the whole position. A leg that needs
+            # less protected (partly offset, or shared with exposure the run
+            # does not own) is guarded by the core in software.
+            sized_leg_bracket=CapabilityLevel.SOFTWARE,
             idempotency=CapabilityLevel.NATIVE,
             short_selling=CapabilityLevel.NATIVE,
         )

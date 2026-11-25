@@ -28,9 +28,10 @@ the interventions only the plugin can see:
   run holds a share of without a trading stop of the bot's (it protects it
   with order legs, with nothing, or cleared its own stop) is guarded with a
   bare baseline: a TP / SL / trailing stop someone else adds to it changes
-  the bot's protection. The baseline lives on an entry row of the run that
-  holds no other guard record, and moves on when reducing fills net that
-  row away, so it survives a restart. A partial TP/SL order (``Partial*``
+  the bot's protection. The baseline lives on an entry row of the run (in
+  the row's position-scoped guard record, beside the entry order's own),
+  and moves on when reducing fills net that row away, so it survives a
+  restart. A partial TP/SL order (``Partial*``
   ``stopOrderType``; the bot never places one) resting on the run's
   position is reported when it covers the run's share — once the evidence
   covers its creation: a position view taken after it, executions that
@@ -94,6 +95,7 @@ from pynecore.core.broker.idempotency import (
 )
 from pynecore.core.broker.models import LegType
 from pynecore.core.broker.protection_guard import (
+    POSITION_PROTECTION_LEVELS_EXTRA,
     PROTECTION_LEVELS_EXTRA,
     ProtectionLevelGuard,
     ProtectionLevels,
@@ -117,6 +119,7 @@ from .helpers import (
     CATEGORY_SPOT,
     ENTRY_NETTED_QTY_EXTRA,
     OWN_ORDER_QTYS_EXTRA,
+    TRADING_STOP_KEY_PREFIX,
     execution_sort_key,
     exit_leg_levels,
     trading_stop_key,
@@ -311,13 +314,20 @@ class _ProtectionMixin(_BybitBase, ABC):
     # --- guard plumbing -------------------------------------------------------
 
     def _protection_guard(self) -> ProtectionLevelGuard:
-        """The plugin's protection guard, built once the journal is known."""
+        """The plugin's protection guard, built once the journal is known.
+
+        A trading stop is a position protection: its record persists in a
+        row's position-scoped slot, so an entry row still resting as an order
+        (a partially filled limit or stop entry, its own levels guarded) can
+        hold it too.
+        """
         guard = self._protection_guard_instance
         if guard is None or self._protection_guard_store is not self.store_ctx:
             guard = ProtectionLevelGuard(
                 self._report_protection_change,
                 store_ctx=self.store_ctx,
                 clock=epoch_time,
+                position_scoped=lambda key: key.startswith(TRADING_STOP_KEY_PREFIX),
             )
             self._protection_guard_instance = guard
             self._protection_guard_store = self.store_ctx
@@ -537,9 +547,9 @@ class _ProtectionMixin(_BybitBase, ABC):
         is all-``None`` only when none is left.
 
         The levels persist on one of the run's own entry rows of the
-        protected side when one may hold them
-        (:meth:`_bare_baseline_row_coid`): such a row lives as long as the
-        run's position, while an ownership row can be released without any
+        protected side carrying exposure (:meth:`_bare_baseline_row_coid`),
+        a partially filled entry still resting included: such a row lives as
+        long as the run's position, while an ownership row can be released without any
         write reaching the plugin — the core skips a retirement whose merged
         levels equal the ones the leg already holds, and releases the
         retiring row all the same. Without such an entry row a retirement's
@@ -633,11 +643,13 @@ class _ProtectionMixin(_BybitBase, ABC):
         bot cleared (:meth:`_guard_cleared_trading_stop`), or one whose
         ownership row closed while the run still holds the position
         (:meth:`_home_trading_stop`) live on one of the run's own entry rows
-        of the position side. A row holds one guard record only, so the row
-        must carry no other: an entry still resting (an unfilled remainder)
-        carries its own limit or trigger under its own key. Of the rows
-        left, the one already holding ``key``, else the newest: reducing
-        fills net the entry rows oldest first, so it lives the longest.
+        of the position side carrying exposure, a partially filled entry
+        still resting included: the record lives in the row's
+        position-scoped slot, beside the entry order's own limit or trigger,
+        and the row outlives the order (a cancelled remainder leaves it
+        owning the executed exposure). Of those rows, the one already holding
+        ``key``, else the newest: reducing fills net the entry rows oldest
+        first, so it lives the longest.
 
         :return: ``None`` when no such row exists: the levels stay where they
             are (in memory only until :meth:`_home_trading_stop` finds one).
@@ -645,22 +657,20 @@ class _ProtectionMixin(_BybitBase, ABC):
         rows = [row for row in self._owned_entry_rows()
                 if row.side == side and self._bare_home_eligible(row, key)]
         for row in rows:
-            saved = (row.extras or {}).get(PROTECTION_LEVELS_EXTRA)
+            saved = (row.extras or {}).get(POSITION_PROTECTION_LEVELS_EXTRA)
             if isinstance(saved, dict) and saved.get('key') == key:
                 return row.client_order_id
         rows.sort(key=lambda item: item.created_ts_ms)
         return rows[-1].client_order_id if rows else None
 
-    def _bare_home_eligible(self, row: 'OrderRow', key: str) -> bool:
-        """Whether entry row ``row`` may hold the guard record of trading stop ``key``."""
-        market = self._market
-        tolerance = self._qty_tolerance(market) if market is not None else _FILL_EPS
-        if float(row.qty) - float(row.filled_qty) > tolerance:
-            return False
-        saved = (row.extras or {}).get(PROTECTION_LEVELS_EXTRA)
-        if saved is not None and not (isinstance(saved, dict) and saved.get('key') == key):
-            return False
-        return not self._protection_guard().known(row.client_order_id)
+    @staticmethod
+    def _bare_home_eligible(row: 'OrderRow', key: str) -> bool:
+        """Whether entry row ``row`` may hold the guard record of trading stop ``key``.
+
+        Its position-scoped slot is free or holds ``key`` already.
+        """
+        saved = (row.extras or {}).get(POSITION_PROTECTION_LEVELS_EXTRA)
+        return saved is None or (isinstance(saved, dict) and saved.get('key') == key)
 
     def _home_trading_stop(self, key: str, idx: int) -> None:
         """Keep the guarded levels of trading stop ``key`` on a live journal row.
@@ -685,7 +695,7 @@ class _ProtectionMixin(_BybitBase, ABC):
             return
         owned = {row.client_order_id for row in self._owned_entry_rows() if row.side == side}
         for row in self.store_ctx.iter_live_orders():
-            saved = (row.extras or {}).get(PROTECTION_LEVELS_EXTRA)
+            saved = (row.extras or {}).get(POSITION_PROTECTION_LEVELS_EXTRA)
             if not (isinstance(saved, dict) and saved.get('key') == key):
                 continue
             if row.state == STATE_BRACKET_OWN or (
@@ -1347,9 +1357,11 @@ class _ProtectionMixin(_BybitBase, ABC):
             return
         flagged = False
         for row in self.store_ctx.iter_live_orders():
-            saved = (row.extras or {}).get(PROTECTION_LEVELS_EXTRA)
-            if isinstance(saved, dict) and saved.get('rebaseline'):
-                flagged = True
+            for extra in (PROTECTION_LEVELS_EXTRA, POSITION_PROTECTION_LEVELS_EXTRA):
+                saved = (row.extras or {}).get(extra)
+                if isinstance(saved, dict) and saved.get('rebaseline'):
+                    flagged = True
+            if flagged:
                 break
         if not flagged:
             return

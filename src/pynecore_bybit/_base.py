@@ -30,6 +30,7 @@ from .config import BybitConfig
 
 if TYPE_CHECKING:
     import threading
+    from collections.abc import Sequence
     from contextlib import AbstractContextManager
     from decimal import Decimal
     from typing import Callable
@@ -511,7 +512,7 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     @abstractmethod
     async def _order_executions(
             self, market: 'InstrumentInfo', order_id: str, from_ms: int,
-            until_ms: int | None = None,
+            until_ms: int | None = None, *, order_link_id: str | None = None,
     ) -> 'tuple[list[dict], bool]': ...
 
     @abstractmethod
@@ -592,6 +593,11 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     ) -> None: ...
 
     @abstractmethod
+    async def close_leg_executed(
+            self, symbol: str, leg_id: str, coids: 'Sequence[str]', since_ms: int,
+    ) -> int | None: ...
+
+    @abstractmethod
     async def reject_out_of_range(
             self, envelope: 'DispatchEnvelope', qty: float,
     ) -> None: ...
@@ -608,8 +614,19 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
             tp_price: float | None,
             sl_price: float | None,
             trail_offset: float | None,
+            qty: float,
             coid: str,
     ) -> None: ...
+
+    @abstractmethod
+    async def bracket_matches(
+            self, symbol: str, leg_id: str, *,
+            side: str,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_offset: float | None,
+            qty: float,
+    ) -> bool | None: ...
 
     # --- Execution internals (execution.py) ---
     @abstractmethod

@@ -37,7 +37,16 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.idempotency import KIND_ENTRY
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
-from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, ENTRY_KIND_WORKING
+from pynecore.core.broker.one_way_emulator import close_leg_attempt_client_order_id
+from pynecore.core.broker.parked_dispatch import (
+    ParkedDispatchResolver, ParkedOutcome, ParkedVerdict,
+)
+from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
+    create_close_leg_row,
+    mark_rejected,
+)
 
 import pynecore_bybit.events as events_module
 import pynecore_bybit.execution as execution_module
@@ -53,6 +62,7 @@ from pynecore_bybit.helpers import (
     format_decimal,
     quantize_qty,
     round_price,
+    wire_link_id,
 )
 from pynecore_bybit.inventory import spot_port_for
 from pynecore_bybit.models import InstrumentInfo
@@ -658,6 +668,313 @@ def _attach_store(plugin, tmp_path, name: str) -> None:
         account_id=f"dup-{name}",
     )
     plugin.store_ctx = store.open_run(identity, script_source="// dup")
+
+
+def __test_bybit_close_leg_executed_reads_every_send_of_the_close__(tmp_path, monkeypatch):
+    """A leg close's executed volume comes from each send's own order.
+
+    The restart replay re-sends only what this reports unexecuted, so it must
+    sum every terminal order of the close, count a send that never reached
+    the wire (no persist-first row) or was rejected as nothing, settle a send
+    found in neither order endpoint from its own executions, and refuse to
+    answer while any send is still working or a read failed.
+    """
+    plugin = _linear_plugin(responses=[{'orderId': '701'}, {'orderId': '702'}])
+    _attach_store(plugin, tmp_path, "close-executed")
+    first = 't3st-0a1b2c3d-0sgls2iio-c0:1'
+    second = close_leg_attempt_client_order_id(first, 1)
+    unsent = close_leg_attempt_client_order_id(first, 2)
+    create_close_leg_row(
+        plugin.store_ctx, coid=first, symbol='BTCUSDT', side='sell', qty=0.004,
+        intent_key='Long', pine_entry_id='Long', parent_close_coid='t3st-0a1b2c3d-0sgls2iio-c0',
+        leg_id='1', leg_volume=4, leg_pre_volume=10,
+    )
+    asyncio.run(plugin.close_leg('BTCUSDT', '1', 4, first))
+    asyncio.run(plugin.close_leg('BTCUSDT', '1', 3, second))
+    # The re-send's own row belongs to the same close.
+    assert plugin.store_ctx.get_order(wire_link_id(second)).intent_key == 'Long'
+    orders: dict[str, tuple[dict | None, bool]] = {
+        wire_link_id(first): ({'orderStatus': 'PartiallyFilledCanceled', 'cumExecQty': '0.001'}, True),
+        wire_link_id(second): ({'orderStatus': 'Filled', 'cumExecQty': '0.003'}, True),
+        wire_link_id(unsent): (None, True),
+    }
+
+    executions: dict[str, tuple[list[dict], bool]] = {wire_link_id(unsent): ([], True)}
+    # Every send's row is past the visibility grace, so an empty read settles it.
+    aged_now = epoch_time() + execution_module._CLOSE_SEND_VISIBILITY_GRACE_MS / 1000 + 1
+    monkeypatch.setattr(execution_module, 'epoch_time', lambda: aged_now)
+
+    async def lookup(_market, link_id):
+        return orders[link_id]
+
+    async def order_executions(_market, order_id, _from_ms, until_ms=None, *,
+                               order_link_id=None):
+        assert order_id == '' and until_ms is None
+        return executions[order_link_id]
+
+    monkeypatch.setattr(plugin, '_confirm_lookup', lookup)
+    monkeypatch.setattr(plugin, '_order_executions', order_executions)
+
+    def executed() -> int | None:
+        return asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [first, second, unsent], 0))
+
+    assert executed() == 4
+    orders[wire_link_id(second)] = ({'orderStatus': 'PartiallyFilled', 'cumExecQty': '0.001'}, True)
+    assert executed() is None
+    # Found in neither endpoint: not working, so its own executions settle it.
+    orders[wire_link_id(second)] = (None, True)
+    executions[wire_link_id(second)] = ([{'execQty': '0.002'}, {'execQty': '0.001'}], True)
+    assert executed() == 4
+    executions[wire_link_id(second)] = ([], True)
+    assert executed() == 1
+    executions[wire_link_id(second)] = ([{'execQty': '0.003'}], False)
+    assert executed() is None
+    orders[wire_link_id(second)] = (None, False)
+    assert executed() is None
+    # A refused POST leaves nothing under the id: the venue settles it as 0.
+    orders[wire_link_id(second)] = (None, True)
+    executions[wire_link_id(second)] = ([], True)
+    mark_rejected(plugin.store_ctx, coid=wire_link_id(second))
+    assert executed() == 1
+
+
+def __test_bybit_close_leg_executed_reads_a_send_the_parked_resolver_rejected__(
+        tmp_path, monkeypatch):
+    """A ``rejected`` row is not proof that the close never executed.
+
+    The parked-dispatch resolver also writes ``rejected`` after three
+    absent order lookups of a send whose disposition was unknown. When the
+    order then shows up filled at Bybit, its execution must count; read as
+    0 from the row state alone, the replay would reduce the leg twice.
+    """
+    plugin = _linear_plugin()
+    _attach_store(plugin, tmp_path, "close-parked")
+    coid = 't3st-0a1b2c3d-0sgls2iio-c0:1'
+    link_id = wire_link_id(coid)
+
+    async def lost_reply(*_args, **_kwargs):
+        raise OrderDispositionUnknownError("reply lost", client_order_id=link_id)
+
+    plugin._order_post = lost_reply
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(plugin.close_leg('BTCUSDT', '1', 4, coid))
+    aged_now = epoch_time() + execution_module._CLOSE_SEND_VISIBILITY_GRACE_MS / 1000 + 1
+    resolver = ParkedDispatchResolver(venue="Bybit", log=logging.getLogger(__name__),
+                                      clock=lambda: aged_now)
+
+    async def absent(_row):
+        return ParkedVerdict(ParkedOutcome.ABSENT)
+
+    for _ in range(3):
+        asyncio.run(resolver.resolve(plugin.store_ctx, absent))
+    row = plugin.store_ctx.get_order_for_run_id(link_id)
+    assert row is not None and row.state == 'rejected'
+
+    async def call(endpoint, params, *, auth=False):
+        assert params.get('orderLinkId') == link_id
+        if endpoint == '/v5/order/history':
+            return {'list': [{'orderId': '931', 'orderLinkId': link_id,
+                              'orderStatus': 'Filled', 'cumExecQty': '0.004',
+                              'createdTime': str(row.created_ts_ms)}]}
+        return {'list': [], 'nextPageCursor': ''}
+
+    plugin._call = call
+    monkeypatch.setattr(execution_module, 'epoch_time', lambda: aged_now)
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], 0)) == 4
+
+
+
+class __test_helper_Crash(BaseException):
+    """A process death between two statements: no ``except Exception`` runs."""
+
+
+def __test_bybit_close_leg_executed_settles_a_send_the_crash_kept_off_the_wire__(
+        tmp_path, monkeypatch):
+    """A crash between the persist-first row and the POST leaves a real row
+    for an order Bybit never received.
+
+    The order is in neither order endpoint and has no execution, so once the
+    visibility grace has passed the send executed nothing: the answer must be
+    ``0`` (the replay re-sends the close under a new id), never ``None``
+    forever, which would stall the replay while the leg has not shrunk.
+    """
+    plugin = _linear_plugin()
+    _attach_store(plugin, tmp_path, "close-crash")
+    coid = 't3st-0a1b2c3d-0sgls2iio-c0:1'
+    link_id = wire_link_id(coid)
+
+    async def crash(*_args, **_kwargs):
+        raise __test_helper_Crash()
+
+    plugin._order_post = crash
+    with pytest.raises(__test_helper_Crash):
+        asyncio.run(plugin.close_leg('BTCUSDT', '1', 4, coid))
+    row = plugin.store_ctx.get_order(link_id)
+    assert row is not None and row.closed_ts_ms is None
+    reads: list[tuple[str, dict]] = []
+
+    async def call(endpoint, params, *, auth=False):
+        assert auth
+        reads.append((endpoint, dict(params)))
+        return {'list': [], 'nextPageCursor': ''}
+
+    plugin._call = call
+    since_ms = int(epoch_time() * 1000) - 5_000
+    aged_now = epoch_time() + execution_module._CLOSE_SEND_VISIBILITY_GRACE_MS / 1000 + 1
+    monkeypatch.setattr(execution_module, 'epoch_time', lambda: aged_now)
+    executed = asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], since_ms))
+    assert executed == 0
+    execution_reads = [params for endpoint, params in reads
+                       if endpoint == '/v5/execution/list']
+    assert execution_reads
+    assert all(params['orderLinkId'] == link_id and 'orderId' not in params
+               for params in execution_reads)
+
+    async def failing(endpoint, params, *, auth=False):
+        if endpoint == '/v5/execution/list':
+            raise BybitError("transport")
+        return {'list': []}
+
+    plugin._call = failing
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], since_ms)) is None
+
+
+def __test_bybit_close_leg_executed_reads_a_send_closed_by_the_prior_instance__(tmp_path):
+    """A send that filled before the crash keeps its closed row in the prior
+    instance; the restarted instance must still count what it executed.
+
+    Read from the current instance only, the row is missing and the send
+    counts as never sent: with the leg replenished by another fill, the
+    replay would send the completed reduction again.
+    """
+    plugin = _linear_plugin(responses=[{'orderId': '901'}])
+    store = BrokerStore(tmp_path / "close-prior.sqlite", plugin_name=plugin.plugin_name)
+    identity = RunIdentity(
+        strategy_id="dup", symbol=plugin._market.symbol, timeframe="1",
+        account_id="dup-close-prior",
+    )
+    plugin.store_ctx = store.open_run(identity, script_source="// dup")
+    coid = 't3st-0a1b2c3d-0sgls2iio-c0:1'
+    link_id = wire_link_id(coid)
+    asyncio.run(plugin.close_leg('BTCUSDT', '1', 4, coid))
+    plugin.store_ctx.close_order(link_id)
+    plugin.store_ctx.close()
+    plugin.store_ctx = store.open_run(identity, script_source="// dup")
+    assert plugin.store_ctx.get_order(link_id) is None
+
+    async def call(endpoint, params, *, auth=False):
+        assert params.get('orderLinkId') == link_id
+        if endpoint == '/v5/order/history':
+            return {'list': [{'orderId': '901', 'orderLinkId': link_id,
+                              'orderStatus': 'Filled', 'cumExecQty': '0.004',
+                              'createdTime': '1000000000000'}]}
+        return {'list': []}
+
+    plugin._call = call
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], 0)) == 4
+
+
+def __test_bybit_close_leg_executed_reads_a_send_whose_row_the_retention_purged__(tmp_path):
+    """The retention purge removes a send's closed row while the pending close
+    that sent it lives on.
+
+    The missing row does not prove the send never reached the wire: the
+    venue still holds the filled order, so it must be asked, and its
+    execution counted. Counted as never sent, the replay of a replenished leg
+    would send the completed reduction again.
+    """
+    plugin = _linear_plugin(responses=[{'orderId': '911'}])
+    store = BrokerStore(tmp_path / "close-purged.sqlite", plugin_name=plugin.plugin_name)
+    plugin.store_ctx = store.open_run(RunIdentity(
+        strategy_id="dup", symbol=plugin._market.symbol, timeframe="1",
+        account_id="dup-close-purged",
+    ), script_source="// dup")
+    coid = 't3st-0a1b2c3d-0sgls2iio-c0:1'
+    link_id = wire_link_id(coid)
+    asyncio.run(plugin.close_leg('BTCUSDT', '1', 4, coid))
+    plugin.store_ctx.close_order(link_id)
+    store._conn.execute("UPDATE orders SET closed_ts_ms = 1 WHERE client_order_id = ?",
+                        (link_id,))
+    assert store.cleanup_old_data() > 0
+    assert plugin.store_ctx.get_order_for_run_id(link_id) is None
+    reads: list[str] = []
+
+    async def call(endpoint, params, *, auth=False):
+        assert params.get('orderLinkId') == link_id
+        reads.append(endpoint)
+        if endpoint == '/v5/order/history':
+            return {'list': [{'orderId': '911', 'orderLinkId': link_id,
+                              'orderStatus': 'Filled', 'cumExecQty': '0.004',
+                              'createdTime': '1000000000000'}]}
+        return {'list': []}
+
+    plugin._call = call
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], 0)) == 4
+    assert '/v5/order/history' in reads
+
+
+def __test_bybit_close_leg_executed_waits_for_a_send_the_venue_has_not_indexed__(
+        tmp_path, monkeypatch):
+    """A crash right after the POST leaves a row whose order Bybit booked but
+    has not indexed yet (order placement is asynchronous).
+
+    Every read is empty at first. Settling the send as unsent then would let
+    the replay send a second close while the first one fills, so within the
+    visibility grace the answer is ``None``; once the order is visible, its
+    fill counts.
+    """
+    plugin = _linear_plugin()
+    _attach_store(plugin, tmp_path, "close-lag")
+    coid = 't3st-0a1b2c3d-0sgls2iio-c0:1'
+    link_id = wire_link_id(coid)
+
+    async def crash(*_args, **_kwargs):
+        raise __test_helper_Crash()
+
+    plugin._order_post = crash
+    with pytest.raises(__test_helper_Crash):
+        asyncio.run(plugin.close_leg('BTCUSDT', '1', 4, coid))
+    visible = False
+
+    async def call(endpoint, params, *, auth=False):
+        assert params.get('orderLinkId') == link_id
+        if visible and endpoint == '/v5/order/history':
+            return {'list': [{'orderId': '921', 'orderLinkId': link_id,
+                              'orderStatus': 'Filled', 'cumExecQty': '0.004',
+                              'createdTime': str(int(epoch_time() * 1000))}]}
+        return {'list': [], 'nextPageCursor': ''}
+
+    plugin._call = call
+    since_ms = int(epoch_time() * 1000) - 5_000
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], since_ms)) is None
+    visible = True
+    aged_now = epoch_time() + execution_module._CLOSE_SEND_VISIBILITY_GRACE_MS / 1000 + 1
+    monkeypatch.setattr(execution_module, 'epoch_time', lambda: aged_now)
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], since_ms)) == 4
+
+
+def __test_bybit_close_leg_executed_waits_for_a_rowless_send_the_venue_has_not_indexed__(
+        monkeypatch):
+    """Without a persist-first row the send's age is read from ``since_ms``.
+
+    With no store (or no row of the id) the visibility grace must still hold:
+    a fresh close the venue has not indexed yet would otherwise read as unsent
+    and be sent a second time. Past the grace the empty reads settle it as 0.
+    """
+    plugin = _linear_plugin()
+    assert plugin.store_ctx is None
+    coid = 't3st-0a1b2c3d-0sgls2iio-c0:1'
+
+    async def call(_endpoint, _params, *, auth=False):
+        assert auth
+        return {'list': [], 'nextPageCursor': ''}
+
+    plugin._call = call
+    since_ms = int(epoch_time() * 1000) - 1_000
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], since_ms)) is None
+    aged_now = epoch_time() + execution_module._CLOSE_SEND_VISIBILITY_GRACE_MS / 1000 + 1
+    monkeypatch.setattr(execution_module, 'epoch_time', lambda: aged_now)
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], since_ms)) == 0
 
 
 def __test_bybit_duplicate_coid_prior_instance_spent__(tmp_path):
@@ -1971,7 +2288,7 @@ def __test_bybit_position_port_primitives__():
     plugin = _linear_plugin(responses=[{}])
     asyncio.run(plugin.amend_bracket(
         'BTCUSDT', '2', side='buy', tp_price=90000.04, sl_price=110000.0,
-        trail_offset=None, coid='coid-bracket',
+        trail_offset=None, qty=0.01, coid='coid-bracket',
     ))
     endpoint, _, body = plugin.calls[-1]
     assert endpoint == '/v5/position/trading-stop'
@@ -1988,42 +2305,45 @@ def __test_bybit_position_port_primitives__():
     ])
     asyncio.run(plugin.amend_bracket(
         'BTCUSDT', '1', side='sell', tp_price=None, sl_price=None,
-        trail_offset=None, coid='c1',
+        trail_offset=None, qty=0.01, coid='c1',
     ))
     plugin._responses = [BybitAPIError("not modified", ret_code=34040)]
     asyncio.run(plugin.amend_bracket(
         'BTCUSDT', '1', side='sell', tp_price=None, sl_price=None,
-        trail_offset=None, coid='c2',
+        trail_offset=None, qty=0.01, coid='c2',
     ))
     plugin._responses = [BybitAPIError("bad params", ret_code=10001)]
     with pytest.raises(ExchangeOrderRejectedError):
         asyncio.run(plugin.amend_bracket(
             'BTCUSDT', '1', side='sell', tp_price=90000.0, sl_price=None,
-            trail_offset=None, coid='c3',
+            trail_offset=None, qty=0.01, coid='c3',
         ))
 
 
-def __test_bybit_trading_stop_clear_failure_is_disposition_unknown__():
-    """An unconfirmed clear is retried; an unconfirmed attach still flattens"""
+def __test_bybit_trading_stop_write_failure_is_disposition_unknown__():
+    """A trading-stop write without a venue verdict is disposition-unknown, clear or attach."""
     # Live crash, bybit c270 2026-10-14: a strategy cancel cleared a leg's
     # bracket during a venue 503 and the rejection ended the run. The
-    # emulator retries a clear only on disposition-unknown.
+    # emulator retries a clear only on disposition-unknown. An attach is no
+    # different: the request may still take effect, and reported as a reject
+    # it would let a newer write go out that the late one then replaces.
     for failure in (BybitConnectionError("HTTP 503"),
                     BybitAPIError("server timeout", ret_code=10016)):
         plugin = _linear_plugin(responses=[failure])
         with pytest.raises(OrderDispositionUnknownError) as raised:
             asyncio.run(plugin.amend_bracket(
                 'BTCUSDT', '2', side='buy', tp_price=None, sl_price=None,
-                trail_offset=None, coid='coid-clear',
+                trail_offset=None, qty=0.01, coid='coid-clear',
             ))
         assert raised.value.client_order_id == 'coid-clear'
 
         plugin = _linear_plugin(responses=[failure])
-        with pytest.raises(ExchangeOrderRejectedError):
+        with pytest.raises(OrderDispositionUnknownError) as raised:
             asyncio.run(plugin.amend_bracket(
                 'BTCUSDT', '2', side='buy', tp_price=90000.0, sl_price=None,
-                trail_offset=None, coid='coid-attach',
+                trail_offset=None, qty=0.01, coid='coid-attach',
             ))
+        assert raised.value.client_order_id == 'coid-attach'
 
 
 
@@ -3701,3 +4021,58 @@ def __test_cancel_with_outcome_server_side_failure_stays_unknown__():
     plugin._order_identity['coid-long'] = ('Long', None, LegType.ENTRY)
     outcome = asyncio.run(plugin.execute_cancel_with_outcome(_cancel_outcome_envelope()))
     assert outcome is CancelDispositionOutcome.UNKNOWN
+
+
+def __test_bybit_fill_events_carry_the_journal_quantity__(tmp_path):
+    """The fill's ``journal_fill_qty`` is what the order's journal row ``filled_qty`` rises by.
+
+    The core's restart check compares the booked cursor with the row, so the
+    figure is the wire-domain execution: gross of a spot base-coin fee where
+    ``fill_qty`` is fee-net, in contracts on inverse where ``fill_qty`` is base.
+    """
+    plugin = _FakeBrokerBybit()
+    market = plugin._market
+    assert market is not None and market.category == 'spot'
+    store = BrokerStore(tmp_path / "journal_qty.sqlite", plugin_name=plugin.plugin_name)
+    plugin.store_ctx = store.open_run(RunIdentity(
+        strategy_id="journal_qty", symbol="BTCUSDT", timeframe="1", account_id="acct",
+    ), script_source="// journal qty")
+    plugin.store_ctx.upsert_order(
+        'coid-buy', symbol='BTCUSDT', side='buy', qty=0.001, filled_qty=0.0,
+        state='confirmed', pine_entry_id='L', extras={'kind': 'position'})
+    plugin._record_identity('coid-buy', pine_id='L', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.001)
+    events = plugin._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'symbol': 'BTCUSDT', 'category': 'spot', 'execType': 'Trade',
+            'execId': 'jq-buy', 'orderId': '951', 'orderLinkId': 'coid-buy',
+            'side': 'Buy', 'execQty': '0.001', 'execPrice': '64345.6',
+            'execFee': '0.000001', 'feeCurrency': 'BTC', 'execTime': '1752600000000',
+        }],
+    }, market)
+    assert len(events) == 1
+    assert events[0].fill_qty == pytest.approx(0.000999)
+    row = plugin.store_ctx.get_order('coid-buy')
+    assert row is not None
+    assert events[0].journal_fill_qty == pytest.approx(0.001) == row.filled_qty
+    store.close()
+
+    inverse = _inverse_plugin(responses=[{'orderId': '921'}])
+    inverse_market = inverse._market
+    assert inverse_market is not None
+    inverse._last_price = 100000.0
+    asyncio.run(inverse.execute_entry(_entry_envelope(symbol='BTCUSD', qty=0.0015)))
+    _, _, body = inverse.calls[-1]
+    events = inverse._translate_executions({
+        'topic': 'execution',
+        'data': [{
+            'category': 'inverse', 'symbol': 'BTCUSD', 'execType': 'Trade',
+            'execId': 'jq-inv', 'orderId': '921', 'orderLinkId': body['orderLinkId'],
+            'side': 'Buy', 'execQty': '100', 'execPrice': '100500',
+            'execFee': '0.0000006', 'execTime': '1752600000000',
+        }],
+    }, inverse_market)
+    assert len(events) == 1
+    assert events[0].fill_qty == pytest.approx(0.001)
+    assert events[0].journal_fill_qty == 100.0

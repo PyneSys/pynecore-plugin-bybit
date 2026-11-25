@@ -36,6 +36,7 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.broker.one_way_emulator import OneWayEmulator
 from pynecore.core.broker.protection_guard import (
+    POSITION_PROTECTION_LEVELS_EXTRA,
     PROTECTION_LEVELS_EXTRA,
     ProtectionLevels,
     rebaseline_after_resume,
@@ -420,7 +421,7 @@ def __test_helper_refused_tp_amend(tmp_path, name: str, error: BybitAPIError):
     try:
         asyncio.run(plugin.amend_bracket(
             'BTCUSDT', '0', side='sell', tp_price=120000.0, sl_price=90000.0,
-            trail_offset=5.0, coid=_trail_envelope().client_order_id(KIND_EXIT_SL),
+            trail_offset=5.0, qty=0.01, coid=_trail_envelope().client_order_id(KIND_EXIT_SL),
         ))
     except Exception:  # noqa: BLE001 - the refusal itself is not under test
         pass
@@ -488,7 +489,7 @@ def __test_overlapping_same_level_writes_settle_by_write_id__(tmp_path):
     def amend(tp: float):
         return plugin.amend_bracket(
             'BTCUSDT', '0', side='sell', tp_price=tp, sl_price=90000.0,
-            trail_offset=5.0, coid=coid,
+            trail_offset=5.0, qty=0.01, coid=coid,
         )
 
     async def overlap():
@@ -544,10 +545,10 @@ def __test_hedge_moved_leg_stop_reports_after_restart__(tmp_path):
     )
     asyncio.run(plugin.amend_bracket(
         'BTCUSDT', '2', side='buy', tp_price=1879.0, sl_price=1887.0,
-        trail_offset=None, coid='attach-s',
+        trail_offset=None, qty=0.01, coid='attach-s',
     ))
     row = plugin.store_ctx.get_order("bo:S-X\x00S:2")
-    assert (row.extras or {})[PROTECTION_LEVELS_EXTRA]['key'] == 'trading-stop:2'
+    assert (row.extras or {})[POSITION_PROTECTION_LEVELS_EXTRA]['key'] == 'trading-stop:2'
 
     fresh = _restarted(plugin, mode=POSITION_MODE_HEDGE)
     carried = _position_push(idx=2, side='Sell', size='0.02', tp='1879',
@@ -633,7 +634,7 @@ def __test_hedge_tp_only_and_sl_only_exits_share_the_leg_bracket__(tmp_path):
     assert __test_helper_ownership_states(plugin) == {sl_row: 'active'}
     # The levels left on the leg are guarded on the exit that still owns it,
     # never on the released row of the retired one.
-    saved = (plugin.store_ctx.get_order(sl_row).extras or {})[PROTECTION_LEVELS_EXTRA]
+    saved = (plugin.store_ctx.get_order(sl_row).extras or {})[POSITION_PROTECTION_LEVELS_EXTRA]
     assert saved['key'] == 'trading-stop:1'
 
     # Retiring the last owner clears the leg.
@@ -668,20 +669,128 @@ def __test_hedge_ambiguous_clear_carrying_levels_is_disposition_unknown__(tmp_pa
         assert __test_helper_ownership_states(plugin) == {"bo:SL\x00Long:1": 'active'}
 
 
-def __test_hedge_ambiguous_attach_with_a_co_owner_is_a_reject__(tmp_path):
+def __test_hedge_ambiguous_attach_with_a_co_owner_is_disposition_unknown__(tmp_path):
     plugin, emulator = __test_helper_hedge_leg_plugin(
         tmp_path, "hedge-ambiguous-attach",
         [{}, BybitAPIError("server timeout", ret_code=10016)])
     asyncio.run(emulator.run_exit_bracket(
         __test_helper_exit_envelope('TP', tp=110000.0), plugin))
-    # An attach is never taken for a clear, even beside another owner: it is a
-    # reject. The leg still holds the co-owner's levels, so the core hands it
-    # to the refused-exit recovery instead of the after-fill flatten.
-    with pytest.raises(ExchangeOrderRejectedError) as raised:
+    # A server-side failure is no verdict: the write may still take effect, so
+    # it is never reported as a reject (a retry under a fresh id could then be
+    # replaced by it). The row stays, and the core holds the leg until it has
+    # read what the leg carries.
+    with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(emulator.run_exit_bracket(
             __test_helper_exit_envelope('SL', sl=90000.0), plugin))
-    assert not isinstance(raised.value, BracketAttachAfterFillRejectedError)
-    assert __test_helper_ownership_states(plugin) == {"bo:TP\x00Long:1": 'active'}
+    assert __test_helper_ownership_states(plugin) == {
+        "bo:TP\x00Long:1": 'active', "bo:SL\x00Long:1": 'active'}
+    assert emulator.needs_settling()
+
+
+def __test_helper_hedge_position_rows(*, size: str, tp='0', sl='0', trail='0') -> dict:
+    """A ``/v5/position/list`` answer with the hedge Buy leg open at ``size``."""
+    return {'list': [{
+        'symbol': 'BTCUSDT', 'positionIdx': 1, 'size': size, 'side': 'Buy',
+        'avgPrice': '100000', 'unrealisedPnl': '0', 'createdTime': '1752600000000',
+        'takeProfit': tp, 'stopLoss': sl, 'trailingStop': trail,
+    }]}
+
+
+def __test_a_shared_hedge_leg_gets_no_trading_stop_only_a_guard_of_the_run_share__(tmp_path):
+    """The run owns 0.002 of a hedge leg of 0.005: no whole-position stop is written.
+
+    A ``tpslMode=Full`` trading stop closes the whole venue position when it
+    fires, the 0.003 the run does not own included. The leg reports the venue
+    size beside the run's share, and the core guards the share in software.
+    """
+    plugin = _InterventionFake(
+        responses=[__test_helper_hedge_position_rows(size='0.005')] * 3,
+        mode=POSITION_MODE_HEDGE)
+    _attach_store(plugin, tmp_path, "hedge-shared-leg")
+    _seed_long(plugin, qty=0.002)
+    plugin._adoption_baselined = True
+    (leg,) = asyncio.run(plugin.fetch_raw_positions('BTCUSDT'))
+    assert (leg.leg_id, leg.qty, leg.venue_qty) == ('1', 0.002, 0.005)
+
+    emulator = OneWayEmulator(plugin.store_ctx, mintick=0.1)
+    result = asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('SL', sl=90000.0), plugin))
+    assert result.legs == ('1',)
+    assert __test_helper_trading_stop_bodies(plugin) == []
+    (trigger,) = emulator.software_guard_triggers('BTCUSDT', 89999.0)
+    assert (trigger.leg_id, trigger.side, trigger.qty, trigger.reason) == (
+        '1', 'sell', 0.002, 'stop_loss')
+
+
+def __test_a_hedge_leg_the_run_owns_whole_keeps_its_trading_stop__(tmp_path):
+    plugin = _InterventionFake(
+        responses=[__test_helper_hedge_position_rows(size='0.002'), {}],
+        mode=POSITION_MODE_HEDGE)
+    _attach_store(plugin, tmp_path, "hedge-own-leg")
+    _seed_long(plugin, qty=0.002)
+    plugin._adoption_baselined = True
+    emulator = OneWayEmulator(plugin.store_ctx, mintick=0.1)
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('SL', sl=90000.0), plugin))
+    assert __test_helper_trading_stop_bodies(plugin) == [('0', '90000', '0')]
+    assert not emulator.has_software_guards()
+
+
+def __test_a_hedge_leg_that_becomes_shared_loses_its_full_trading_stop__(tmp_path):
+    """Foreign exposure joining a whole-stopped hedge leg moves the stop to the guard.
+
+    The run owned the whole 0.002 when its ``tpslMode=Full`` stop went on.
+    Someone else then adds 0.003 to the same position: the stop would close
+    that too. The next settle pass clears the trading stop and guards the
+    run's 0.002 in software, without any bracket operation of the strategy.
+    """
+    plugin = _InterventionFake(
+        responses=[__test_helper_hedge_position_rows(size='0.002'), {},
+                   __test_helper_hedge_position_rows(size='0.005', sl='90000'), {}],
+        mode=POSITION_MODE_HEDGE)
+    _attach_store(plugin, tmp_path, "hedge-leg-becomes-shared")
+    _seed_long(plugin, qty=0.002)
+    plugin._adoption_baselined = True
+    emulator = OneWayEmulator(plugin.store_ctx, mintick=0.1)
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('SL', sl=90000.0), plugin))
+    assert __test_helper_trading_stop_bodies(plugin) == [('0', '90000', '0')]
+
+    result = asyncio.run(emulator.settle_leg_writes('BTCUSDT', plugin, 0.0))
+    assert result.refused == ()
+    assert __test_helper_trading_stop_bodies(plugin) == [
+        ('0', '90000', '0'), ('0', '0', '0')]
+    (trigger,) = emulator.software_guard_triggers('BTCUSDT', 89999.0)
+    assert (trigger.leg_id, trigger.side, trigger.qty, trigger.reason) == (
+        '1', 'sell', 0.002, 'stop_loss')
+
+
+def __test_bracket_matches_reads_the_trading_stop_the_leg_holds__():
+    def matches(rows: dict, **levels) -> bool | None:
+        plugin = _InterventionFake(responses=[rows], mode=POSITION_MODE_HEDGE)
+        wanted = dict(tp_price=None, sl_price=None, trail_offset=None)
+        wanted.update(levels)
+        return asyncio.run(plugin.bracket_matches(
+            'BTCUSDT', '1', side='sell', qty=0.002, **wanted))
+
+    fixed = __test_helper_hedge_position_rows(size='0.002', tp='110000', sl='90000')
+    assert matches(fixed, tp_price=110000.0, sl_price=90000.0)
+    assert matches(fixed, tp_price=110000.04, sl_price=90000.0)  # same tick
+    assert not matches(fixed, tp_price=110000.0, sl_price=91000.0)
+    assert not matches(fixed, sl_price=90000.0)  # the leg holds a take-profit too
+    assert not matches(fixed)  # a clear did not take effect
+    bare = __test_helper_hedge_position_rows(size='0.002')
+    assert matches(bare) and not matches(bare, sl_price=90000.0)
+    # A trailing stop is identified by its distance and take-profit; a stop the
+    # venue may have trailed cannot tell the write from an earlier stop.
+    trailing = __test_helper_hedge_position_rows(size='0.002', sl='95000', trail='500')
+    assert matches(trailing, sl_price=95000.0, trail_offset=500.0) is True
+    assert matches(trailing, sl_price=90000.0, trail_offset=500.0) is None
+    assert matches(trailing, sl_price=90000.0, trail_offset=600.0) is False
+    assert matches(trailing, tp_price=110000.0, sl_price=90000.0, trail_offset=500.0) is False
+    assert matches(trailing, sl_price=95000.0) is False
+    # A closed leg holds nothing and matches no write, a clear included.
+    assert not matches(__test_helper_hedge_position_rows(size='0'))
 
 
 def __test_hedge_ambiguous_last_owner_clear_is_disposition_unknown__(tmp_path):
@@ -711,7 +820,7 @@ def __test_hedge_skipped_retirement_keeps_the_stop_guarded_across_restart__(tmp_
         __test_helper_cancel_envelope('A'), plugin))
     assert __test_helper_trading_stop_bodies(plugin) == [('0', '90000', '0')]
     assert __test_helper_ownership_states(plugin) == {"bo:B\x00Long:1": 'active'}
-    saved = (plugin.store_ctx.get_order('entry-1').extras or {})[PROTECTION_LEVELS_EXTRA]
+    saved = (plugin.store_ctx.get_order('entry-1').extras or {})[POSITION_PROTECTION_LEVELS_EXTRA]
     assert saved['key'] == 'trading-stop:1'
 
     # A stop moved while the bot was down is still the bot's guarded stop.
@@ -720,6 +829,107 @@ def __test_hedge_skipped_retirement_keeps_the_stop_guarded_across_restart__(tmp_
     _push(fresh, moved)
     _push(fresh, moved)
     assert _kinds(fresh) == [QuarantineKind.EXTERNAL_INTERVENTION]
+
+
+def __test_helper_partial_working_entry(plugin, *, qty: float, filled: float) -> None:
+    """Seed the run's only entry: a limit order resting with a remainder, its limit guarded."""
+    plugin.store_ctx.upsert_order(
+        'entry-w', symbol='BTCUSDT', side='buy', qty=qty, filled_qty=filled,
+        state='confirmed', intent_key='Long-w', pine_entry_id='Long',
+        exchange_order_id='venue-w',
+        extras={'kind': ENTRY_KIND_WORKING, 'order_type': 'limit'},
+    )
+    plugin._note_own_order_qty('entry-w', qty)
+    write = plugin._expect_protection('entry-w', ProtectionLevels(limit=99000.0),
+                                      row_coid='entry-w')
+    plugin._settle_protection('entry-w', ProtectionLevels(limit=99000.0), write=write)
+
+
+def __test_helper_trading_stop_records(plugin, key: str) -> list[str]:
+    """The live rows holding the persisted guard record of trading stop ``key``."""
+    return [row.client_order_id for row in plugin.store_ctx.iter_live_orders()
+            if ((row.extras or {}).get(POSITION_PROTECTION_LEVELS_EXTRA) or {}).get('key') == key]
+
+
+def __test_helper_skip_a_retirement(plugin, emulator) -> None:
+    """Two exits with the same stop; the core skips the retirement of the first."""
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('A', sl=90000.0), plugin))
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('B', sl=90000.0), plugin))
+    asyncio.run(emulator.run_exit_bracket_clear(
+        __test_helper_cancel_envelope('A'), plugin))
+    assert __test_helper_trading_stop_bodies(plugin) == [('0', '90000', '0')]
+    assert __test_helper_ownership_states(plugin) == {"bo:B\x00Long:1": 'active'}
+
+
+def __test_helper_stop_moved_is_reported(plugin, *, size: str) -> None:
+    """A restarted plugin reports a stop moved on the venue while it was down."""
+    fresh = _restarted(plugin, mode=POSITION_MODE_HEDGE)
+    moved = _position_push(idx=1, side='Buy', size=size, tp='0', sl='95000', trail='0')
+    _push(fresh, moved)
+    _push(fresh, moved)
+    assert _kinds(fresh) == [QuarantineKind.EXTERNAL_INTERVENTION]
+    _, context, _ = fresh.quarantines[0]
+    assert context['protection_key'] == 'trading-stop:1'
+
+
+def __test_hedge_skipped_retirement_guards_the_stop_of_a_partially_filled_entry__(tmp_path):
+    # The run's only entry is a limit order resting with a remainder: its row
+    # holds the entry's own guarded limit, and no fully filled row exists.
+    plugin, emulator = __test_helper_hedge_leg_plugin(
+        tmp_path, "hedge-skipped-retire-partial", [{}])
+    __test_helper_partial_working_entry(plugin, qty=0.004, filled=0.002)
+    __test_helper_skip_a_retirement(plugin, emulator)
+    # Both records live on the entry row: its own limit, and the leg's stop.
+    assert __test_helper_trading_stop_records(plugin, 'trading-stop:1') == ['entry-w']
+    entry_record = plugin.store_ctx.get_order('entry-w').extras[PROTECTION_LEVELS_EXTRA]
+    assert entry_record['key'] == 'entry-w'
+
+    # A stop moved while the bot was down is still the bot's guarded stop,
+    # and so is the entry's limit.
+    __test_helper_stop_moved_is_reported(plugin, size='0.002')
+    fresh = _restarted(plugin, mode=POSITION_MODE_HEDGE)
+    moved = _order_push('entry-w', status='New', trigger='0', price='98000', qty='0.004',
+                        order_id='venue-w')
+    _push(fresh, moved)
+    assert _kinds(fresh) == [QuarantineKind.EXTERNAL_INTERVENTION]
+    _, context, _ = fresh.quarantines[0]
+    assert context['protection_key'] == 'entry-w'
+
+
+def __test_hedge_partial_entry_stop_record_outlives_the_entry_order__(tmp_path):
+    for ending in ('filled', 'cancelled'):
+        plugin, emulator = __test_helper_hedge_leg_plugin(
+            tmp_path, f"hedge-partial-{ending}", [{}])
+        __test_helper_partial_working_entry(plugin, qty=0.004, filled=0.002)
+        __test_helper_skip_a_retirement(plugin, emulator)
+        if ending == 'filled':
+            # The remainder fills: the order rests no more, its limit is not
+            # guarded any longer, and the stop record stays on the row.
+            _push(plugin, _exec_push(_close_exec(
+                execId='own-w', orderId='venue-w', orderLinkId='entry-w', side='Buy',
+                execQty='0.002', closedSize='0', createType='CreateByUser', seq='60')))
+            size = '0.004'
+        else:
+            # The remainder is cancelled: the row keeps owning the executed
+            # exposure and drops the order's own record only.
+            plugin._retire_cancelled_row('entry-w', 0.002, 'venue-w')
+            size = '0.002'
+        row = plugin.store_ctx.get_order('entry-w')
+        assert row.closed_ts_ms is None, ending
+        assert row.qty == pytest.approx(row.filled_qty), ending
+        assert not plugin._protection_guard().known('entry-w'), ending
+        assert PROTECTION_LEVELS_EXTRA not in (row.extras or {}), ending
+        assert __test_helper_trading_stop_records(plugin, 'trading-stop:1') == ['entry-w']
+        __test_helper_stop_moved_is_reported(plugin, size=size)
+
+    # The run's position closes: the stop's record goes with it.
+    __test_helper_own_close_row(plugin, 'close-w', side='sell', qty=0.002)
+    __test_helper_own_fill(plugin, 'close-w', exec_id='c-w', side='Sell', qty='0.002',
+                           closed='0.002')
+    assert not plugin._protection_guard().known('trading-stop:1')
+    assert __test_helper_trading_stop_records(plugin, 'trading-stop:1') == []
 
 
 # === Manual close: the run's share of a shared leg =========================
@@ -2698,7 +2908,7 @@ def __test_same_add_never_reports__(tmp_path):
     )
     asyncio.run(plugin.amend_bracket(
         'BTCUSDT', '2', side='buy', tp_price=1879.0, sl_price=1887.0,
-        trail_offset=None, coid='attach-s',
+        trail_offset=None, qty=0.01, coid='attach-s',
     ))
     _push(plugin, _position_push(idx=2, side='Sell', size='0.02', tp='1879',
                                  sl='1887', trail='0', seq='50'))
@@ -3584,7 +3794,7 @@ def __test_hedge_own_close_forgets_only_its_leg__(tmp_path):
     )
     asyncio.run(plugin.amend_bracket(
         'BTCUSDT', '2', side='buy', tp_price=1879.0, sl_price=1887.0,
-        trail_offset=None, coid='attach-s',
+        trail_offset=None, qty=0.01, coid='attach-s',
     ))
     _seed_long(plugin, qty=0.01)
     plugin.store_ctx.upsert_order(
@@ -3659,7 +3869,7 @@ def __test_foreign_stop_added_to_a_bare_position_reports__(tmp_path):
 def __test_bare_baseline_survives_a_restart__(tmp_path):
     plugin = _manual_plugin(tmp_path, "bare-restart")
     row = plugin.store_ctx.get_order('entry-1')
-    assert (row.extras or {})[PROTECTION_LEVELS_EXTRA]['key'] == 'trading-stop:0'
+    assert (row.extras or {})[POSITION_PROTECTION_LEVELS_EXTRA]['key'] == 'trading-stop:0'
     fresh = _restarted(plugin)
     fresh._adoption_baselined = True
     added = __test_helper_stop_view(sl='29000')
@@ -3682,7 +3892,7 @@ def __test_helper_store_clock(monkeypatch) -> None:
 def __test_helper_trading_stop_home(plugin) -> list:
     """The live rows holding the persisted levels of ``trading-stop:0``."""
     return [row.client_order_id for row in plugin.store_ctx.iter_live_orders()
-            if ((row.extras or {}).get(PROTECTION_LEVELS_EXTRA) or {}).get('key')
+            if ((row.extras or {}).get(POSITION_PROTECTION_LEVELS_EXTRA) or {}).get('key')
             == 'trading-stop:0']
 
 
@@ -3706,6 +3916,8 @@ def __test_bare_baseline_never_takes_over_a_resting_entry_record__(tmp_path):
     assert plugin._protection_guard().known('trading-stop:0')
     record = plugin.store_ctx.get_order('entry-w').extras[PROTECTION_LEVELS_EXTRA]
     assert record['key'] == 'entry-w'
+    # The bare baseline shares the row, in its position-scoped slot.
+    assert __test_helper_trading_stop_home(plugin) == ['entry-w']
     fresh = _restarted(plugin)
     fresh._adoption_baselined = True
     moved = _order_push('entry-w', status='New', trigger='0', price='28000', qty='0.04',
@@ -3713,13 +3925,13 @@ def __test_bare_baseline_never_takes_over_a_resting_entry_record__(tmp_path):
     _push(fresh, moved)
     assert _kinds(fresh) == [QuarantineKind.EXTERNAL_INTERVENTION]
 
-    # The entry fills completely: its row rests no more, and the next view
-    # of the position persists the bare baseline there.
+    # The entry fills completely: its row rests no more and keeps the bare
+    # baseline.
     _push(plugin, _exec_push(_close_exec(
         execId='own-w', orderId='venue-w', orderLinkId='entry-w', side='Buy',
         execQty='0.02', closedSize='0', createType='CreateByUser', seq='60')))
     assert plugin._run_owned_signed_size() == pytest.approx(0.04)
-    assert __test_helper_trading_stop_home(plugin) == []
+    assert __test_helper_trading_stop_home(plugin) == ['entry-w']
     _push(plugin, __test_helper_view(size=0.04, seq=60))
     assert __test_helper_trading_stop_home(plugin) == ['entry-w']
     fresh = _restarted(plugin)
@@ -3982,7 +4194,7 @@ def __test_own_cleared_trading_stop_stays_guarded__(tmp_path):
         plugin._market, context_coid='cancel-x', row_coid=None))
     assert plugin._protection_guard().known('trading-stop:0')
     row = plugin.store_ctx.get_order('entry-1')
-    assert (row.extras or {})[PROTECTION_LEVELS_EXTRA]['key'] == 'trading-stop:0'
+    assert (row.extras or {})[POSITION_PROTECTION_LEVELS_EXTRA]['key'] == 'trading-stop:0'
     bare = __test_helper_stop_view(size='0.002', seq='60')
     _push(plugin, bare)
     _push(plugin, bare)
@@ -4006,7 +4218,7 @@ def __test_own_cleared_trading_stop_stays_guarded__(tmp_path):
     for tp, sl in ((1879.0, 1887.0), (None, None)):
         asyncio.run(plugin.amend_bracket(
             'BTCUSDT', '2', side='buy', tp_price=tp, sl_price=sl,
-            trail_offset=None, coid='attach-s',
+            trail_offset=None, qty=0.01, coid='attach-s',
         ))
     assert plugin._protection_guard().known('trading-stop:2')
     added = __test_helper_stop_view(idx=2, side='Sell', tp='1850', seq='60')
@@ -4020,7 +4232,7 @@ def __test_own_cleared_trading_stop_stays_guarded__(tmp_path):
     for tp, sl in ((1879.0, 1887.0), (None, None)):
         asyncio.run(plugin.amend_bracket(
             'BTCUSDT', '2', side='buy', tp_price=tp, sl_price=sl,
-            trail_offset=None, coid='attach-s',
+            trail_offset=None, qty=0.01, coid='attach-s',
         ))
     assert not plugin._protection_guard().known('trading-stop:2')
 

@@ -778,6 +778,26 @@ def __test_baseline_hedge_clamp_is_per_side_and_noop_when_covered__(tmp_path):
     assert [coid for coid, _ in _clamp_events(broker)] == ['short1']
 
 
+def __test_hedge_leg_venue_size_comes_from_the_verified_snapshot__(tmp_path):
+    # Someone adds 0.002 to the run's Buy leg while the startup baseline
+    # reads: the first snapshot shows 0.002, the verified re-read 0.004. The
+    # leg reports that 0.004 beside the run's 0.002, so the core never writes
+    # a whole-position stop that would close the foreign half.
+    broker = _AdoptionFake(
+        market=_linear_instrument(),
+        position_snapshots=[__test_helper_hedge_rows('0.002', seq=60),
+                            __test_helper_hedge_rows('0.004', seq=61)],
+        execs={'o1': [_exec('e1', '0.002')]},
+        order_lookups={'c1': {'orderId': 'o1', 'orderStatus': 'Filled',
+                              'cumExecQty': '0.002'}},
+    )
+    broker._position_mode = POSITION_MODE_HEDGE
+    _open(tmp_path, broker)
+    _seed(broker, 'c1', qty=0.002, filled_qty=0.002)
+    (leg,) = asyncio.run(broker.fetch_raw_positions('BTCUSDT'))
+    assert (leg.leg_id, leg.qty, leg.venue_qty) == ('1', 0.002, 0.004)
+
+
 def __test_helper_fold_events(broker) -> list:
     cur = broker.store_ctx._store._conn.execute(
         "SELECT client_order_id FROM events "

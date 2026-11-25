@@ -1317,8 +1317,13 @@ class _EventStreamMixin(_BybitBase, ABC):
         row = self.store_ctx.get_order(coid)
         if row is None or row.closed_ts_ms is not None:
             return
-        extras = dict(row.extras or {})
+        # Read the row again after the guard dropped the order's own record
+        # from its extras: writing the earlier copy back would restore it.
         self._forget_protection(coid)
+        row = self.store_ctx.get_order(coid)
+        if row is None:
+            return
+        extras = dict(row.extras or {})
         if extras.get('kind') not in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING):
             self.store_ctx.close_order(coid)
             return
@@ -1523,6 +1528,10 @@ class _EventStreamMixin(_BybitBase, ABC):
             fee=fee,
             fee_currency=order.fee_currency,
             fill_id=str(entry.get('execId') or '') or None,
+            # The row's ``filled_qty`` is the wire-domain cumulative: gross of
+            # a spot base-coin fee, in contracts on inverse. ``fill_qty`` is
+            # neither, so the core's restart check needs this figure.
+            journal_fill_qty=exec_qty,
         )
 
     def _translate_order_rows(
