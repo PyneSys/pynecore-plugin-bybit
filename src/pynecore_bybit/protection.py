@@ -99,11 +99,13 @@ from pynecore.core.broker.protection_guard import (
     ProtectionLevels,
 )
 from pynecore.core.broker.store_helpers import (
+    BRACKET_OWN_STATE_CLEARING,
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     EXTRAS_KEY_BRACKET_OWN_ATTACH_COID,
     EXTRAS_KEY_BRACKET_OWN_CLEAR_COID,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
+    EXTRAS_KEY_BRACKET_OWN_STATE,
     STATE_BRACKET_OWN,
     iter_active_bracket_ownerships,
 )
@@ -523,25 +525,64 @@ class _ProtectionMixin(_BybitBase, ABC):
                 return
         self._forget_protection(key)
 
-    def _trading_stop_row_coid(self, leg_id: str, coid: str) -> str | None:
-        """The live ownership row a trading-stop write on ``leg_id`` belongs to.
+    def _trading_stop_write_owner(self, leg_id: str, coid: str) -> tuple[str | None, bool]:
+        """The journal row a trading-stop write on ``leg_id`` persists on.
 
-        The row whose attach or clear id is ``coid`` when there is one, else
-        the newest live ownership row of the leg; ``None`` storeless or when
-        the leg has no ownership row.
+        A write retires an exit from the leg when ``coid`` is the clear id the
+        core persisted on a ``clearing`` ownership row of the leg before the
+        amend (or, for a row that carries none, the row's own id: the core
+        re-drives such a retirement under it). The core sends every write as
+        the leg's whole protection, merged over the exits that own it, so a
+        retirement carries the levels of the exits that still own the leg and
+        is all-``None`` only when none is left.
+
+        The levels persist on one of the run's own entry rows of the
+        protected side when one may hold them
+        (:meth:`_bare_baseline_row_coid`): such a row lives as long as the
+        run's position, while an ownership row can be released without any
+        write reaching the plugin — the core skips a retirement whose merged
+        levels equal the ones the leg already holds, and releases the
+        retiring row all the same. Without such an entry row a retirement's
+        levels belong to the newest ``active`` row of the leg, never to the
+        retiring row, which the core releases once the write lands; with no
+        ``active`` row left, to the retiring row
+        (:meth:`_guard_cleared_trading_stop` moves the bare levels on). Any
+        other write then belongs to the row whose attach id is ``coid`` when
+        there is one, else to the newest live ownership row of the leg.
+
+        :param leg_id: The hedge leg (``positionIdx``) the write addresses.
+        :param coid: The client-order-id the core sent the write under.
+        :return: ``(row_coid, retiring)``: the row the written levels persist
+            on (``None`` storeless or when the leg has neither an eligible
+            entry row nor an ownership row), and whether the write retires an
+            exit from the leg.
         """
         if self.store_ctx is None:
-            return None
+            return None, False
+        attached: str | None = None
+        retiring: str | None = None
         newest: str | None = None
+        newest_active: str | None = None
         for row in iter_active_bracket_ownerships(self.store_ctx):
             extras = row.extras or {}
             if str(extras.get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)) != leg_id:
                 continue
-            if coid in (extras.get(EXTRAS_KEY_BRACKET_OWN_ATTACH_COID),
-                        extras.get(EXTRAS_KEY_BRACKET_OWN_CLEAR_COID)):
-                return row.client_order_id
+            clearing = extras.get(EXTRAS_KEY_BRACKET_OWN_STATE) == BRACKET_OWN_STATE_CLEARING
+            if clearing and coid in (extras.get(EXTRAS_KEY_BRACKET_OWN_CLEAR_COID),
+                                     row.client_order_id):
+                retiring = retiring or row.client_order_id
+            elif coid == extras.get(EXTRAS_KEY_BRACKET_OWN_ATTACH_COID):
+                attached = attached or row.client_order_id
             newest = row.client_order_id
-        return newest
+            if not clearing:
+                newest_active = row.client_order_id
+        idx = int(leg_id)
+        side = self._run_side_on_leg(idx)
+        home = (self._bare_baseline_row_coid(side, trading_stop_key(idx))
+                if side is not None else None)
+        if retiring is not None:
+            return home or newest_active or retiring, True
+        return home or attached or newest, False
 
     def _trading_stop_side(self, key: str, position_idx: int) -> str | None:
         """The position side the trading stop on ``position_idx`` protects.

@@ -13,9 +13,11 @@ import pytest
 
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
+    ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
 )
 from pynecore.core.broker.idempotency import (
+    KIND_CANCEL,
     KIND_CLOSE,
     KIND_ENTRY,
     KIND_EXIT_SL,
@@ -29,8 +31,10 @@ from pynecore.core.broker.models import (
     ExitIntent,
     LegType,
     OrderType,
+    PositionLeg,
     QuarantineKind,
 )
+from pynecore.core.broker.one_way_emulator import OneWayEmulator
 from pynecore.core.broker.protection_guard import (
     PROTECTION_LEVELS_EXTRA,
     ProtectionLevels,
@@ -41,7 +45,9 @@ from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    EXTRAS_KEY_BRACKET_OWN_STATE,
     create_bracket_ownership_row,
+    iter_active_bracket_ownerships,
 )
 from pynecore.core.broker.sync_engine import OrderSyncEngine
 
@@ -550,6 +556,167 @@ def __test_hedge_moved_leg_stop_reports_after_restart__(tmp_path):
     assert fresh.quarantines == []
     moved = _position_push(idx=2, side='Sell', size='0.02', tp='1879',
                            sl='1900', trail='0')
+    _push(fresh, moved)
+    _push(fresh, moved)
+    assert _kinds(fresh) == [QuarantineKind.EXTERNAL_INTERVENTION]
+
+
+# === Hedge leg owned by several exits ======================================
+
+_HEDGE_BAR_MS = 1_752_600_000_000
+
+
+def __test_helper_hedge_leg_plugin(tmp_path, name: str, responses: list):
+    """A hedge plugin whose Buy leg is open, behind the core one-way emulator."""
+    plugin = _InterventionFake(responses=responses, mode=POSITION_MODE_HEDGE)
+    _attach_store(plugin, tmp_path, name)
+    leg = PositionLeg(leg_id='1', symbol='BTCUSDT', side='buy', qty=0.002,
+                      entry_price=100000.0, open_time=1752600000.0)
+
+    async def fetch_raw_positions(_symbol: str) -> list[PositionLeg]:
+        return [leg]
+
+    plugin.fetch_raw_positions = fetch_raw_positions
+    return plugin, OneWayEmulator(plugin.store_ctx, mintick=0.1)
+
+
+def __test_helper_exit_envelope(pine_id: str, *, tp=None, sl=None) -> DispatchEnvelope:
+    return DispatchEnvelope(
+        intent=ExitIntent(pine_id=pine_id, from_entry='Long', symbol='BTCUSDT',
+                          side='sell', qty=0.002, tp_price=tp, sl_price=sl),
+        run_tag='t3st', bar_ts_ms=_HEDGE_BAR_MS, coid_max_len=36,
+    )
+
+
+def __test_helper_cancel_envelope(pine_id: str) -> DispatchEnvelope:
+    return DispatchEnvelope(
+        intent=CancelIntent(pine_id=pine_id, from_entry='Long', symbol='BTCUSDT'),
+        run_tag='t3st', bar_ts_ms=_HEDGE_BAR_MS + 60_000, coid_max_len=36,
+    )
+
+
+def __test_helper_trading_stop_bodies(plugin) -> list[tuple[str, str, str]]:
+    return [(body['takeProfit'], body['stopLoss'], body['trailingStop'])
+            for endpoint, _, body in plugin.calls
+            if endpoint == '/v5/position/trading-stop']
+
+
+def __test_helper_ownership_states(plugin) -> dict[str, str]:
+    return {
+        row.client_order_id: (row.extras or {})[EXTRAS_KEY_BRACKET_OWN_STATE]
+        for row in iter_active_bracket_ownerships(plugin.store_ctx)
+    }
+
+
+def __test_helper_attach_tp_and_sl(plugin, emulator) -> None:
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('TP', tp=110000.0), plugin))
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('SL', sl=90000.0), plugin))
+
+
+def __test_hedge_tp_only_and_sl_only_exits_share_the_leg_bracket__(tmp_path):
+    plugin, emulator = __test_helper_hedge_leg_plugin(
+        tmp_path, "hedge-tp-sl", [{}, {}, {}, {}])
+    __test_helper_attach_tp_and_sl(plugin, emulator)
+    # The leg carries the union: the SL attach keeps the TP exit's level.
+    assert __test_helper_trading_stop_bodies(plugin) == [
+        ('110000', '0', '0'),
+        ('110000', '90000', '0'),
+    ]
+
+    # Retiring the TP exit removes its level ("0") and keeps the SL.
+    asyncio.run(emulator.run_exit_bracket_clear(
+        __test_helper_cancel_envelope('TP'), plugin))
+    assert __test_helper_trading_stop_bodies(plugin)[-1] == ('0', '90000', '0')
+    sl_row = "bo:SL\x00Long:1"
+    assert __test_helper_ownership_states(plugin) == {sl_row: 'active'}
+    # The levels left on the leg are guarded on the exit that still owns it,
+    # never on the released row of the retired one.
+    saved = (plugin.store_ctx.get_order(sl_row).extras or {})[PROTECTION_LEVELS_EXTRA]
+    assert saved['key'] == 'trading-stop:1'
+
+    # Retiring the last owner clears the leg.
+    asyncio.run(emulator.run_exit_bracket_clear(
+        __test_helper_cancel_envelope('SL'), plugin))
+    assert __test_helper_trading_stop_bodies(plugin)[-1] == ('0', '0', '0')
+    assert __test_helper_ownership_states(plugin) == {}
+
+
+def __test_hedge_ambiguous_clear_carrying_levels_is_disposition_unknown__(tmp_path):
+    for failure in (BybitConnectionError("HTTP 503"),
+                    BybitAPIError("server timeout", ret_code=10016)):
+        plugin, emulator = __test_helper_hedge_leg_plugin(
+            tmp_path, f"hedge-ambiguous-{type(failure).__name__}",
+            [{}, {}, failure, {}])
+        __test_helper_attach_tp_and_sl(plugin, emulator)
+        cancel = __test_helper_cancel_envelope('TP')
+        cancel_coid = cancel.client_order_id(KIND_CANCEL)
+
+        # The clear keeps the SL exit's level, yet it is a clear: an unknown
+        # outcome leaves the retiring row to the core's retry, never a reject.
+        with pytest.raises(OrderDispositionUnknownError) as raised:
+            asyncio.run(emulator.run_exit_bracket_clear(cancel, plugin))
+        assert raised.value.client_order_id == cancel_coid
+        assert __test_helper_trading_stop_bodies(plugin)[-1] == ('0', '90000', '0')
+        tp_row = "bo:TP\x00Long:1"
+        assert __test_helper_ownership_states(plugin)[tp_row] == 'clearing'
+
+        # The per-sync drain re-sends the same merged levels and finishes it.
+        asyncio.run(emulator.drain_clearing_rows('BTCUSDT', plugin))
+        assert __test_helper_trading_stop_bodies(plugin)[-1] == ('0', '90000', '0')
+        assert __test_helper_ownership_states(plugin) == {"bo:SL\x00Long:1": 'active'}
+
+
+def __test_hedge_ambiguous_attach_with_a_co_owner_is_a_reject__(tmp_path):
+    plugin, emulator = __test_helper_hedge_leg_plugin(
+        tmp_path, "hedge-ambiguous-attach",
+        [{}, BybitAPIError("server timeout", ret_code=10016)])
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('TP', tp=110000.0), plugin))
+    # An attach is never taken for a clear, even beside another owner: it is a
+    # reject. The leg still holds the co-owner's levels, so the core hands it
+    # to the refused-exit recovery instead of the after-fill flatten.
+    with pytest.raises(ExchangeOrderRejectedError) as raised:
+        asyncio.run(emulator.run_exit_bracket(
+            __test_helper_exit_envelope('SL', sl=90000.0), plugin))
+    assert not isinstance(raised.value, BracketAttachAfterFillRejectedError)
+    assert __test_helper_ownership_states(plugin) == {"bo:TP\x00Long:1": 'active'}
+
+
+def __test_hedge_ambiguous_last_owner_clear_is_disposition_unknown__(tmp_path):
+    plugin, emulator = __test_helper_hedge_leg_plugin(
+        tmp_path, "hedge-ambiguous-last",
+        [{}, BybitAPIError("server timeout", ret_code=10016)])
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('SL', sl=90000.0), plugin))
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(emulator.run_exit_bracket_clear(
+            __test_helper_cancel_envelope('SL'), plugin))
+    assert __test_helper_trading_stop_bodies(plugin)[-1] == ('0', '0', '0')
+    assert __test_helper_ownership_states(plugin) == {"bo:SL\x00Long:1": 'clearing'}
+
+
+def __test_hedge_skipped_retirement_keeps_the_stop_guarded_across_restart__(tmp_path):
+    plugin, emulator = __test_helper_hedge_leg_plugin(tmp_path, "hedge-skipped-retire", [{}])
+    _seed_long(plugin, qty=0.002, side='buy')
+    # Two exits with the same stop: the second attach and the retirement of
+    # the first leave the leg's merged levels unchanged, so the core sends
+    # neither, and releases the retired exit's row without a plugin call.
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('A', sl=90000.0), plugin))
+    asyncio.run(emulator.run_exit_bracket(
+        __test_helper_exit_envelope('B', sl=90000.0), plugin))
+    asyncio.run(emulator.run_exit_bracket_clear(
+        __test_helper_cancel_envelope('A'), plugin))
+    assert __test_helper_trading_stop_bodies(plugin) == [('0', '90000', '0')]
+    assert __test_helper_ownership_states(plugin) == {"bo:B\x00Long:1": 'active'}
+    saved = (plugin.store_ctx.get_order('entry-1').extras or {})[PROTECTION_LEVELS_EXTRA]
+    assert saved['key'] == 'trading-stop:1'
+
+    # A stop moved while the bot was down is still the bot's guarded stop.
+    fresh = _restarted(plugin, mode=POSITION_MODE_HEDGE)
+    moved = _position_push(idx=1, side='Buy', size='0.002', tp='0', sl='95000', trail='0')
     _push(fresh, moved)
     _push(fresh, moved)
     assert _kinds(fresh) == [QuarantineKind.EXTERNAL_INTERVENTION]

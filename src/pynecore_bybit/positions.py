@@ -1145,7 +1145,10 @@ class _PositionsMixin(_BybitBase, ABC):
         aggregation — the core emulator owns netting and leg selection.
         The leg id is the ``positionIdx`` (the address ``close_leg`` and
         ``amend_bracket`` need); ``open_time`` comes from the broker's
-        ``createdTime`` so the FIFO order is replay-stable.
+        ``createdTime`` so the FIFO order is replay-stable. A hedge leg
+        aggregates every entry of its side, so no leg carries an
+        ``entry_id``: each exit of the side protects it, and the core merges
+        their levels into the one bracket the leg holds.
 
         A failed venue read raises the broker taxonomy
         (:func:`~pynecore_bybit.exceptions.classify_read_error`), never a raw
@@ -1306,12 +1309,14 @@ class _PositionsMixin(_BybitBase, ABC):
             trail_offset: float | None,
             coid: str,
     ) -> None:
-        """Replicate (or, all-``None``, clear) the bracket on ONE hedge leg.
+        """Write the whole bracket of ONE hedge leg.
 
         ``POST /v5/position/trading-stop`` sets the position-attribute
-        TP / SL / trailing of the addressed ``positionIdx``; Bybit clears a
-        field on the literal ``"0"``, so an all-``None`` amend wipes the
-        bracket wholesale. ``side`` is unused — Bybit needs no anchor seed
+        TP / SL / trailing of the addressed ``positionIdx``. Every write sends
+        all three fields and Bybit clears a field on the literal ``"0"``, so
+        the write is a full replacement: a level absent from the merged
+        protection the core sends is removed, and an all-``None`` amend wipes
+        the bracket wholesale. ``side`` is unused — Bybit needs no anchor seed
         for a trailing distance (``trailingStop`` activates immediately
         without an ``activePrice``). A leg that vanished between the
         emulator's fetch and this amend rejects with the measured
@@ -1323,7 +1328,11 @@ class _PositionsMixin(_BybitBase, ABC):
         attach it raises :class:`ExchangeOrderRejectedError`, so the emulator
         flattens the leg rather than trust it protected. On a clear it raises
         :class:`OrderDispositionUnknownError`: the emulator's persist-first
-        ``clearing`` row then re-drives the clear on the next sync.
+        ``clearing`` row then re-drives the clear on the next sync. A clear is
+        an all-``None`` write, or one sent under the clear id of a ``clearing``
+        ownership row of the leg: retiring one exit while others still own
+        the leg carries their levels
+        (:meth:`~_BybitBase._trading_stop_write_owner`).
         """
         del side  # Bybit derives the protective side from the leg itself.
         market = await asyncio.to_thread(self._broker_market)
@@ -1350,9 +1359,11 @@ class _PositionsMixin(_BybitBase, ABC):
             float(trail) if trail is not None else None,
         )
         cleared = levels == ProtectionLevels()
-        write = self._expect_protection(
-            key, levels, row_coid=self._trading_stop_row_coid(leg_id, coid),
-        )
+        row_coid, retiring = self._trading_stop_write_owner(leg_id, coid)
+        # A retirement keeps the levels of the exits that still own the leg,
+        # so it is told apart from an attach by its coid, not by its levels.
+        clearing = cleared or retiring
+        write = self._expect_protection(key, levels, row_coid=row_coid)
         try:
             await self._call('/v5/position/trading-stop', method='post',
                              body=body, auth=True)
@@ -1372,7 +1383,7 @@ class _PositionsMixin(_BybitBase, ABC):
                     self._guard_cleared_trading_stop(key, idx)
                 return
             if e.ret_code in AMBIGUOUS_DISPOSITION_CODES:
-                if cleared:
+                if clearing:
                     raise OrderDispositionUnknownError(
                         f"Bybit trading-stop clear on leg {leg_id}: server-side "
                         f"failure (retCode={e.ret_code}); disposition unknown",
@@ -1392,7 +1403,7 @@ class _PositionsMixin(_BybitBase, ABC):
         except BaseException as e:
             self._settle_protection(key, None, write=write)
             if isinstance(e, BybitError):
-                if cleared:
+                if clearing:
                     raise OrderDispositionUnknownError(
                         f"Bybit trading-stop clear on leg {leg_id}: transport "
                         f"failure; disposition unknown",
