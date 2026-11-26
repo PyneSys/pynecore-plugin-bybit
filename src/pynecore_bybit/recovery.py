@@ -85,6 +85,7 @@ from .helpers import (
     OPEN_ORDERS_PAGE_LIMIT,
 )
 from .models import InstrumentInfo
+from .state import _ended_cum_exec_qty
 
 logger = logging.getLogger(__name__)
 
@@ -194,10 +195,19 @@ class _RecoveryMixin(_BybitBase, ABC):
             # lookup — a definitive reject requires FINDING a dead order.
             return False
         status = str(existing.get('orderStatus') or '')
-        try:
-            cum_exec = Decimal(str(existing.get('cumExecQty') or '0') or '0')
-        except (InvalidOperation, TypeError, ValueError):
-            cum_exec = Decimal(0)
+        if status in _DEAD_ORDER_STATUSES or status == 'Filled':
+            ended_cum_exec = _ended_cum_exec_qty(existing)
+            if ended_cum_exec is None:
+                # An ended order without a usable executed quantity proves
+                # neither a refusal nor a fill: the row stays pending for the
+                # parked-dispatch resolver, which reads it again in-run.
+                return False
+            cum_exec = Decimal(str(ended_cum_exec))
+        else:
+            try:
+                cum_exec = Decimal(str(existing.get('cumExecQty') or '0') or '0')
+            except (InvalidOperation, TypeError, ValueError):
+                cum_exec = Decimal(0)
         if status in _DEAD_ORDER_STATUSES and cum_exec <= 0:
             # A clean reject / cancel / deactivation with zero fills: the
             # order died without becoming exposure. Retire it terminally.

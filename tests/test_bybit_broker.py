@@ -8,6 +8,7 @@ import time
 import threading
 from decimal import Decimal
 from time import time as epoch_time
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,7 @@ from pynecore.core.broker.exceptions import (
     VenueWritesQuarantinedError,
 )
 from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_REDUCE_ONLY,
     CancelDispositionOutcome,
     CancelIntent,
     CapabilityLevel,
@@ -36,17 +38,26 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.broker.idempotency import KIND_ENTRY
 from pynecore.core.broker.run_identity import RunIdentity
-from pynecore.core.broker.storage import BrokerStore
+from pynecore.core.broker.spot_inventory import SpotInventoryManager
+from pynecore.core.broker.storage import (
+    ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND,
+    BrokerStore,
+    FillReceipt,
+)
 from pynecore.core.broker.one_way_emulator import close_leg_attempt_client_order_id
 from pynecore.core.broker.parked_dispatch import (
     ParkedDispatchResolver, ParkedOutcome, ParkedVerdict,
 )
 from pynecore.core.broker.store_helpers import (
+    CLOSE_ENDED_PARTIALLY_EVENT,
+    CLOSE_ENDED_UNFILLED_EVENT,
+    CLOSE_EXECUTED_QTY_KEY,
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     create_close_leg_row,
     mark_rejected,
 )
+from pynecore.core.broker.sync_engine import OrderSyncEngine
 
 import pynecore_bybit.events as events_module
 import pynecore_bybit.execution as execution_module
@@ -57,6 +68,7 @@ from pynecore_bybit.exceptions import (
 from pynecore_bybit.helpers import (
     ENTRY_CANCEL_CUM_EXEC_EXTRA,
     ENTRY_REMAINDER_CANCELLED_EXTRA,
+    ENTRY_TERMINAL_EVENT_OWED_EXTRA,
     base_to_contracts,
     contracts_to_base,
     format_decimal,
@@ -70,6 +82,7 @@ from pynecore_bybit.positions import (
     POSITION_MODE_HEDGE,
     POSITION_MODE_ONE_WAY,
 )
+from pynecore_bybit.state import parse_exchange_order
 
 
 def main():
@@ -736,6 +749,55 @@ def __test_bybit_close_leg_executed_reads_every_send_of_the_close__(tmp_path, mo
     executions[wire_link_id(second)] = ([], True)
     mark_rejected(plugin.store_ctx, coid=wire_link_id(second))
     assert executed() == 1
+
+
+@pytest.mark.parametrize('order', [
+    {'orderStatus': 'Cancelled'},
+    {'orderStatus': 'Cancelled', 'cumExecQty': ''},
+    {'orderStatus': 'PartiallyFilledCanceled', 'cumExecQty': '0'},
+    {'orderStatus': 'Filled', 'cumExecQty': '0'},
+], ids=['missing', 'empty', 'partial_zero', 'filled_zero'])
+def __test_bybit_close_leg_executed_never_reads_an_unusable_figure_as_zero__(
+        tmp_path, monkeypatch, order):
+    """An ended close order without a usable ``cumExecQty`` is not a send that executed nothing.
+
+    A zero would make the restart replay re-send a close that may have
+    executed: the answer is ``None`` until the order says what it executed.
+    """
+    plugin = _linear_plugin(responses=[{'orderId': '701'}])
+    _attach_store(plugin, tmp_path, "close-executed-unusable")
+    coid = 't3st-0a1b2c3d-0sgls2iio-c0:1'
+    create_close_leg_row(
+        plugin.store_ctx, coid=coid, symbol='BTCUSDT', side='sell', qty=0.004,
+        intent_key='Long', pine_entry_id='Long', parent_close_coid='t3st-0a1b2c3d-0sgls2iio-c0',
+        leg_id='1', leg_volume=4, leg_pre_volume=10,
+    )
+    asyncio.run(plugin.close_leg('BTCUSDT', '1', 4, coid))
+    answer: dict = dict(order)
+
+    async def lookup(_market, _link_id):
+        return answer, True
+
+    monkeypatch.setattr(plugin, '_confirm_lookup', lookup)
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], 0)) is None
+    answer['cumExecQty'] = '0'
+    answer['orderStatus'] = 'Cancelled'
+    assert asyncio.run(plugin.close_leg_executed('BTCUSDT', '1', [coid], 0)) == 0
+
+
+@pytest.mark.parametrize(('order', 'expected'), [
+    ({'orderStatus': 'Cancelled'}, (False, None)),
+    ({'orderStatus': 'PartiallyFilledCanceled', 'cumExecQty': '0'}, (False, None)),
+    ({'orderStatus': 'New'}, (False, None)),
+    ({'orderStatus': 'Cancelled', 'cumExecQty': '0'}, (True, Decimal(0))),
+    ({'orderStatus': 'New', 'cumExecQty': '0'}, (None, None)),
+    ({'orderStatus': 'Cancelled', 'cumExecQty': '0.002'}, (False, Decimal('0.002'))),
+], ids=['dead_missing', 'dead_contradictory', 'live_missing', 'dead_zero', 'live_zero',
+        'dead_executed'])
+def __test_bybit_rollback_readback_reads_a_zero_only_from_the_venue__(order, expected):
+    """A rollback leg is re-dispatchable only on a dead order the venue says executed nothing."""
+    plugin = _linear_plugin(responses=[{'list': [order]}])
+    assert asyncio.run(plugin._rollback_readback('leg')) == expected
 
 
 def __test_bybit_close_leg_executed_reads_a_send_the_parked_resolver_rejected__(
@@ -1704,7 +1766,9 @@ def __test_bybit_entry_cancelled_before_its_first_fill_is_delivered_stays_owned_
     market = plugin._market
     assert market is not None
 
-    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is True
+    # The bare ACK proves no unfilled end (Bybit cancels asynchronously): the
+    # cancel is not reported landed, so the engine keeps the order tracked.
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is False
     row = plugin.store_ctx.get_order(coid)
     assert row is not None and row.closed_ts_ms is None
     assert row.qty == pytest.approx(0.01)
@@ -1731,6 +1795,45 @@ def __test_bybit_entry_cancelled_before_its_first_fill_is_delivered_stays_owned_
     assert row.filled_qty == pytest.approx(0.004)
     plugin._position_mode = POSITION_MODE_HEDGE
     assert plugin._run_owned_signed_size() == pytest.approx(0.004)
+    # The engine's retry is answered from the settled row, without a second
+    # cancel request (the fake holds no response for one): not landed while
+    # the fill event still waits for the engine, landed once its receipt
+    # shows the engine booked it.
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is False
+    plugin.store_ctx.record_fill_receipts([FillReceipt('e-first', booked=True, fee=0.0)])
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is True
+
+
+def __test_bybit_first_entry_cancel_ack_is_not_landed_until_the_fill_is_known__(tmp_path):
+    """The strategy's first cancel of an entry does not report a bare ACK as landed.
+
+    Bybit processes the cancel asynchronously and a fill can win it, so the
+    engine must keep the order tracked (``False``) instead of tearing down
+    its pending partial protection. When the execution then books on the
+    row, the cancel stays not landed until the engine's fill receipt shows
+    it took the fill; the retry is then answered from the row — the entry
+    filled — without a second cancel request.
+    """
+    plugin, coid = _partial_entry_plugin(
+        tmp_path, "first-cancel-race", filled=0.0, responses=[{}],
+    )
+    market = plugin._market
+    assert market is not None
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is False
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is False, \
+        "nothing settled yet, and no second request is sent"
+
+    # The execution books on the row while its event still waits in the
+    # queue: the engine has not armed the partial protection on it yet, so
+    # the cancel is still not landed.
+    events = plugin._translate_executions(_execution_push(coid, 'e-won', '0.004'), market)
+    assert len(events) == 1 and events[0].fill_qty == pytest.approx(0.004)
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is False
+    plugin.store_ctx.record_fill_receipts([FillReceipt('e-won', booked=True, fee=0.0)])
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is True
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.filled_qty == pytest.approx(0.004)
 
 
 def __test_bybit_partial_entry_cancel_push_normalizes_to_cum_exec__(tmp_path):
@@ -1782,7 +1885,7 @@ def __test_bybit_cancel_of_a_filled_entry_keeps_its_row__(tmp_path):
     plugin, coid = _partial_entry_plugin(
         tmp_path, "unfilled-cancel", filled=0.0, responses=[{}],
     )
-    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is True
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is False
     row = plugin.store_ctx.get_order(coid)
     assert row is not None and row.closed_ts_ms is None
     plugin._translate_order_rows({
@@ -1794,6 +1897,8 @@ def __test_bybit_cancel_of_a_filled_entry_keeps_its_row__(tmp_path):
     }, plugin._market)
     row = plugin.store_ctx.get_order(coid)
     assert row is not None and row.closed_ts_ms is not None
+    # The zero-fill proof lands the engine's retry, with no request sent.
+    assert asyncio.run(plugin.execute_cancel(_entry_cancel_envelope())) is True
 
 
 def __test_bybit_spot_port_min_sellable_floor__():
@@ -2043,6 +2148,160 @@ def __test_bybit_spot_base_fee_close_never_quarantines__(tmp_path):
     assert manager.fold.violation is None
     assert not manager.quarantined
     assert not quarantine_calls
+    store.close()
+
+
+def __test_bybit_spot_fill_whose_booking_failed_is_booked_on_retry__(tmp_path, monkeypatch):
+    """A spot fill the inventory ledger committed is booked once its booking lands.
+
+    The ledger commits the fill as delivered before the order booking runs
+    and dedups every later copy; a failed booking keeps the execution
+    pending, and the retry (or a replayed copy) books it and emits its event
+    exactly once.
+    """
+    plugin = _FakeBrokerBybit()
+    market = plugin._market
+    assert market is not None and market.category == 'spot'
+    store = BrokerStore(tmp_path / "spot_retry.sqlite", plugin_name=plugin.plugin_name)
+    plugin.store_ctx = store.open_run(RunIdentity(
+        strategy_id="spot_retry", symbol="BTCUSDT", timeframe="1", account_id="acct-spot",
+    ), script_source="// spot retry")
+    port = spot_port_for(plugin, market)
+    manager = SpotInventoryManager(
+        plugin.store_ctx, port, account_id="acct-spot", symbol="BTCUSDT",
+        request_quarantine=lambda *_args, **_kw: None,
+    )
+    manager._started = True
+    plugin._spot_manager = manager
+    plugin._spot_port = port
+    plugin._record_identity('coid-buy', pine_id='L', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.001)
+    frame = {'topic': 'execution', 'data': [{
+        'symbol': 'BTCUSDT', 'category': 'spot', 'execType': 'Trade',
+        'execId': 'r-buy', 'orderId': '901', 'orderLinkId': 'coid-buy',
+        'side': 'Buy', 'execQty': '0.001', 'execPrice': '64000',
+        'execFee': '0.000001', 'feeCurrency': 'BTC', 'execTime': '1752600000000',
+    }]}
+
+    def failing_booking(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(plugin, '_book_own_execution', failing_booking)
+        with pytest.raises(sqlite3.OperationalError):
+            plugin._translate_executions(frame, market)
+    assert manager.fold.net_base == Decimal('0.000999')
+    assert 'r-buy' not in plugin._seen_exec_ids
+    assert list(plugin._spot_bookings_pending) == ['r-buy']
+    events = plugin._retry_spot_bookings(market)
+    assert [e.fill_id for e in events] == ['r-buy']
+    assert events[0].fill_qty == pytest.approx(0.000999)
+    assert plugin._spot_bookings_pending == {}
+    assert plugin._translate_executions(frame, market) == []
+    assert plugin._retry_spot_bookings(market) == []
+    assert manager.fold.net_base == Decimal('0.000999')
+    store.close()
+
+
+def __test_bybit_spot_fill_whose_fold_refresh_failed_is_booked_on_retry__(
+        tmp_path, monkeypatch):
+    """A spot fill the inventory ledger committed before its fold refresh raised is booked once.
+
+    The ledger commits the fill as delivered and then refreshes its fold;
+    when the refresh raises, the execution is already owed its booking, so
+    the retry books it although the ledger reports the copy as a replay.
+    """
+    plugin = _FakeBrokerBybit()
+    market = plugin._market
+    assert market is not None and market.category == 'spot'
+    store = BrokerStore(tmp_path / "spot_refresh.sqlite", plugin_name=plugin.plugin_name)
+    plugin.store_ctx = store.open_run(RunIdentity(
+        strategy_id="spot_refresh", symbol="BTCUSDT", timeframe="1", account_id="acct-spot",
+    ), script_source="// spot refresh")
+    port = spot_port_for(plugin, market)
+    manager = SpotInventoryManager(
+        plugin.store_ctx, port, account_id="acct-spot", symbol="BTCUSDT",
+        request_quarantine=lambda *_args, **_kw: None,
+    )
+    manager._started = True
+    plugin._spot_manager = manager
+    plugin._spot_port = port
+    plugin._record_identity('coid-buy', pine_id='L', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.001)
+    frame = {'topic': 'execution', 'data': [{
+        'symbol': 'BTCUSDT', 'category': 'spot', 'execType': 'Trade',
+        'execId': 'r-buy', 'orderId': '901', 'orderLinkId': 'coid-buy',
+        'side': 'Buy', 'execQty': '0.001', 'execPrice': '64000',
+        'execFee': '0.000001', 'feeCurrency': 'BTC', 'execTime': '1752600000000',
+    }]}
+
+    def failing_refresh(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(manager, '_refresh_fold', failing_refresh)
+        with pytest.raises(sqlite3.OperationalError):
+            plugin._translate_executions(frame, market)
+    assert 'r-buy' not in plugin._seen_exec_ids
+    assert list(plugin._spot_bookings_pending) == ['r-buy']
+    events = plugin._retry_spot_bookings(market)
+    assert [e.fill_id for e in events] == ['r-buy']
+    assert events[0].fill_qty == pytest.approx(0.000999)
+    assert plugin._spot_bookings_pending == {}
+    assert plugin._translate_executions(frame, market) == []
+    assert plugin._retry_spot_bookings(market) == []
+    store.close()
+
+
+def __test_bybit_delivered_spot_fill_whose_dedup_check_failed_is_not_booked_again__(
+        tmp_path, monkeypatch):
+    """A fill the ledger held before a failing inventory entry is not owed a booking.
+
+    The execution was booked and delivered; with the in-memory de-dup
+    frontier empty (a fresh process sees the same copy), the inventory
+    entry raises before it decides the copy is a replay. Neither the retry
+    nor a later copy books it a second time.
+    """
+    plugin = _FakeBrokerBybit()
+    plugin._account_id = "acct-spot"
+    market = plugin._market
+    assert market is not None and market.category == 'spot'
+    store = BrokerStore(tmp_path / "spot_dedup.sqlite", plugin_name=plugin.plugin_name)
+    plugin.store_ctx = store.open_run(RunIdentity(
+        strategy_id="spot_dedup", symbol="BTCUSDT", timeframe="1", account_id="acct-spot",
+    ), script_source="// spot dedup")
+    port = spot_port_for(plugin, market)
+    manager = SpotInventoryManager(
+        plugin.store_ctx, port, account_id="acct-spot", symbol="BTCUSDT",
+        request_quarantine=lambda *_args, **_kw: None,
+    )
+    manager._started = True
+    plugin._spot_manager = manager
+    plugin._spot_port = port
+    plugin._record_identity('coid-buy', pine_id='L', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.001)
+    frame = {'topic': 'execution', 'data': [{
+        'symbol': 'BTCUSDT', 'category': 'spot', 'execType': 'Trade',
+        'execId': 'd-buy', 'orderId': '901', 'orderLinkId': 'coid-buy',
+        'side': 'Buy', 'execQty': '0.001', 'execPrice': '64000',
+        'execFee': '0.000001', 'feeCurrency': 'BTC', 'execTime': '1752600000000',
+    }]}
+    assert [e.fill_id for e in plugin._translate_executions(frame, market)] == ['d-buy']
+    booked_cum = dict(plugin._filled_cum)
+    plugin._seen_exec_ids.clear()
+
+    def failing_entry(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(manager, '_record_execution', failing_entry)
+        with pytest.raises(sqlite3.OperationalError):
+            plugin._translate_executions(frame, market)
+    assert plugin._spot_bookings_pending == {}
+    assert plugin._retry_spot_bookings(market) == []
+    assert plugin._translate_executions(frame, market) == []
+    assert plugin._filled_cum == booked_cum
+    assert manager.fold.net_base == Decimal('0.000999')
     store.close()
 
 
@@ -4076,3 +4335,852 @@ def __test_bybit_fill_events_carry_the_journal_quantity__(tmp_path):
     assert len(events) == 1
     assert events[0].fill_qty == pytest.approx(0.001)
     assert events[0].journal_fill_qty == 100.0
+
+
+__test_helper_ENTRY_COID = 'coid-entry'
+
+__test_helper_ORDER_NOT_FOUND = 170213
+
+#: The cancel probe's answer per entry-order state, the same in the running
+#: process and after a restart (the probe has one verdict for both).
+__test_helper_CANCEL_PROBE_EXPECTED = {
+    'working': CancelDispositionOutcome.UNKNOWN,
+    'partially_filled_working': CancelDispositionOutcome.ALREADY_FILLED,
+    'cancelled_zero_fill': CancelDispositionOutcome.CANCEL_CONFIRMED,
+    'cancelled_after_partial_fill': CancelDispositionOutcome.ALREADY_FILLED,
+    'rejected_at_create': CancelDispositionOutcome.CANCEL_CONFIRMED,
+    'rejected_after_ack': CancelDispositionOutcome.CANCEL_CONFIRMED,
+    'filled_open': CancelDispositionOutcome.ALREADY_FILLED,
+    'filled_open_history_gone': CancelDispositionOutcome.ALREADY_FILLED,
+    'filled_closed_flat': CancelDispositionOutcome.FILLED_AND_CLOSED,
+    'filled_closed_by_netting': CancelDispositionOutcome.UNKNOWN,
+    'never_reached_no_row': CancelDispositionOutcome.UNKNOWN,
+    'never_reached_pending_row': CancelDispositionOutcome.UNKNOWN,
+    'rejected_on_absence_still_absent': CancelDispositionOutcome.CANCEL_CONFIRMED,
+    'rejected_on_absence_shows_filled': CancelDispositionOutcome.UNKNOWN,
+}
+
+
+def __test_helper_open_probe_run(tmp_path, name: str):
+    """A linear plugin with a fresh store run; returns ``(plugin, store, identity)``."""
+    plugin = _linear_plugin()
+    store = BrokerStore(tmp_path / f"{name}.sqlite", plugin_name=plugin.plugin_name)
+    identity = RunIdentity(
+        strategy_id="probe", symbol="BTCUSDT", timeframe="1", account_id=f"probe-{name}",
+    )
+    plugin.store_ctx = store.open_run(identity, script_source="// probe")
+    return plugin, store, identity
+
+
+def __test_helper_restart(plugin, store, identity):
+    """End the plugin's process instance and start a new one on the same run."""
+    plugin.store_ctx.close()
+    fresh = _linear_plugin()
+    fresh.store_ctx = store.open_run(identity, script_source="// probe")
+    return fresh
+
+
+def __test_helper_entry_row(plugin, *, filled: float = 0.0, state: str = 'confirmed',
+                            order_id: str | None = '601') -> None:
+    """Journal the working LIMIT entry ``Long`` the cancel aims at."""
+    coid = __test_helper_ENTRY_COID
+    plugin._record_identity(coid, pine_id='Long', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.01)
+    extras: dict = {'kind': ENTRY_KIND_WORKING}
+    if order_id is not None:
+        extras['order_id'] = order_id
+    plugin.store_ctx.upsert_order(
+        coid, symbol='BTCUSDT', side='buy', qty=0.01, filled_qty=filled, state=state,
+        intent_key='Long', pine_entry_id='Long', exchange_order_id=order_id,
+        extras=extras,
+    )
+
+
+def __test_helper_venue_order(plugin, coid: str, status: str, cum_exec: str | None) -> dict:
+    """One venue order object of ``coid`` as the order endpoints and push return it."""
+    row = plugin.store_ctx.get_order_for_run_id(coid)
+    created = row.created_ts_ms if row is not None else int(epoch_time() * 1000)
+    order = {
+        'symbol': 'BTCUSDT', 'orderId': '601', 'orderLinkId': coid,
+        'orderStatus': status, 'side': 'Buy', 'orderType': 'Limit', 'qty': '0.01',
+        'price': '90000', 'createdTime': str(created),
+    }
+    if cum_exec is not None:
+        order['cumExecQty'] = cum_exec
+    return order
+
+
+def __test_helper_order_push(plugin, coid: str, status: str, cum_exec: str | None) -> None:
+    """Deliver one private ``order`` push of ``coid``."""
+    plugin._translate_order_rows({
+        'topic': 'order',
+        'data': [__test_helper_venue_order(plugin, coid, status, cum_exec)],
+    }, plugin._market)
+
+
+def __test_helper_prepare_cancel_probe(plugin, state: str) -> list:
+    """Journal one entry-order state; returns the venue answers the probe will read.
+
+    The answers are what the venue holds for the state: the cancel request's
+    reply, then the ``orderLinkId`` read (open set, then history).
+    """
+    coid = __test_helper_ENTRY_COID
+    not_found = BybitAPIError("order not exists", ret_code=__test_helper_ORDER_NOT_FOUND)
+    nothing = {'list': []}
+    if state == 'working':
+        __test_helper_entry_row(plugin)
+        return [{}]
+    if state == 'partially_filled_working':
+        __test_helper_entry_row(plugin, filled=0.004)
+        return [{}]
+    if state == 'cancelled_zero_fill':
+        __test_helper_entry_row(plugin)
+        __test_helper_order_push(plugin, coid, 'Cancelled', '0')
+        return []
+    if state == 'cancelled_after_partial_fill':
+        __test_helper_entry_row(plugin, filled=0.004)
+        __test_helper_order_push(plugin, coid, 'PartiallyFilledCanceled', '0.004')
+        order = __test_helper_venue_order(plugin, coid, 'PartiallyFilledCanceled', '0.004')
+        return [not_found, nothing, {'list': [order]}]
+    if state == 'rejected_at_create':
+        __test_helper_entry_row(plugin, state='submitted', order_id=None)
+        mark_rejected(plugin.store_ctx, coid=coid)
+        return []
+    if state == 'rejected_after_ack':
+        __test_helper_entry_row(plugin)
+        __test_helper_order_push(plugin, coid, 'Rejected', '0')
+        return []
+    if state == 'filled_open':
+        __test_helper_entry_row(plugin, filled=0.01)
+        order = __test_helper_venue_order(plugin, coid, 'Filled', '0.01')
+        return [not_found, nothing, {'list': [order]}]
+    if state == 'filled_open_history_gone':
+        __test_helper_entry_row(plugin, filled=0.01)
+        return [not_found, nothing, nothing]
+    if state == 'filled_closed_flat':
+        __test_helper_entry_row(plugin, filled=0.01)
+        plugin._deriv_is_flat = lambda: True
+        plugin._sweep_waits_for_ledger = lambda: False
+        plugin._close_entry_rows_when_flat(plugin._market)
+        assert plugin.store_ctx.get_order(coid).closed_ts_ms is not None
+        return []
+    if state == 'filled_closed_by_netting':
+        __test_helper_entry_row(plugin, filled=0.01)
+        plugin._net_entry_row(plugin.store_ctx.get_order(coid), 0.01)
+        assert plugin.store_ctx.get_order(coid).closed_ts_ms is not None
+        order = __test_helper_venue_order(plugin, coid, 'Filled', '0.01')
+        return [nothing, {'list': [order]}]
+    if state == 'never_reached_no_row':
+        return []
+    if state.startswith('rejected_on_absence'):
+        # A dispatch whose answer was lost, rejected by the parked-dispatch
+        # resolver after three lookups that did not find it: an inference,
+        # so the probe reads the venue again before it confirms the cancel.
+        __test_helper_entry_row(plugin, state='disposition_unknown', order_id=None)
+        aged_now = epoch_time() + 3600.0
+        resolver = ParkedDispatchResolver(venue="Bybit", log=logging.getLogger(__name__),
+                                          clock=lambda: aged_now)
+
+        async def absent(_row):
+            return ParkedVerdict(ParkedOutcome.ABSENT)
+
+        for _ in range(3):
+            asyncio.run(resolver.resolve(plugin.store_ctx, absent))
+        row = plugin.store_ctx.get_order(coid)
+        assert row is not None and row.state == 'rejected' and row.closed_ts_ms is not None
+        if state == 'rejected_on_absence_still_absent':
+            return [nothing, nothing]
+        order = __test_helper_venue_order(plugin, coid, 'Filled', '0.01')
+        return [nothing, {'list': [order]}]
+    assert state == 'never_reached_pending_row'
+    __test_helper_entry_row(plugin, state='submitted', order_id=None)
+    return [not_found, nothing, nothing]
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['running', 'restart'])
+@pytest.mark.parametrize('state', list(__test_helper_CANCEL_PROBE_EXPECTED))
+def __test_bybit_cancel_probe_answers_from_the_order_state__(tmp_path, state, restart):
+    """The cancel probe's answer for every state the entry order can be in.
+
+    The answer is :data:`__test_helper_CANCEL_PROBE_EXPECTED`, in the process
+    that journaled the state and in a new process instance of the run alike:
+    a row closed before the restart stays with the prior instance, and a live
+    one is adopted. An ended order is answered from the journal, reading the
+    venue only when the journal proves nothing, and an outcome that neither
+    proves stays UNKNOWN. Every venue read the probe makes is one of the
+    state's canned answers, and all of them are used.
+    """
+    plugin, store, identity = __test_helper_open_probe_run(tmp_path, state)
+    responses = __test_helper_prepare_cancel_probe(plugin, state)
+    if restart:
+        plugin = __test_helper_restart(plugin, store, identity)
+    plugin._responses = list(responses)
+    outcome = asyncio.run(plugin.execute_cancel_with_outcome(_entry_cancel_envelope()))
+    assert outcome is __test_helper_CANCEL_PROBE_EXPECTED[state]
+    assert plugin._responses == []
+    plugin.store_ctx.close()
+
+
+@pytest.mark.parametrize(('status', 'cum_exec', 'expected'), [
+    ('Cancelled', '0', CancelDispositionOutcome.CANCEL_CONFIRMED),
+    ('Filled', '0.01', CancelDispositionOutcome.ALREADY_FILLED),
+    ('PartiallyFilledCanceled', '0.004', CancelDispositionOutcome.ALREADY_FILLED),
+], ids=['cancelled', 'filled_after_ack', 'partially_filled_after_ack'])
+def __test_bybit_entry_cancel_ack_is_settled_by_the_next_probe__(
+        tmp_path, status, cum_exec, expected):
+    """A clean cancel ACK of an entry proves no unfilled end; the next probe settles it.
+
+    Bybit processes a cancel request asynchronously, and a fill can still win
+    after the ACK. The first probe therefore answers UNKNOWN (the core keeps
+    the legs cancel-tentative); the next one finds the order gone, reads it
+    back by ``orderLinkId`` and answers from the ended order.
+    """
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, f"ack-{status}")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    plugin._responses = [{}]
+    outcome = asyncio.run(plugin.execute_cancel_with_outcome(_entry_cancel_envelope()))
+    assert outcome is CancelDispositionOutcome.UNKNOWN
+    not_found = BybitAPIError("order not exists", ret_code=__test_helper_ORDER_NOT_FOUND)
+    order = __test_helper_venue_order(plugin, coid, status, cum_exec)
+    plugin._responses = [not_found, {'list': []}, {'list': [order]}]
+    outcome = asyncio.run(plugin.execute_cancel_with_outcome(_entry_cancel_envelope()))
+    assert outcome is expected
+    assert plugin._responses == []
+    plugin.store_ctx.close()
+
+
+def __test_bybit_entry_cancel_ack_then_unfilled_push_confirms_the_cancel__(tmp_path):
+    """After a cancel ACK, the terminal push proving zero fills lets the probe confirm."""
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, "ack-push")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    plugin._responses = [{}]
+    outcome = asyncio.run(plugin.execute_cancel_with_outcome(_entry_cancel_envelope()))
+    assert outcome is CancelDispositionOutcome.UNKNOWN
+    __test_helper_order_push(plugin, coid, 'Cancelled', '0')
+    plugin._responses = []
+    outcome = asyncio.run(plugin.execute_cancel_with_outcome(_entry_cancel_envelope()))
+    assert outcome is CancelDispositionOutcome.CANCEL_CONFIRMED
+    plugin.store_ctx.close()
+
+
+@pytest.mark.parametrize('status', ['PartiallyFilledCanceled', 'Filled'])
+def __test_bybit_executed_status_with_zero_cum_exec_is_no_unfilled_proof__(tmp_path, status):
+    """An ended entry whose status states an execution but whose figure is zero proves nothing.
+
+    Neither the push nor the disappearance readback may journal the zero as
+    the proof that the entry never executed: the cancel probe would confirm
+    the cancel from it and the core would abort the entry's protection.
+    """
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, f"contradictory-{status}")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    if status == 'PartiallyFilledCanceled':
+        __test_helper_order_push(plugin, coid, status, '0')
+    order = __test_helper_venue_order(plugin, coid, status, '0')
+
+    async def lookup(_market, _coid):
+        return order, True
+
+    plugin._confirm_lookup = lookup
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None
+    confirmation = asyncio.run(plugin._confirm_vanished_order(plugin._market, row))
+    assert confirmation.resolution.name == 'INCONCLUSIVE'
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert ENTRY_CANCEL_CUM_EXEC_EXTRA not in (row.extras or {})
+    assert plugin._entry_cancel_verdict(row, None) is CancelDispositionOutcome.UNKNOWN
+    plugin.store_ctx.close()
+
+
+def __test_helper_close_row(plugin) -> str:
+    """Dispatch a one-way market close through the plugin; returns its client order id."""
+    plugin._responses = [{'orderId': '701'}]
+    asyncio.run(plugin.execute_close(DispatchEnvelope(
+        intent=CloseIntent(pine_id='Long', symbol='BTCUSDT', side='sell', qty=0.004),
+        run_tag='t3st', bar_ts_ms=1_752_600_000_000, coid_max_len=36,
+    )))
+    _, _, body = plugin.calls[-1]
+    return body['orderLinkId']
+
+
+def __test_helper_held_close_outcome(store_ctx, coid: str) -> str:
+    """The core's verdict on a held partial-bracket close, read from ``store_ctx``."""
+    engine = SimpleNamespace(_store_ctx=store_ctx, _broker=SimpleNamespace())
+    engine._held_order_close_outcome = (
+        lambda close_coid: OrderSyncEngine._held_order_close_outcome(engine, close_coid))
+    return OrderSyncEngine._held_trigger_close_outcome(engine, coid).outcome
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['running', 'restart'])
+@pytest.mark.parametrize(('ending', 'expected'), [
+    (None, 'working'),
+    (('fill', '0.004'), 'sent'),
+    (('Cancelled', '0'), 'refused'),
+    (('Deactivated', '0'), 'refused'),
+    (('Rejected', '0'), 'refused'),
+    (('PartiallyFilledCanceled', '0.002'), 'partial'),
+    (('Cancelled', '0.002'), 'partial'),
+    (('Cancelled', '0.004'), 'sent'),
+    (('PartiallyFilledCanceled', '0'), 'working'),
+    (('Cancelled', None), 'working'),
+], ids=['working', 'filled', 'cancelled_zero_fill', 'deactivated_zero_fill',
+        'rejected_zero_fill', 'cancelled_after_partial_fill', 'cancelled_with_fill',
+        'cancelled_after_full_fill', 'contradictory_partial', 'no_cum_exec'])
+def __test_bybit_close_row_ending_settles_the_held_close__(tmp_path, ending, expected, restart):
+    """How a close's venue order ended decides the core's held-close verdict.
+
+    The core settles a held partial-bracket close only from the close's
+    journal: a filled quantity or a ``confirmed`` event is ``'sent'``, the
+    core's ended-unfilled mark ``'refused'`` (the leg re-arms), its
+    ended-partially mark ``'partial'`` (the leg re-arms for the rest), a live
+    row the venue acknowledged ``'working'``, and an ended row with none of
+    them ``'unknown'`` (quarantine). A cancel push with a zero ``cumExecQty``
+    proves nothing executed (the row keeps its state: the venue did not
+    refuse the order); a positive one proves the close executed that much,
+    journaled as the completion event when it is the whole close and as the
+    ended-partially mark with the figure otherwise, while the fill cursor is
+    left to the bookings; a push without a ``cumExecQty``, or a contradictory
+    one, proves nothing and leaves the row live (``'working'``) for a later
+    push or the disappearance readback. A second copy of the push changes
+    nothing.
+    """
+    plugin, store, identity = __test_helper_open_probe_run(tmp_path, f"close-{expected}")
+    coid = __test_helper_close_row(plugin)
+    if ending is not None:
+        status, cum_exec = ending
+        if status == 'fill':
+            plugin._translate_executions(_execution_push(coid, 'e-close', cum_exec),
+                                         plugin._market)
+        else:
+            for _ in range(2):
+                __test_helper_order_push(plugin, coid, status, cum_exec)
+            row = plugin.store_ctx.get_order(coid)
+            assert row is not None
+            assert (row.closed_ts_ms is None) == (expected == 'working')
+            assert row.filled_qty == 0.0
+            executed_events = [
+                key for key, event_coid, _xid, _payload
+                in plugin.store_ctx.iter_events_by_kind_for_run_id('confirmed')
+                if event_coid == coid]
+            assert len(executed_events) == (1 if expected == 'sent' else 0)
+            ended = {kind: [payload for _key, event_coid, _xid, payload
+                            in plugin.store_ctx.iter_events_by_kind_for_run_id(kind)
+                            if event_coid == coid]
+                     for kind in (CLOSE_ENDED_UNFILLED_EVENT, CLOSE_ENDED_PARTIALLY_EVENT)}
+            assert len(ended[CLOSE_ENDED_UNFILLED_EVENT]) == (1 if expected == 'refused' else 0)
+            assert [payload[CLOSE_EXECUTED_QTY_KEY]
+                    for payload in ended[CLOSE_ENDED_PARTIALLY_EVENT]] == (
+                [float(cum_exec)] if expected == 'partial' else [])
+            assert row.state != 'rejected'
+    if restart:
+        plugin = __test_helper_restart(plugin, store, identity)
+    assert __test_helper_held_close_outcome(plugin.store_ctx, coid) == expected
+    plugin.store_ctx.close()
+
+
+@pytest.mark.parametrize(('cum_exec', 'expected'), [
+    ('0', 'refused'), ('0.002', 'unknown'), (None, 'working'),
+], ids=['zero_fill', 'unbooked_fill', 'no_cum_exec'])
+def __test_bybit_vanished_close_row_journals_its_ending__(tmp_path, cum_exec, expected):
+    """The disappearance pass settles a close whose cancel push went missing.
+
+    It reads the order by ``orderLinkId``; a dead order with a zero
+    ``cumExecQty`` is journaled as executing nothing before the row is
+    retired, so the core re-arms the held leg instead of quarantining. A
+    fill the row has not booked yet keeps the row live (the fill recovery
+    books it), and so does an order without a ``cumExecQty``: it proves
+    neither a fill nor its absence, so nothing is journaled or retired.
+    """
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, f"vanish-{expected}")
+    coid = __test_helper_close_row(plugin)
+    order = __test_helper_venue_order(plugin, coid, 'Cancelled', cum_exec)
+
+    async def lookup(_market, _coid):
+        return order, True
+
+    plugin._confirm_lookup = lookup
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None
+    confirmation = asyncio.run(plugin._confirm_vanished_order(plugin._market, row))
+    if cum_exec in ('0.002', None):
+        assert confirmation.resolution.name == 'INCONCLUSIVE'
+        assert plugin.store_ctx.get_order(coid).closed_ts_ms is None
+        assert __test_helper_held_close_outcome(plugin.store_ctx, coid) == 'working'
+        plugin.store_ctx.close()
+        return
+    assert confirmation.resolution.name == 'CANCELLED'
+    plugin._retire_vanished_cancelled_row(row)
+    assert plugin.store_ctx.get_order(coid).closed_ts_ms is not None
+    assert __test_helper_held_close_outcome(plugin.store_ctx, coid) == expected
+    plugin.store_ctx.close()
+
+
+@pytest.mark.parametrize('status', ['Cancelled', 'Filled'])
+@pytest.mark.parametrize('cum_exec', [None, 'nan', '-0.004', 'inf'],
+                         ids=['missing', 'nan', 'negative', 'infinite'])
+def __test_bybit_vanished_entry_without_cum_exec_is_not_proven_unfilled__(
+        tmp_path, status, cum_exec):
+    """An ended entry order without a readable ``cumExecQty`` keeps its row live.
+
+    The disappearance verdict would otherwise retire the row with its empty
+    fill cursor as the terminal figure, journal a zero as the proof that the
+    entry never executed, and the cancel probe would then confirm the cancel
+    from that proof without reading the venue again.
+    """
+    plugin, _store, _identity = __test_helper_open_probe_run(
+        tmp_path, f"vanish-entry-{status}-{cum_exec}")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    order = __test_helper_venue_order(plugin, coid, status, cum_exec)
+
+    async def lookup(_market, _coid):
+        return order, True
+
+    plugin._confirm_lookup = lookup
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None
+    confirmation = asyncio.run(plugin._confirm_vanished_order(plugin._market, row))
+    assert confirmation.resolution.name == 'INCONCLUSIVE'
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert ENTRY_CANCEL_CUM_EXEC_EXTRA not in (row.extras or {})
+    assert coid not in plugin._unbooked_fill_orders
+    plugin.store_ctx.close()
+
+
+@pytest.mark.parametrize('cum_exec', ['nan', '-0.002', 'inf'])
+def __test_bybit_close_push_with_invalid_cum_exec_journals_nothing__(tmp_path, cum_exec):
+    """A close's cancel push with a non-finite or negative ``cumExecQty`` proves nothing.
+
+    No ending is journaled and the row stays live, so the core's held-close
+    verdict stays ``'working'`` instead of reading a fabricated zero as
+    ``'refused'``, and the later push that carries the figure still settles
+    the close (a closed row would be read by neither that push nor the
+    disappearance readback).
+    """
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, f"close-invalid-{cum_exec}")
+    coid = __test_helper_close_row(plugin)
+    __test_helper_order_push(plugin, coid, 'Cancelled', cum_exec)
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    for kind in (CLOSE_ENDED_UNFILLED_EVENT, CLOSE_ENDED_PARTIALLY_EVENT, 'confirmed'):
+        assert [event_coid for _key, event_coid, _xid, _payload
+                in plugin.store_ctx.iter_events_by_kind_for_run_id(kind)
+                if event_coid == coid] == []
+    assert __test_helper_held_close_outcome(plugin.store_ctx, coid) == 'working'
+    __test_helper_order_push(plugin, coid, 'Cancelled', '0')
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is not None
+    assert __test_helper_held_close_outcome(plugin.store_ctx, coid) == 'refused'
+    plugin.store_ctx.close()
+
+
+def __test_bybit_close_push_ahead_of_its_cursor_queues_the_fill_recovery__(tmp_path):
+    """A terminal close push reporting executions the row has not booked queues them.
+
+    The row closes on the push, but its trade and fee records are still owed:
+    the per-order recovery must read the order's executions by ``orderId``,
+    since the windowed backfill misses an execution indexed past its overlap.
+    """
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, "close-recovery")
+    coid = __test_helper_close_row(plugin)
+    __test_helper_order_push(plugin, coid, 'PartiallyFilledCanceled', '0.002')
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is not None
+    assert plugin._unbooked_fill_orders[coid] == ('601', Decimal('0.002'))
+    assert plugin.fill_recovery_pending(['Long'])
+    plugin.store_ctx.close()
+
+
+def __test_bybit_close_push_without_unbooked_fills_queues_no_recovery__(tmp_path):
+    """A close push whose ``cumExecQty`` the row's cursor already covers queues nothing."""
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, "close-no-recovery")
+    coid = __test_helper_close_row(plugin)
+    __test_helper_order_push(plugin, coid, 'Cancelled', '0')
+    assert coid not in plugin._unbooked_fill_orders
+    plugin.store_ctx.close()
+
+
+# === Terminal events without the venue's executed quantity ===================
+
+def __test_helper_settle_cancelled(plugin) -> list:
+    """Run one cancel settlement pass; the events it handed over."""
+    events: list = []
+    asyncio.run(plugin._settle_cancelled_entries(plugin._market, events))
+    return events
+
+
+def __test_helper_history_readback(plugin, coid: str, status: str, cum_exec: str,
+                                   cancel_type: str | None = None) -> list:
+    """The ``orderLinkId`` read of an ended order: not open, found in history."""
+    order = __test_helper_venue_order(plugin, coid, status, cum_exec)
+    if cancel_type is not None:
+        order['cancelType'] = cancel_type
+    return [{'list': []}, {'list': [order]}]
+
+
+@pytest.mark.parametrize(('status', 'event_type'), [
+    ('Cancelled', 'cancelled'), ('Rejected', 'rejected'), ('PartiallyFilledCanceled', 'cancelled'),
+], ids=['cancelled', 'rejected', 'contradictory_zero'])
+def __test_bybit_terminal_push_without_cum_exec_keeps_the_entry_unproven__(
+        tmp_path, status, event_type):
+    """A terminal entry push without a usable ``cumExecQty`` proves no unfilled end.
+
+    The event carries ``filled_qty_known=False`` (the core keeps the entry's
+    mapping, legs and tentative state), the row stays live and owes the
+    terminal event. The cancel settlement's history readback then delivers
+    the same terminal event with the venue's quantity, exactly once.
+    """
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, f"unproven-{status}")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    cum_exec = '0' if status == 'PartiallyFilledCanceled' else None
+    order = __test_helper_venue_order(plugin, coid, status, cum_exec)
+    order['cancelType'] = 'CancelByUser'
+    events = plugin._translate_order_rows({'topic': 'order', 'data': [order]}, plugin._market)
+    assert [e.event_type for e in events] == [event_type]
+    pushed = events[0].order
+    assert pushed.filled_qty_known is False and not pushed.proven_unexecuted
+    assert pushed.filled_qty == 0.0 and pushed.client_order_id == coid
+    row = plugin.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    assert row.extras[ENTRY_TERMINAL_EVENT_OWED_EXTRA] == {
+        'event_type': event_type, 'cancel_type': 'CancelByUser',
+    }
+
+    # The readback is a known figure: the owed event goes out once.
+    settled_status = 'Cancelled' if status == 'PartiallyFilledCanceled' else status
+    plugin._responses = __test_helper_history_readback(plugin, coid, settled_status, '0')
+    settled = __test_helper_settle_cancelled(plugin)
+    assert plugin._responses == []
+    assert [(e.event_type, e.pine_id, e.order.client_order_id) for e in settled] == \
+        [(event_type, 'Long', coid)]
+    assert settled[0].order.filled_qty_known is True and settled[0].order.proven_unexecuted
+    row = plugin.store_ctx.get_order(coid)
+    assert row.closed_ts_ms is not None
+    assert ENTRY_TERMINAL_EVENT_OWED_EXTRA not in (row.extras or {})
+    assert __test_helper_settle_cancelled(plugin) == []
+    plugin.store_ctx.close()
+
+
+def __test_bybit_owed_terminal_event_carries_the_readback_execution__(tmp_path):
+    """The re-delivered terminal event carries the execution the history proves."""
+    plugin, store, identity = __test_helper_open_probe_run(tmp_path, "owed-executed")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    __test_helper_order_push(plugin, coid, 'Cancelled', None)
+    # The obligation survives a restart: it is in the journal row.
+    plugin = __test_helper_restart(plugin, store, identity)
+    plugin._responses = __test_helper_history_readback(
+        plugin, coid, 'PartiallyFilledCanceled', '0.004', cancel_type='CancelByUser')
+    settled = __test_helper_settle_cancelled(plugin)
+    assert [e.event_type for e in settled] == ['cancelled']
+    assert settled[0].order.filled_qty == pytest.approx(0.004)
+    assert settled[0].order.filled_qty_known is True
+    row = plugin.store_ctx.get_order(coid)
+    assert row.closed_ts_ms is None and row.qty == pytest.approx(0.004)
+    assert ENTRY_TERMINAL_EVENT_OWED_EXTRA not in row.extras
+    assert __test_helper_settle_cancelled(plugin) == []
+    plugin.store_ctx.close()
+
+
+def __test_helper_second_owed_entry(plugin) -> str:
+    """Journal a second working entry ``Short`` and leave its terminal event owed."""
+    coid = 'coid-entry-2'
+    plugin._record_identity(coid, pine_id='Short', from_entry=None,
+                            leg_type=LegType.ENTRY, qty=0.01)
+    plugin.store_ctx.upsert_order(
+        coid, symbol='BTCUSDT', side='sell', qty=0.01, filled_qty=0.0, state='confirmed',
+        intent_key='Short', pine_entry_id='Short', exchange_order_id='602',
+        extras={'kind': ENTRY_KIND_WORKING, 'order_id': '602'},
+    )
+    order = __test_helper_venue_order(plugin, coid, 'Cancelled', None)
+    order['orderId'] = '602'
+    plugin._translate_order_rows({'topic': 'order', 'data': [order]}, plugin._market)
+    return coid
+
+
+def __test_bybit_owed_terminal_event_survives_a_later_lookup_failure__(tmp_path, monkeypatch):
+    """A settled owed event is handed over before the next row's lookup can fail.
+
+    The first owed entry settles (its mark cleared, its row closed); the
+    second entry's lookup raises. The first event is already in the caller's
+    list, so the reconcile wrapper moves it to the outbox.
+    """
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, "owed-two")
+    __test_helper_entry_row(plugin)
+    first = __test_helper_ENTRY_COID
+    __test_helper_order_push(plugin, first, 'Cancelled', None)
+    second = __test_helper_second_owed_entry(plugin)
+    readback = __test_helper_venue_order(plugin, first, 'Cancelled', '0')
+
+    async def lookup(_market, coid):
+        if coid == second:
+            raise RuntimeError("lookup failed")
+        return readback, True
+
+    monkeypatch.setattr(plugin, '_confirm_lookup', lookup)
+    events: list = []
+    with pytest.raises(RuntimeError):
+        asyncio.run(plugin._settle_cancelled_entries(plugin._market, events))
+    assert [(e.event_type, e.order.client_order_id, e.order.filled_qty_known)
+            for e in events] == [('cancelled', first, True)]
+    assert plugin.store_ctx.get_order(first).closed_ts_ms is not None
+    assert ENTRY_TERMINAL_EVENT_OWED_EXTRA in plugin.store_ctx.get_order(second).extras
+    plugin.store_ctx.close()
+
+
+def __test_bybit_ready_owed_terminal_event_is_redelivered_after_a_restart__(tmp_path):
+    """An owed event the engine never applied goes out once from the next process.
+
+    The engine's durable fill-evidence hold of the entry is what the owed
+    event releases: while it stands after a restart, the ready record is
+    re-delivered once per process; once the engine released it (it applied
+    the event), a restart re-delivers nothing.
+    """
+    plugin, store, identity = __test_helper_open_probe_run(tmp_path, "owed-ready")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    __test_helper_order_push(plugin, coid, 'Cancelled', None)
+    # The engine deferred the unknown-quantity event and persisted its hold.
+    plugin.store_ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {
+        'Long': {'order_ids': ['601'], 'since_ms': 0, 'expired': False},
+    })
+    plugin._responses = __test_helper_history_readback(
+        plugin, coid, 'Cancelled', '0', cancel_type='CancelByUser')
+    settled = __test_helper_settle_cancelled(plugin)
+    assert [e.event_type for e in settled] == ['cancelled']
+    assert plugin.store_ctx.get_order(coid).closed_ts_ms is not None
+
+    # The process stopped before the engine applied the event: the hold stands.
+    plugin = __test_helper_restart(plugin, store, identity)
+    redelivered = __test_helper_settle_cancelled(plugin)
+    assert [(e.event_type, e.pine_id, e.order.client_order_id, e.order.filled_qty_known,
+             e.cancel_reason) for e in redelivered] == \
+        [('cancelled', 'Long', coid, True, settled[0].cancel_reason)]
+    assert __test_helper_settle_cancelled(plugin) == []
+
+    # The engine applied it and released the hold.
+    plugin.store_ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {},
+                                          removed=['Long'])
+    plugin = __test_helper_restart(plugin, store, identity)
+    assert __test_helper_settle_cancelled(plugin) == []
+    plugin.store_ctx.close()
+
+
+def __test_bybit_ready_owed_terminal_event_held_by_intent_key_is_redelivered__(tmp_path):
+    """A hold that names the entry by intent key only still gets its owed event."""
+    plugin, store, identity = __test_helper_open_probe_run(tmp_path, "owed-key")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    __test_helper_order_push(plugin, coid, 'Cancelled', None)
+    plugin.store_ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {
+        'Long': {'order_ids': [], 'since_ms': 0, 'expired': False},
+    })
+    plugin._responses = __test_helper_history_readback(
+        plugin, coid, 'Cancelled', '0', cancel_type='CancelByUser')
+    assert [e.event_type for e in __test_helper_settle_cancelled(plugin)] == ['cancelled']
+    plugin = __test_helper_restart(plugin, store, identity)
+    assert [e.order.client_order_id for e in __test_helper_settle_cancelled(plugin)] == [coid]
+    plugin.store_ctx.close()
+
+
+def __test_bybit_ready_owed_terminal_event_without_a_hold_is_not_redelivered__(tmp_path):
+    """An owed event whose entry the engine holds nothing for stays applied after a restart."""
+    plugin, store, identity = __test_helper_open_probe_run(tmp_path, "owed-free")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    __test_helper_order_push(plugin, coid, 'Cancelled', None)
+    plugin._responses = __test_helper_history_readback(
+        plugin, coid, 'Cancelled', '0', cancel_type='CancelByUser')
+    assert [e.event_type for e in __test_helper_settle_cancelled(plugin)] == ['cancelled']
+    plugin = __test_helper_restart(plugin, store, identity)
+    assert __test_helper_settle_cancelled(plugin) == []
+    plugin.store_ctx.close()
+
+
+def __test_bybit_known_terminal_push_settles_the_owed_event__(tmp_path):
+    """A later push with the figure is the delivery: the settlement owes nothing more."""
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, "owed-push")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    __test_helper_order_push(plugin, coid, 'Cancelled', None)
+    events = plugin._translate_order_rows({
+        'topic': 'order', 'data': [__test_helper_venue_order(plugin, coid, 'Cancelled', '0')],
+    }, plugin._market)
+    assert [(e.event_type, e.order.filled_qty_known, e.order.filled_qty) for e in events] == \
+        [('cancelled', True, 0.0)]
+    row = plugin.store_ctx.get_order(coid)
+    assert row.closed_ts_ms is not None
+    assert ENTRY_TERMINAL_EVENT_OWED_EXTRA not in (row.extras or {})
+    assert __test_helper_settle_cancelled(plugin) == []
+    plugin.store_ctx.close()
+
+
+@pytest.mark.parametrize('delivery', ['known_push', 'journaled_figure_push'])
+def __test_bybit_owed_event_delivered_by_a_push_is_redelivered_after_a_restart__(
+        tmp_path, delivery):
+    """A push that clears the owed mark journals its event as ready, like the readback.
+
+    The push is the delivery the core waits for, and the mark is gone with
+    it: a process that stops before the core stored the event leaves the
+    engine's hold standing and nothing else that would deliver it. The next
+    process re-delivers it once from the ready record; once the hold is
+    released, nothing goes out.
+    """
+    plugin, store, identity = __test_helper_open_probe_run(tmp_path, f"owed-{delivery}")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    __test_helper_order_push(plugin, coid, 'Cancelled', None)
+    plugin.store_ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {
+        'Long': {'order_ids': ['601'], 'since_ms': 0, 'expired': False},
+    })
+    if delivery == 'known_push':
+        pushed = __test_helper_venue_order(plugin, coid, 'Cancelled', '0')
+    else:
+        # A venue read journaled the figure while the mark still stood.
+        row = plugin.store_ctx.get_order(coid)
+        plugin.store_ctx.upsert_order(
+            coid, extras={**(row.extras or {}), ENTRY_CANCEL_CUM_EXEC_EXTRA: 0.0})
+        pushed = __test_helper_venue_order(plugin, coid, 'Cancelled', None)
+    events = plugin._translate_order_rows({'topic': 'order', 'data': [pushed]}, plugin._market)
+    assert [(e.event_type, e.order.filled_qty_known, e.order.filled_qty) for e in events] == \
+        [('cancelled', True, 0.0)]
+    assert ENTRY_TERMINAL_EVENT_OWED_EXTRA not in (plugin.store_ctx.get_order(coid).extras or {})
+
+    # The process stopped before the core stored the event: the hold stands.
+    plugin = __test_helper_restart(plugin, store, identity)
+    redelivered = __test_helper_settle_cancelled(plugin)
+    assert [(e.event_type, e.pine_id, e.order.client_order_id, e.order.filled_qty_known,
+             e.order.filled_qty) for e in redelivered] == \
+        [('cancelled', 'Long', coid, True, 0.0)]
+    assert __test_helper_settle_cancelled(plugin) == []
+
+    plugin.store_ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {},
+                                          removed=['Long'])
+    plugin = __test_helper_restart(plugin, store, identity)
+    assert __test_helper_settle_cancelled(plugin) == []
+    plugin.store_ctx.close()
+
+
+@pytest.mark.parametrize('delivery', ['known_push', 'journaled_figure_push'])
+def __test_bybit_owed_event_push_reports_the_marked_cancel_reason_live_and_on_replay__(
+        tmp_path, delivery):
+    """The live delivery and the restart's re-delivery report the same cancel reason.
+
+    The incomplete push names the venue's cancel cause, the confirming push
+    only the quantity. The ready record keeps the marked cause; the live
+    event must carry it too, or the core reads a venue-driven cancel as an
+    unexpected one during live processing.
+    """
+    plugin, store, identity = __test_helper_open_probe_run(tmp_path, f"owed-reason-{delivery}")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    incomplete = __test_helper_venue_order(plugin, coid, 'Cancelled', None)
+    incomplete['cancelType'] = 'CancelByReduceOnly'
+    plugin._translate_order_rows({'topic': 'order', 'data': [incomplete]}, plugin._market)
+    plugin.store_ctx.replace_keyed_events(ENTRY_FILL_EVIDENCE_HOLD_EVENT_KIND, {
+        'Long': {'order_ids': ['601'], 'since_ms': 0, 'expired': False},
+    })
+    if delivery == 'known_push':
+        pushed = __test_helper_venue_order(plugin, coid, 'Cancelled', '0')
+    else:
+        row = plugin.store_ctx.get_order(coid)
+        plugin.store_ctx.upsert_order(
+            coid, extras={**(row.extras or {}), ENTRY_CANCEL_CUM_EXEC_EXTRA: 0.0})
+        pushed = __test_helper_venue_order(plugin, coid, 'Cancelled', None)
+    live = plugin._translate_order_rows({'topic': 'order', 'data': [pushed]}, plugin._market)
+    assert [(e.event_type, e.order.filled_qty_known, e.cancel_reason) for e in live] == \
+        [('cancelled', True, CANCEL_REASON_VENUE_REDUCE_ONLY)]
+
+    plugin = __test_helper_restart(plugin, store, identity)
+    replayed = __test_helper_settle_cancelled(plugin)
+    assert [(e.event_type, e.order.filled_qty_known, e.cancel_reason) for e in replayed] == \
+        [('cancelled', True, CANCEL_REASON_VENUE_REDUCE_ONLY)]
+    plugin.store_ctx.close()
+
+
+def __test_bybit_explicit_zero_cancel_push_is_a_proven_unfilled_end__(tmp_path):
+    """A pushed ``cumExecQty`` of ``0`` is the venue's word: the cancel is confirmed."""
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, "explicit-zero")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    events = plugin._translate_order_rows({
+        'topic': 'order', 'data': [__test_helper_venue_order(plugin, coid, 'Cancelled', '0')],
+    }, plugin._market)
+    assert len(events) == 1 and events[0].order.proven_unexecuted
+    row = plugin.store_ctx.get_order(coid)
+    assert row.closed_ts_ms is not None
+    assert ENTRY_TERMINAL_EVENT_OWED_EXTRA not in (row.extras or {})
+    assert (row.extras or {}).get(ENTRY_CANCEL_CUM_EXEC_EXTRA) == 0.0
+    plugin.store_ctx.close()
+
+
+def __test_bybit_unproven_terminal_push_reports_the_booked_execution__(tmp_path):
+    """Without the venue's figure the event's quantity is the execution already booked."""
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, "unproven-booked")
+    __test_helper_entry_row(plugin, filled=0.004)
+    coid = __test_helper_ENTRY_COID
+    events = plugin._translate_order_rows({
+        'topic': 'order', 'data': [__test_helper_venue_order(plugin, coid, 'Cancelled', None)],
+    }, plugin._market)
+    order = events[0].order
+    assert order.filled_qty_known is False and order.filled_qty == pytest.approx(0.004)
+    assert order.remaining_qty == pytest.approx(0.006)
+    row = plugin.store_ctx.get_order(coid)
+    assert ENTRY_TERMINAL_EVENT_OWED_EXTRA not in (row.extras or {}), \
+        "a booked execution is proof the core acts on: nothing is owed"
+    plugin.store_ctx.close()
+
+
+@pytest.mark.parametrize(('status', 'cum_exec'), [
+    ('Cancelled', '0'), ('PartiallyFilledCanceled', '0.004'),
+], ids=['unfilled', 'partially_filled'])
+def __test_bybit_late_unproven_push_reports_the_journaled_venue_figure__(
+        tmp_path, status, cum_exec):
+    """A push without the figure after a readback settled the row reports that figure.
+
+    The REST cancel ACK leaves the entry remainder-cancelled, the cancel
+    settlement's readback settles it from the venue's ``cumExecQty`` (no
+    event: nothing was owed), and the venue's terminal push arrives late
+    without a usable figure. Nothing reads a settled row again, so an
+    unproven event would make the core hold the entry for good: the event
+    carries the journaled venue figure as known, and nothing is owed.
+    """
+    plugin, _store, _identity = __test_helper_open_probe_run(tmp_path, f"late-{status}")
+    __test_helper_entry_row(plugin)
+    coid = __test_helper_ENTRY_COID
+    plugin._retire_cancelled_row(coid)
+    plugin._responses = __test_helper_history_readback(plugin, coid, status, cum_exec)
+    assert __test_helper_settle_cancelled(plugin) == []
+    events = plugin._translate_order_rows({
+        'topic': 'order', 'data': [__test_helper_venue_order(plugin, coid, status, None)],
+    }, plugin._market)
+    assert [e.event_type for e in events] == ['cancelled']
+    order = events[0].order
+    assert order.filled_qty_known is True
+    assert order.filled_qty == pytest.approx(float(cum_exec))
+    assert order.proven_unexecuted is (cum_exec == '0')
+    row = plugin.store_ctx.get_order(coid)
+    assert ENTRY_TERMINAL_EVENT_OWED_EXTRA not in (row.extras or {})
+    assert __test_helper_settle_cancelled(plugin) == []
+    plugin.store_ctx.close()
+
+
+@pytest.mark.parametrize('cum_exec', [None, 'x', '-1'], ids=['missing', 'unparsable', 'negative'])
+def __test_bybit_snapshot_without_cum_exec_is_not_a_known_zero__(cum_exec):
+    """``parse_exchange_order`` never turns an unusable ``cumExecQty`` into a known zero."""
+    base = {'symbol': 'BTCUSDT', 'orderId': '1', 'orderLinkId': 'c', 'side': 'Buy',
+            'orderType': 'Limit', 'qty': '0.01', 'price': '1', 'createdTime': '1'}
+    for status in ('New', 'Cancelled', 'Filled'):
+        entry = {**base, 'orderStatus': status}
+        if cum_exec is not None:
+            entry['cumExecQty'] = cum_exec
+        order = parse_exchange_order(entry)
+        assert order.filled_qty == 0.0 and order.filled_qty_known is False
+    known = parse_exchange_order({**base, 'orderStatus': 'Cancelled', 'cumExecQty': '0'})
+    assert known.filled_qty_known is True and known.proven_unexecuted
+

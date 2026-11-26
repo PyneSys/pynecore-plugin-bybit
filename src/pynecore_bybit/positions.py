@@ -81,8 +81,11 @@ from .exceptions import (
     reject_error,
 )
 from .helpers import (
+    CATEGORY_SPOT,
+    CORE_CLIENT_ORDER_ID_EXTRA,
     EXECUTION_SINCE_SKEW_MS,
     contracts_to_base,
+    execution_sort_key,
     format_decimal,
     round_price,
     trading_stop_key,
@@ -550,6 +553,19 @@ class _PositionsMixin(_BybitBase, ABC):
         normalized down to the terminal filled amount (the residual can
         never fill again) — otherwise the row would be owned by neither.
 
+        The per-order fill recovery targets an earlier process left open
+        (:meth:`~_ReconcileMixin._durable_fill_recovery_targets`) are settled
+        here too. A target of a row an earlier process CLOSED names an order
+        no other path reads again (the restart re-homes only the live rows):
+        its executions are walked by ``orderId`` like a live row's, under the
+        same order-truth gate against the target's terminal ``cumExecQty``,
+        and seeded into the de-dup frontier; a close / exit leg's executions
+        its cursor lacks net the entry rows like any other unbooked reduce,
+        in one transaction with the target's done record, so a later restart
+        never nets them twice. Nothing is emitted: the adopted position holds
+        them. A target of a re-homed row is done once the seeded cursor
+        covers it, and queued for the per-order recovery otherwise.
+
         Completeness of the seed (the F8 order-truth gate): a successfully
         paginated ``/v5/execution/list`` walk is NOT proof the venue's
         execution index has caught up with the position — a fill can sit in
@@ -614,8 +630,10 @@ class _PositionsMixin(_BybitBase, ABC):
                 "adoption baseline: venue time read returned no timestamp",
             )
         last_index_lag: str | None = None
+        restored = self._durable_fill_recovery_targets()
         for _ in range(_ADOPTION_STABLE_ATTEMPTS):
             seeds: list[tuple] = []
+            closed_seeds: list[tuple] = []
             pass_index_lag: str | None = None
             for row in self.store_ctx.iter_live_orders():
                 if row.state in PENDING_DISPATCH_STATES or row.state in LEDGER_ROW_STATES:
@@ -677,6 +695,36 @@ class _PositionsMixin(_BybitBase, ABC):
                         )
                         last_index_lag = pass_index_lag
                 seeds.append((row, order_id, ids, qty_sum, lookup is None, executions))
+            for coid, (order_id, cum_exec) in restored.items():
+                # A recovery target of a row an earlier process closed: the
+                # restart re-homed only the live rows, so no other path reads
+                # this order again. Its executions all ran before the
+                # restart (the order had ended), so the adopted position
+                # holds them; walk them like a live row's, under the same
+                # order-truth gate (the target is the venue's terminal
+                # ``cumExecQty``).
+                closed = self.store_ctx.get_order_for_run_id(coid)
+                if closed is None or closed.closed_ts_ms is None:
+                    continue
+                from_ms = closed.created_ts_ms - EXECUTION_SINCE_SKEW_MS
+                ids, qty_sum, seeded, executions = await self._recovery_fill_ids(
+                    market, order_id, from_ms, until_ms=floor_ms,
+                )
+                if not seeded:
+                    raise BybitAdoptionBaselineError(
+                        "adoption baseline: execution seed read failed "
+                        f"for closed order {order_id}",
+                    )
+                parked_ids, parked_qty, parked = self._parked_adoption_executions(
+                    market, order_id, floor_ms, ids,
+                )
+                ids.update(parked_ids)
+                qty_sum += parked_qty
+                executions = [*executions, *parked]
+                if qty_sum < float(cum_exec) - _FILL_EPS:
+                    pass_index_lag = f"closed order {order_id} ({qty_sum} < {cum_exec})"
+                    last_index_lag = pass_index_lag
+                closed_seeds.append((closed, order_id, ids, qty_sum, executions, cum_exec))
             # The run's own trading stops that fired while the bot was down:
             # no row's order walk reads them.
             stop_executions = await self._unbooked_venue_stop_executions(market, floor_ms)
@@ -700,142 +748,203 @@ class _PositionsMixin(_BybitBase, ABC):
                 # failing the first startup read; no partial seed is committed.
                 rows = verify
                 continue
+            # Every write of the pass commits as one: credits taken, entry
+            # rows netted and recovery targets marked done never land without
+            # each other, and the latch, the de-dup frontier and the queue
+            # change only once they have. A failed write leaves the baseline
+            # unlatched for the retry, against the journal as it was.
+            seen: set[str] = set()
+            requeue: dict[str, tuple[str, Decimal]] = {}
+            inherited: list[tuple[str, list[dict]]] = []
+            with self._journal_transaction():
+                unbooked_reduces: list[tuple[str, float, list[dict]]] = []
+                for row, order_id, ids, qty_sum, dead, executions in seeds:
+                    seen.update(ids)
+                    # ``qty_sum`` is the order's venue-domain cumulative; the
+                    # row's cursor is net of what reducing fills consumed.
+                    netted = venue_filled_qty(row) - float(row.filled_qty)
+                    cumulative: float = min(
+                        float(row.qty), max(float(row.filled_qty), qty_sum - netted),
+                    )
+                    if ((row.extras or {}).get('kind') in ('exit_leg', 'close')
+                            and cumulative > row.filled_qty + _FILL_EPS):
+                        unbooked_reduces.append(
+                            (row.side, cumulative - float(row.filled_qty), executions))
+                    if cumulative > row.filled_qty:
+                        self.store_ctx.set_filled(row.client_order_id, cumulative)
+                        self.store_ctx.log_event(
+                            'adoption_baseline_applied',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=order_id,
+                            intent_key=row.intent_key,
+                            payload={'from_filled_qty': row.filled_qty,
+                                     'filled_qty': cumulative,
+                                     'exec_count': len(ids)},
+                        )
+                    is_entry = ((row.extras or {}).get('kind')
+                                in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING))
+                    if is_entry and executions:
+                        inherited.append((row.client_order_id, executions))
+                    if dead and is_entry and cumulative > _FILL_EPS:
+                        # Conclusively dead ENTRY carrying fills: the fills are
+                        # a real component of the adopted position, so the row
+                        # stays live and the position lifecycle
+                        # (positions-namespace tracking + flat sweep) owns its
+                        # retirement. BOTH owners predicate on a FULL fill, so
+                        # a partially filled dead entry must have its qty
+                        # normalized down to the terminal filled amount — the
+                        # residual can never fill again (the order is dead) and
+                        # an un-normalized row would be owned by neither
+                        # (disappearance maps its not-found to INCONCLUSIVE
+                        # forever).
+                        if cumulative < row.qty - _FILL_EPS:
+                            self.store_ctx.upsert_order(
+                                row.client_order_id, qty=cumulative,
+                            )
+                        self.store_ctx.log_event(
+                            'adoption_baseline_unattributable',
+                            client_order_id=row.client_order_id,
+                            intent_key=row.intent_key,
+                            payload={'state': row.state, 'kept': True,
+                                     'qty': cumulative, 'from_qty': row.qty},
+                        )
+                        continue
+                    if dead:
+                        # Conclusively dead with no kept-alive exemption (a
+                        # zero-fill row, or a non-entry leg whose residual can
+                        # never fill again): retire the row AND its intent
+                        # envelope. Its walked executions are already in the
+                        # de-dup frontier, so nothing re-books them; without
+                        # ``record_complete`` the persisted envelope would
+                        # replay on the first sync and hand a re-emitted intent
+                        # the same spent ``client_order_id``.
+                        self.store_ctx.record_unpark(row.client_order_id)
+                        self.store_ctx.close_order(row.client_order_id)
+                        if row.intent_key:
+                            self.store_ctx.record_complete(row.intent_key)
+                        self.store_ctx.log_event(
+                            'adoption_baseline_unattributable',
+                            client_order_id=row.client_order_id,
+                            intent_key=row.intent_key,
+                            payload={'state': row.state, 'retired': True},
+                        )
+                        continue
+                    if ((row.extras or {}).get('kind') in ('exit_leg', 'close')
+                            and cumulative >= row.qty - _FILL_EPS):
+                        # Fully covered non-entry leg: the live full-fill
+                        # terminal (``_fill_event``) can never fire for it —
+                        # every one of its executions is in the de-dup
+                        # frontier — so apply the FULL terminal here (unpark +
+                        # close + intent completion; ENTRY rows stay live for
+                        # the flat sweep). ``record_complete`` matters: on the
+                        # live path the engine retires the intent envelope when
+                        # the fill event reaches it (``_drop_envelope``), but
+                        # the baseline suppresses that event — without the
+                        # completion the persisted envelope would replay on the
+                        # first sync and hand a re-emitted intent the same
+                        # spent ``client_order_id``. The sibling / OCA legs of
+                        # this exit still carry their exchange handles, so the
+                        # runtime disappearance pass owns their retirement.
+                        self.store_ctx.record_unpark(row.client_order_id)
+                        self.store_ctx.close_order(row.client_order_id)
+                        if row.intent_key:
+                            self.store_ctx.record_complete(row.intent_key)
+                        self.store_ctx.log_event(
+                            'adoption_baseline_closed',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=order_id,
+                            intent_key=row.intent_key,
+                            payload={'filled_qty': cumulative,
+                                     'kind': (row.extras or {}).get('kind')},
+                        )
+                # Position in ``unbooked_reduces`` -> the closed row's target its
+                # netting settles; the done record is written with the netting.
+                closed_reduces: dict[int, tuple[str, str, Decimal]] = {}
+                for closed, order_id, ids, qty_sum, executions, cum_exec in closed_seeds:
+                    seen.update(ids)
+                    netted = venue_filled_qty(closed) - float(closed.filled_qty)
+                    cumulative = min(
+                        float(closed.qty), max(float(closed.filled_qty), qty_sum - netted),
+                    )
+                    unbooked = cumulative - float(closed.filled_qty)
+                    if ((closed.extras or {}).get('kind') in ('exit_leg', 'close')
+                            and unbooked > _FILL_EPS):
+                        # The reduce never reached the journal: it consumed
+                        # entry exposure the entry rows still own.
+                        closed_reduces[len(unbooked_reduces)] = (
+                            closed.client_order_id, order_id, cum_exec)
+                        unbooked_reduces.append((closed.side, unbooked, executions))
+                        continue
+                    self._journal_fill_recovery_done(
+                        closed.client_order_id, order_id, cum_exec,
+                        source='adoption_baseline', netted_qty=0.0,
+                    )
+                order_reduces = len(unbooked_reduces)
+                for entry in stop_executions:
+                    seen.add(str(entry.get('execId') or ''))
+                    unbooked_reduces.append((str(entry.get('side') or '').lower(),
+                                             float(entry.get('execQty') or 0.0), [entry]))
+                tolerance = market.qty_step / 2 if market.qty_step > 0 else _FILL_EPS
+                credited = self._take_persisted_ledger_credits(unbooked_reduces, tolerance)
+                for position, (side, quantity) in enumerate(credited):
+                    # A reducing fill the run never booked (it landed while the
+                    # bot was down) consumed entry exposure exactly like a booked
+                    # one: net it out of the entry rows before the venue clamp,
+                    # which only sees the excess over the whole venue leg and
+                    # misses it when foreign exposure shares the leg. What an
+                    # earlier process's position ledger already netted for it is
+                    # not netted again.
+                    if position < order_reduces:
+                        settled = closed_reduces.get(position)
+                        if settled is None:
+                            self._reduce_entry_ownership(side, quantity)
+                            continue
+                        # The done record, in the same commit, keeps a later
+                        # restart from netting the same reduce again.
+                        self._reduce_entry_ownership(side, quantity)
+                        self._journal_fill_recovery_done(
+                            *settled, source='adoption_baseline', netted_qty=quantity,
+                        )
+                        continue
+                    _, executed, (entry,) = unbooked_reduces[position]
+                    owned = self._entry_side_exposure(side)
+                    self._reduce_entry_ownership(side, quantity)
+                    self._log_adopted_venue_stop(
+                        entry, side,
+                        claim=owned - self._entry_side_exposure(side) + executed - quantity,
+                    )
+                for entry in closeouts:
+                    # The venue closed the run's side while the bot was down; the
+                    # execution does not say how much of it was the run's. The
+                    # run's share on that side is taken as gone — someone else
+                    # who holds the leg now keeps theirs.
+                    side = str(entry.get('side') or '').lower()
+                    seen.add(str(entry.get('execId') or ''))
+                    owned = self._entry_side_exposure(side)
+                    self._reduce_entry_ownership(side, owned)
+                    self._log_venue_closeout_while_down(entry, side, retired=owned)
+                self._clamp_entry_ownership_to_venue(verify)
+                for coid, target in restored.items():
+                    # A target of a row this instance re-homed: the walk above
+                    # seeded its cursor and de-dup frontier from the same
+                    # per-order truth. A cursor still short of the target goes
+                    # back to the per-order recovery, whose reads now meet the
+                    # seeded frontier; a pending-dispatch or ledger row the walk
+                    # exempted keeps its durable target for its own resolution.
+                    live = self.store_ctx.get_order(coid)
+                    if live is None:
+                        continue
+                    if venue_filled_qty(live) >= float(target[1]) - _FILL_EPS:
+                        self._journal_fill_recovery_done(
+                            coid, *target, source='adoption_baseline')
+                    elif (live.state not in PENDING_DISPATCH_STATES
+                          and live.state not in LEDGER_ROW_STATES):
+                        requeue[coid] = target
             self._adoption_baselined = True
             self._deriv_exec_floor_ms = floor_ms
-            unbooked_reduces: list[tuple[str, float, list[dict]]] = []
-            for row, order_id, ids, qty_sum, dead, executions in seeds:
-                self._seen_exec_ids.update(ids)
-                # ``qty_sum`` is the order's venue-domain cumulative; the
-                # row's cursor is net of what reducing fills consumed.
-                netted = venue_filled_qty(row) - float(row.filled_qty)
-                cumulative: float = min(
-                    float(row.qty), max(float(row.filled_qty), qty_sum - netted),
-                )
-                if ((row.extras or {}).get('kind') in ('exit_leg', 'close')
-                        and cumulative > row.filled_qty + _FILL_EPS):
-                    unbooked_reduces.append(
-                        (row.side, cumulative - float(row.filled_qty), executions))
-                if cumulative > row.filled_qty:
-                    self.store_ctx.set_filled(row.client_order_id, cumulative)
-                    self.store_ctx.log_event(
-                        'adoption_baseline_applied',
-                        client_order_id=row.client_order_id,
-                        exchange_order_id=order_id,
-                        intent_key=row.intent_key,
-                        payload={'from_filled_qty': row.filled_qty,
-                                 'filled_qty': cumulative,
-                                 'exec_count': len(ids)},
-                    )
-                is_entry = ((row.extras or {}).get('kind')
-                            in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING))
-                if dead and is_entry and cumulative > _FILL_EPS:
-                    # Conclusively dead ENTRY carrying fills: the fills are
-                    # a real component of the adopted position, so the row
-                    # stays live and the position lifecycle
-                    # (positions-namespace tracking + flat sweep) owns its
-                    # retirement. BOTH owners predicate on a FULL fill, so
-                    # a partially filled dead entry must have its qty
-                    # normalized down to the terminal filled amount — the
-                    # residual can never fill again (the order is dead) and
-                    # an un-normalized row would be owned by neither
-                    # (disappearance maps its not-found to INCONCLUSIVE
-                    # forever).
-                    if cumulative < row.qty - _FILL_EPS:
-                        self.store_ctx.upsert_order(
-                            row.client_order_id, qty=cumulative,
-                        )
-                    self.store_ctx.log_event(
-                        'adoption_baseline_unattributable',
-                        client_order_id=row.client_order_id,
-                        intent_key=row.intent_key,
-                        payload={'state': row.state, 'kept': True,
-                                 'qty': cumulative, 'from_qty': row.qty},
-                    )
-                    continue
-                if dead:
-                    # Conclusively dead with no kept-alive exemption (a
-                    # zero-fill row, or a non-entry leg whose residual can
-                    # never fill again): retire the row AND its intent
-                    # envelope. Its walked executions are already in the
-                    # de-dup frontier, so nothing re-books them; without
-                    # ``record_complete`` the persisted envelope would
-                    # replay on the first sync and hand a re-emitted intent
-                    # the same spent ``client_order_id``.
-                    self.store_ctx.record_unpark(row.client_order_id)
-                    self.store_ctx.close_order(row.client_order_id)
-                    if row.intent_key:
-                        self.store_ctx.record_complete(row.intent_key)
-                    self.store_ctx.log_event(
-                        'adoption_baseline_unattributable',
-                        client_order_id=row.client_order_id,
-                        intent_key=row.intent_key,
-                        payload={'state': row.state, 'retired': True},
-                    )
-                    continue
-                if ((row.extras or {}).get('kind') in ('exit_leg', 'close')
-                        and cumulative >= row.qty - _FILL_EPS):
-                    # Fully covered non-entry leg: the live full-fill
-                    # terminal (``_fill_event``) can never fire for it —
-                    # every one of its executions is in the de-dup
-                    # frontier — so apply the FULL terminal here (unpark +
-                    # close + intent completion; ENTRY rows stay live for
-                    # the flat sweep). ``record_complete`` matters: on the
-                    # live path the engine retires the intent envelope when
-                    # the fill event reaches it (``_drop_envelope``), but
-                    # the baseline suppresses that event — without the
-                    # completion the persisted envelope would replay on the
-                    # first sync and hand a re-emitted intent the same
-                    # spent ``client_order_id``. The sibling / OCA legs of
-                    # this exit still carry their exchange handles, so the
-                    # runtime disappearance pass owns their retirement.
-                    self.store_ctx.record_unpark(row.client_order_id)
-                    self.store_ctx.close_order(row.client_order_id)
-                    if row.intent_key:
-                        self.store_ctx.record_complete(row.intent_key)
-                    self.store_ctx.log_event(
-                        'adoption_baseline_closed',
-                        client_order_id=row.client_order_id,
-                        exchange_order_id=order_id,
-                        intent_key=row.intent_key,
-                        payload={'filled_qty': cumulative,
-                                 'kind': (row.extras or {}).get('kind')},
-                    )
-            order_reduces = len(unbooked_reduces)
-            for entry in stop_executions:
-                self._seen_exec_ids.add(str(entry.get('execId') or ''))
-                unbooked_reduces.append((str(entry.get('side') or '').lower(),
-                                         float(entry.get('execQty') or 0.0), [entry]))
-            tolerance = market.qty_step / 2 if market.qty_step > 0 else _FILL_EPS
-            credited = self._take_persisted_ledger_credits(unbooked_reduces, tolerance)
-            for position, (side, quantity) in enumerate(credited):
-                # A reducing fill the run never booked (it landed while the
-                # bot was down) consumed entry exposure exactly like a booked
-                # one: net it out of the entry rows before the venue clamp,
-                # which only sees the excess over the whole venue leg and
-                # misses it when foreign exposure shares the leg. What an
-                # earlier process's position ledger already netted for it is
-                # not netted again.
-                if position < order_reduces:
-                    self._reduce_entry_ownership(side, quantity)
-                    continue
-                _, executed, (entry,) = unbooked_reduces[position]
-                owned = self._entry_side_exposure(side)
-                self._reduce_entry_ownership(side, quantity)
-                self._log_adopted_venue_stop(
-                    entry, side,
-                    claim=owned - self._entry_side_exposure(side) + executed - quantity,
-                )
-            for entry in closeouts:
-                # The venue closed the run's side while the bot was down; the
-                # execution does not say how much of it was the run's. The
-                # run's share on that side is taken as gone — someone else
-                # who holds the leg now keeps theirs.
-                side = str(entry.get('side') or '').lower()
-                self._seen_exec_ids.add(str(entry.get('execId') or ''))
-                owned = self._entry_side_exposure(side)
-                self._reduce_entry_ownership(side, owned)
-                self._log_venue_closeout_while_down(entry, side, retired=owned)
-            self._clamp_entry_ownership_to_venue(verify)
+            self._seen_exec_ids.update(seen)
+            self._unbooked_fill_orders.update(requeue)
+            self._queue_inherited_entry_fills(inherited, market)
             for side in {str(entry.get('side') or '').lower()
                          for entry in (*stop_executions, *closeouts)}:
                 # The venue clears a fired stop with the position it closed.
@@ -866,6 +975,41 @@ class _PositionsMixin(_BybitBase, ABC):
             and (row.extras or {}).get('kind') in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)
             and row.filled_qty > _FILL_EPS
         )
+
+    def _queue_inherited_entry_fills(
+            self, inherited: list[tuple[str, list[dict]]], market: InstrumentInfo,
+    ) -> None:
+        """Queue the entry fills the baseline seeded and the engine never took.
+
+        The baseline put every walked execution of a live entry row into the
+        de-dup frontier, so no stream or backfill path delivers it again. An
+        execution whose fill the engine did not take
+        (:meth:`~pynecore.core.broker.storage.RunContext.fill_delivered` is
+        ``False``: the earlier process journaled it, and the engine had not
+        booked it when that process ended) is delivered once by the next
+        backfill pass, flagged ``journaled_before_restart``
+        (:meth:`~_BybitBase._inherited_fill_event`): the engine records its
+        receipt and books its fee onto the entry's open trades. The fee of an
+        exit or close fill has no such channel: the engine does not recover
+        the earlier process's trade it belonged to.
+
+        :param inherited: Per live entry row: its client order id and walked
+            execution rows.
+        :param market: The chart instrument.
+        """
+        if self.store_ctx is None or market.category == CATEGORY_SPOT:
+            return
+        for coid, executions in inherited:
+            row = self.store_ctx.get_order(coid)
+            if row is None or row.closed_ts_ms is not None:
+                continue
+            for entry in sorted(executions, key=execution_sort_key):
+                fill_id = str(entry.get('execId') or '')
+                if not fill_id or self.store_ctx.fill_delivered(fill_id):
+                    continue
+                event = self._inherited_fill_event(row, entry, market)
+                if event is not None:
+                    self._inherited_fill_events.append(event)
 
     def _log_venue_closeout_while_down(self, entry: dict, side: str, *, retired: float) -> None:
         """Journal one venue close of the run's side the adoption baseline retired.
@@ -1244,7 +1388,12 @@ class _PositionsMixin(_BybitBase, ABC):
         The leg gets a persist-first close row under the wire id, like a
         one-way close (:meth:`execute_close`): the disappearance pass tracks
         it and the per-order fill recovery books a fill the stream dropped
-        and the execution list indexed past the backfill's read overlap.
+        and the execution list indexed past the backfill's read overlap. The
+        row keeps ``coid`` itself
+        (:data:`~pynecore_bybit.helpers.CORE_CLIENT_ORDER_ID_EXTRA`): every
+        order and fill event of the leg reports it as its
+        ``client_order_id``, so the core tells a netting close's fill from a
+        strategy close's on every path, after a restart too.
         """
         market = await asyncio.to_thread(self._broker_market)
         idx = int(leg_id)
@@ -1259,7 +1408,7 @@ class _PositionsMixin(_BybitBase, ABC):
         # and the flat venue was cleared as an unexplained external close.
         emulator_row = (self.store_ctx.get_order(close_leg_row_client_order_id(coid))
                         if self.store_ctx is not None else None)
-        extras: dict = {'kind': 'close'}
+        extras: dict = {'kind': 'close', CORE_CLIENT_ORDER_ID_EXTRA: coid}
         self._persist_leg_row(
             link_id, market=market, side=side.lower(), qty=qty,
             intent_key=emulator_row.intent_key if emulator_row is not None else None,

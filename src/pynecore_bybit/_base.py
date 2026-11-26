@@ -56,7 +56,7 @@ if TYPE_CHECKING:
 
     from .hosts import BybitHosts
     from .inventory import _BybitSpotPort
-    from .ledger import LegLedger
+    from .ledger import LedgerSnapshot, LegLedger
     from .models import InstrumentInfo
     from .ws import BybitWebSocket
 
@@ -229,9 +229,16 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # covers the venue figure (:meth:`_recover_unbooked_order_fills`). The
     # time-windowed backfill misses an execution the venue indexes later than
     # its read overlap; this read has no time cursor to fall behind.
-    # In-memory only: a restart's adoption baseline re-seeds every live row
-    # from the same per-order venue truth.
+    # Every target is journaled first (``FILL_RECOVERY_TARGET_EVENT``) and
+    # cleared with a done record: a restart's adoption baseline re-seeds every
+    # live row from the same per-order venue truth and settles the targets of
+    # rows an earlier process closed.
     _unbooked_fill_orders: 'dict[str, tuple[str, Decimal]]'
+    # Recovery queue changes made inside the open plugin write span
+    # (:meth:`_journal_transaction`), applied to :attr:`_unbooked_fill_orders`
+    # when the outermost span commits and discarded on a rollback; ``None``
+    # outside a span. Client order id -> target, ``None`` = drop.
+    _fill_recovery_staged: 'dict[str, tuple[str, Decimal] | None] | None'
     # Client order ids of derivative MARKET entry rows whose terminal venue
     # order truth was already read once (:meth:`_note_unbooked_market_entries`).
     # A market entry leaves the open set at once and is never tracked by the
@@ -254,6 +261,38 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     # inverse — the exec-push quantities compare exactly in this domain.
     _dispatch_qty: 'dict[str, float]'
     _filled_cum: 'dict[str, float]'
+    # ``execId`` of every entry fill event this process emitted, per ``orderLinkId``,
+    # pruned once the core's durable fill receipt shows it booked
+    # (:meth:`~pynecore.core.broker.storage.RunContext.fill_delivered`). A
+    # fill the plugin booked on the row can still wait in the event queue
+    # while the core runs a cancel of its order; this tells the cancel so.
+    _undelivered_fill_ids: 'dict[str, set[str]]'
+    # Entry fills an earlier process of the run journaled and the engine never
+    # took (no booked fill receipt), found by the adoption baseline's
+    # per-order walk: delivered once by the next backfill pass, flagged
+    # :attr:`~pynecore.core.broker.models.OrderEvent.journaled_before_restart`,
+    # so the engine records their receipt and books their fee onto the
+    # entry's open trades (:meth:`_inherited_fill_event`).
+    _inherited_fill_events: 'list[OrderEvent]'
+    # Events whose plugin state a pass already committed but which never
+    # reached the engine: the pass that built them raised before it handed
+    # them over. :meth:`watch_orders` yields them first on its next turn (a
+    # reopened stream included), so a commit never strands its event.
+    _event_outbox: 'list[OrderEvent]'
+    # Whether this process re-delivered the ready owed terminal events
+    # (:data:`~pynecore_bybit.helpers.OWED_TERMINAL_EVENT_READY_EVENT`) whose
+    # entry the engine still holds for its execution evidence.
+    _owed_terminal_restored: bool
+    # Spot executions whose order booking has not landed yet, by ``execId``,
+    # entered before the inventory ledger takes the execution: the ledger
+    # commits it as delivered (and may raise after that commit) and dedups
+    # every later copy, so the booking is retried from the execution row kept
+    # here (:meth:`_retry_spot_bookings`) until it lands.
+    _spot_bookings_pending: 'dict[str, dict]'
+    # Legs whose run share an own execution started inside the booking now in
+    # progress: their bare trading-stop baseline is set once that booking
+    # committed (:meth:`_baseline_started_shares`).
+    _share_baselines_due: 'list[int]'
     # Per-``orderLinkId`` base<->contract conversion anchor price (inverse
     # only): fills convert back to the Pine base denomination at the SAME
     # price the dispatch converted at, so a full fill sums exactly to the
@@ -640,6 +679,29 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     ) -> 'tuple[str | None, str | None, LegType | None]': ...
 
     @abstractmethod
+    def _own_order_link_id(self, order_link_id: str | None, order_id: str | None) -> str: ...
+
+    @abstractmethod
+    def _core_client_order_id(self, order_link_id: str | None) -> str | None: ...
+
+    @abstractmethod
+    def _deliver_owed_terminal_event(
+            self, coid: str, readback: dict, event_type: str | None,
+    ) -> dict | None: ...
+
+    @abstractmethod
+    def _order_lifecycle_event(
+            self, entry: dict, event_type: str, coid: str,
+            identity: 'tuple[str | None, str | None, LegType | None]',
+            market: 'InstrumentInfo', *, seen: float | None = None,
+    ) -> 'OrderEvent': ...
+
+    @abstractmethod
+    def _inherited_fill_event(
+            self, row: 'OrderRow', entry: dict, market: 'InstrumentInfo',
+    ) -> 'OrderEvent | None': ...
+
+    @abstractmethod
     def _persist_leg_row(
             self, coid: str, *, market: 'InstrumentInfo', side: str,
             qty: 'Decimal', intent_key: str | None, extras: dict,
@@ -735,7 +797,23 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     ) -> None: ...
 
     @abstractmethod
-    async def _settle_cancelled_entries(self, market: 'InstrumentInfo') -> None: ...
+    def _clear_fill_recovery(self, coid: str) -> None: ...
+
+    @abstractmethod
+    def _journal_transaction(self) -> 'AbstractContextManager[None]': ...
+
+    @abstractmethod
+    def _journal_fill_recovery_done(
+            self, coid: str, order_id: str, cum_exec: 'Decimal', **payload: object,
+    ) -> None: ...
+
+    @abstractmethod
+    def _durable_fill_recovery_targets(self) -> 'dict[str, tuple[str, Decimal]]': ...
+
+    @abstractmethod
+    async def _settle_cancelled_entries(
+            self, market: 'InstrumentInfo', events: 'list[OrderEvent]',
+    ) -> None: ...
 
     # --- External-intervention detection (protection.py) ---
     @abstractmethod
@@ -764,6 +842,15 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
             self, entry: dict, before: dict[int, float], after: dict[int, float],
             market: 'InstrumentInfo',
     ) -> None: ...
+
+    @abstractmethod
+    def _baseline_started_shares(self) -> None: ...
+
+    @abstractmethod
+    def _ledger_state_snapshot(self) -> 'LedgerSnapshot': ...
+
+    @abstractmethod
+    def _restore_ledger_state(self, snapshot: 'LedgerSnapshot') -> None: ...
 
     @abstractmethod
     def _note_share_held_since(self, since_ms: int, market: 'InstrumentInfo') -> None: ...
@@ -880,5 +967,10 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     @abstractmethod
     def _retire_cancelled_row(
             self, coid: str, venue_cum_exec: float | None = None,
-            order_id: str | None = None,
+            order_id: str | None = None, venue_status: str | None = None,
+    ) -> None: ...
+
+    @abstractmethod
+    def _journal_close_ending(
+            self, coid: str, venue_status: str, venue_cum_exec: float | None,
     ) -> None: ...

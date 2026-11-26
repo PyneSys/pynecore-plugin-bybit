@@ -43,7 +43,9 @@ graceful stop.
 import asyncio
 import logging
 from abc import ABC
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from time import time as epoch_time
 from typing import TYPE_CHECKING
@@ -79,10 +81,15 @@ from .helpers import (
     CATEGORY_SPOT,
     ENTRY_CANCEL_CUM_EXEC_EXTRA,
     ENTRY_REMAINDER_CANCELLED_EXTRA,
+    ENTRY_TERMINAL_EVENT_OWED_EXTRA,
     EXECUTION_CURSOR_OVERLAP_MS,
+    FILL_RECOVERY_DONE_EVENT,
+    FILL_RECOVERY_TARGET_EVENT,
+    OWED_TERMINAL_EVENT_READY_EVENT,
     venue_filled_qty,
 )
 from .recovery import open_orders_by_id
+from .state import _ended_cum_exec_qty
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
@@ -117,6 +124,19 @@ _LIVE_ORDER_STATUSES = frozenset({
 #: resolver starts looking it up by ``orderLinkId``. Covers the venue's own
 #: indexing lag of a POST that DID land moments before its reply was lost.
 _PARKED_DISPATCH_GRACE_S = 30.0
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
+    """A finite, non-negative journaled quantity, or ``None`` when unusable."""
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return None
+    try:
+        figure = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not figure.is_finite() or figure < 0:
+        return None
+    return figure
 
 #: Age (milliseconds since the persist-first row was written) a confirmed
 #: derivative MARKET entry with an unbooked remainder must reach before its
@@ -279,9 +299,15 @@ class _ReconcileMixin(_BybitBase, ABC):
         reconcile cadence and answers its question by ``orderLinkId``
         (:meth:`_confirm_lookup`):
 
-        * found live or with fills — landed; the engine verification / the
-          fill path unpark it.
-        * found dead with zero fills — the venue refused it.
+        * found live — landed; the engine verification / the fill path
+          unpark it.
+        * found ended with fills (``Filled``, or dead with a positive
+          executed quantity) — landed, and settled here
+          (:meth:`~_ReconcileMixin._settle_landed_ended_dispatch`): the order is in no open
+          set, and its push may be the one that was lost.
+        * found dead with zero fills — the venue refused it; dead without a
+          usable executed quantity (:func:`~pynecore_bybit.state._ended_cum_exec_qty`)
+          — inconclusive, never a refusal.
         * not found with both endpoints read — absent.
         * transport failure — inconclusive.
 
@@ -300,14 +326,20 @@ class _ReconcileMixin(_BybitBase, ABC):
             if existing is None:
                 return ParkedVerdict(ParkedOutcome.ABSENT)
             status = str(existing.get('orderStatus') or '')
-            try:
-                cum_exec = Decimal(str(existing.get('cumExecQty') or '0') or '0')
-            except (InvalidOperation, TypeError, ValueError):
-                cum_exec = Decimal(0)
-            refused = status in _DEAD_ORDER_STATUSES and cum_exec <= 0
-            return ParkedVerdict(
-                ParkedOutcome.REFUSED if refused else ParkedOutcome.LANDED,
-                order_id=str(existing.get('orderId') or '') or None, status=status)
+            order_id = str(existing.get('orderId') or '') or None
+            if status in _DEAD_ORDER_STATUSES or status == 'Filled':
+                cum_exec = _ended_cum_exec_qty(existing)
+                if cum_exec is None:
+                    # An ended order without a usable executed quantity
+                    # proves no refusal: a rejected row would read as proof
+                    # that the order never executed.
+                    return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+                if status in _DEAD_ORDER_STATUSES and cum_exec <= _FILL_EPS:
+                    return ParkedVerdict(ParkedOutcome.REFUSED, order_id=order_id,
+                                         status=status)
+                if order_id:
+                    self._settle_landed_ended_dispatch(market, row, existing, cum_exec)
+            return ParkedVerdict(ParkedOutcome.LANDED, order_id=order_id, status=status)
 
         try:
             await self._parked_resolver.resolve(self.store_ctx, lookup)
@@ -316,6 +348,48 @@ class _ReconcileMixin(_BybitBase, ABC):
                 "Bybit parked dispatch resolution pass failed (transient): %s",
                 exc, exc_info=traceback_wanted(exc),
             )
+
+    def _settle_landed_ended_dispatch(
+            self, market: 'InstrumentInfo', row: 'OrderRow', existing: dict,
+            cum_exec: float,
+    ) -> None:
+        """Settle a parked dispatch the venue shows ended with executions.
+
+        The create reply was lost, and the order already ended (``Filled``,
+        or dead with a positive ``cumExecQty``): it is in no open set, so
+        neither the engine verification nor the disappearance pass ever looks
+        at it, and its terminal push may have been lost too. The venue's
+        order object is the proof it landed, so in one store transaction the
+        row is confirmed under the venue ``orderId`` (the alias the fill
+        paths resolve executions by), the engine park is dropped, the
+        executions the cursor lacks are queued for the per-order fill
+        recovery (:meth:`~_ReconcileMixin._note_unbooked_fills`, which books them through the
+        event stream's gates, never from this figure), and a dead order is
+        retired like its terminal push would have: a close row journals how
+        it ended (:meth:`~_EventStreamMixin._journal_close_ending`), an entry
+        row is normalized to the executed quantity
+        (:meth:`~_EventStreamMixin._retire_cancelled_row`).
+
+        :param market: The chart instrument.
+        :param row: The parked row.
+        :param existing: The venue order object found by ``orderLinkId``.
+        :param cum_exec: Its validated ``cumExecQty``
+            (:func:`~pynecore_bybit.state._ended_cum_exec_qty`), positive.
+        """
+        if self.store_ctx is None:
+            return
+        coid = row.client_order_id
+        order_id = str(existing.get('orderId') or '')
+        status = str(existing.get('orderStatus') or '')
+        with self._journal_transaction():
+            self.store_ctx.upsert_order(coid, state='confirmed', exchange_order_id=order_id)
+            self.store_ctx.add_ref(coid, 'order_id', order_id)
+            self.store_ctx.record_unpark(coid)
+            confirmed = self.store_ctx.get_order(coid)
+            if confirmed is not None and market.category != CATEGORY_SPOT:
+                self._note_unbooked_fills(confirmed, order_id, Decimal(str(cum_exec)))
+            if status in _DEAD_ORDER_STATUSES:
+                self._retire_cancelled_row(coid, cum_exec, order_id, venue_status=status)
 
     async def _disappearance_present(
             self, market: 'InstrumentInfo', position_rows: list[dict] | None,
@@ -382,10 +456,132 @@ class _ReconcileMixin(_BybitBase, ABC):
         reconcile cadence reads that order's executions by ``orderId`` until
         the cursor covers the figure (:meth:`_recover_unbooked_order_fills`).
         Spot stays out: its fills recover through the inventory ledger.
+
+        The target is journaled (:data:`FILL_RECOVERY_TARGET_EVENT`) before
+        it is queued, so a caller that retires the row in the same store
+        transaction never closes it without the durable obligation, and a
+        failed write leaves both the queue and the row as they were. A target
+        already queued unchanged is not written again.
         """
         if not order_id or venue_filled_qty(row) >= float(cum_exec) - _FILL_EPS:
             return
-        self._unbooked_fill_orders[row.client_order_id] = (order_id, cum_exec)
+        coid = row.client_order_id
+        target = (order_id, cum_exec)
+        if self._fill_recovery_target(coid) == target:
+            return
+        if self.store_ctx is not None:
+            self.store_ctx.log_event(
+                FILL_RECOVERY_TARGET_EVENT, client_order_id=coid,
+                exchange_order_id=order_id, payload={'cum_exec_qty': str(cum_exec)},
+            )
+        self._publish_fill_recovery(coid, target)
+
+    def _clear_fill_recovery(self, coid: str) -> None:
+        """Drop a per-order fill recovery target once its executions are accounted.
+
+        The done record (:data:`FILL_RECOVERY_DONE_EVENT`) is written first,
+        so a failed write keeps the target queued for the next pass.
+
+        :param coid: The row's client order id.
+        """
+        target = self._fill_recovery_target(coid)
+        if target is not None:
+            self._journal_fill_recovery_done(coid, target[0], target[1])
+        self._publish_fill_recovery(coid, None)
+
+    @contextmanager
+    def _journal_transaction(self) -> Iterator[None]:
+        """Open (or join) a store transaction that also covers the recovery queue.
+
+        Every plugin write span goes through here. The per-order fill recovery
+        queue (:attr:`~_BybitBase._unbooked_fill_orders`) mirrors journal
+        records (:data:`FILL_RECOVERY_TARGET_EVENT`,
+        :data:`FILL_RECOVERY_DONE_EVENT`); a queue change made inside the span
+        is staged and applied only when the outermost span commits, so a
+        rolled back span never leaves a queued target without its durable
+        record (a retry would skip the record as already queued) or drops a
+        target whose done record was discarded.
+        """
+        assert self.store_ctx is not None
+        outermost = self._fill_recovery_staged is None
+        if outermost:
+            self._fill_recovery_staged = {}
+        try:
+            with self.store_ctx.transaction():
+                yield
+        except BaseException:
+            if outermost:
+                self._fill_recovery_staged = None
+            raise
+        if outermost:
+            staged = self._fill_recovery_staged or {}
+            self._fill_recovery_staged = None
+            for coid, target in staged.items():
+                if target is None:
+                    self._unbooked_fill_orders.pop(coid, None)
+                else:
+                    self._unbooked_fill_orders[coid] = target
+
+    def _fill_recovery_target(self, coid: str) -> tuple[str, Decimal] | None:
+        """The recovery target queued for ``coid``, a change staged in the open span included."""
+        staged = self._fill_recovery_staged
+        if staged is not None and coid in staged:
+            return staged[coid]
+        return self._unbooked_fill_orders.get(coid)
+
+    def _publish_fill_recovery(self, coid: str, target: tuple[str, Decimal] | None) -> None:
+        """Queue (``target``) or drop (``None``) a recovery target, on commit inside a span.
+
+        Outside a :meth:`_journal_transaction` span the journal write before
+        this call has committed already, so the change applies at once.
+        """
+        staged = self._fill_recovery_staged
+        if staged is not None:
+            staged[coid] = target
+        elif target is None:
+            self._unbooked_fill_orders.pop(coid, None)
+        else:
+            self._unbooked_fill_orders[coid] = target
+
+    def _journal_fill_recovery_done(
+            self, coid: str, order_id: str, cum_exec: Decimal, **payload: object,
+    ) -> None:
+        """Write the done record of one per-order fill recovery target."""
+        if self.store_ctx is None:
+            return
+        self.store_ctx.log_event(
+            FILL_RECOVERY_DONE_EVENT, client_order_id=coid, exchange_order_id=order_id,
+            payload={'cum_exec_qty': str(cum_exec), **payload},
+        )
+
+    def _durable_fill_recovery_targets(self) -> dict[str, tuple[str, Decimal]]:
+        """The per-order fill recovery targets earlier processes of the run left open.
+
+        The newest target of each client order id counts; it is open unless
+        a done record of the same order covers its ``cum_exec_qty``. A record
+        without a client order id, an order id or a readable figure is
+        skipped.
+
+        :return: ``client_order_id`` -> ``(orderId, cumExecQty)``, wire domain.
+        """
+        if self.store_ctx is None:
+            return {}
+        targets: dict[str, tuple[str, Decimal]] = {}
+        for _ik, coid, order_id, payload in \
+                self.store_ctx.iter_events_by_kind_for_run_id(FILL_RECOVERY_TARGET_EVENT):
+            figure = _decimal_or_none(payload.get('cum_exec_qty'))
+            if coid and order_id and figure is not None:
+                targets[coid] = (order_id, figure)
+        if not targets:
+            return {}
+        for _ik, coid, order_id, payload in \
+                self.store_ctx.iter_events_by_kind_for_run_id(FILL_RECOVERY_DONE_EVENT):
+            target = targets.get(coid or '')
+            figure = _decimal_or_none(payload.get('cum_exec_qty'))
+            if (target is not None and figure is not None and order_id == target[0]
+                    and figure >= target[1]):
+                del targets[coid or '']
+        return targets
 
     @override
     def fill_recovery_pending(self, entry_ids: Collection[str]) -> bool:
@@ -451,36 +647,68 @@ class _ReconcileMixin(_BybitBase, ABC):
                 continue
             if str(existing.get('orderStatus') or '') in _LIVE_ORDER_STATUSES:
                 continue
-            try:
-                cum_exec = Decimal(str(existing.get('cumExecQty') or '0') or '0')
-            except (InvalidOperation, TypeError, ValueError):
-                cum_exec = Decimal(0)
+            ended = _ended_cum_exec_qty(existing)
+            if ended is None:
+                # The terminal order carries no usable executed quantity:
+                # a zero would end the checks with its fills unproven.
+                continue
+            cum_exec = Decimal(str(ended))
             order_id = str(existing.get('orderId') or '') or row.exchange_order_id or ''
             self._note_unbooked_fills(row, order_id, cum_exec)
             checked.add(coid)
         checked.intersection_update(candidates)
 
-    async def _settle_cancelled_entries(self, market: 'InstrumentInfo') -> None:
+    @override
+    async def _settle_cancelled_entries(
+            self, market: 'InstrumentInfo', events: list[OrderEvent],
+    ) -> None:
         """Settle the remainder-cancelled entries whose executed quantity is unknown.
 
         A REST cancel ACK carries no fill figure, so the entry row stays
         live and unnormalized (:meth:`_retire_cancelled_row`) until the
         venue's terminal ``cumExecQty`` arrives. The private ``order`` push
-        normally delivers it; this pass is the backstop for a dropped push:
-        each such row is read once per reconcile pass by ``orderLinkId``
-        (:meth:`_confirm_lookup`), and a terminal order settles it — closed
-        on zero fills, otherwise normalized to the executed quantity with a
-        lagging cursor queued for the per-order fill recovery. A still-live
-        order (the cancel is not processed yet), a not-found order and a
-        transport failure are retried on the next pass.
+        normally delivers it; this pass is the backstop for a dropped push
+        and for a push without a usable figure: each such row is read once
+        per reconcile pass by ``orderLinkId`` (:meth:`_confirm_lookup`), and
+        a terminal order with a usable ``cumExecQty``
+        (:func:`~pynecore_bybit.state._ended_cum_exec_qty`) settles it —
+        closed on zero fills, otherwise normalized to the executed quantity
+        with a lagging cursor queued for the per-order fill recovery. A
+        still-live order (the cancel is not processed yet), a not-found
+        order, an ended order without a usable figure and a transport
+        failure are retried on the next pass.
+
+        A row whose terminal event went to the core without the figure
+        (:data:`ENTRY_TERMINAL_EVENT_OWED_EXTRA`) gets that event again, now
+        with the venue's executed quantity. The settlement's transaction
+        clears the mark and journals the event as ready
+        (:data:`OWED_TERMINAL_EVENT_READY_EVENT`, with the venue's order
+        object); the event is appended to ``events`` as soon as it commits,
+        before the next lookup, so a later row's failure leaves it with the
+        caller. The engine stores a delivered event before it queues it and
+        replays it itself after a restart, but an event the earlier process
+        never yielded (it stopped with the event still in the outbox) is
+        still owed, and nothing else reads the settled row again: the first
+        pass of the next process re-delivers the ready events of the entries
+        the engine still holds (:meth:`_owed_terminal_events_still_held`).
+
+        :param events: The pass's event list; the owed terminal events are
+            appended to it.
         """
         if self.store_ctx is None:
             return
+        if not self._owed_terminal_restored:
+            for ready in self._owed_terminal_events_still_held():
+                event = self._owed_terminal_event(market, ready)
+                if event is not None:
+                    events.append(event)
+            self._owed_terminal_restored = True
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
+            owed_mark = ENTRY_TERMINAL_EVENT_OWED_EXTRA in extras
             if (not extras.get(ENTRY_REMAINDER_CANCELLED_EXTRA)
                     or ENTRY_CANCEL_CUM_EXEC_EXTRA in extras
-                    or row.filled_qty >= row.qty - _FILL_EPS):
+                    or (not owed_mark and row.filled_qty >= row.qty - _FILL_EPS)):
                 continue
             existing, conclusive = await self._confirm_lookup(market, row.client_order_id)
             if not conclusive or existing is None:
@@ -488,17 +716,80 @@ class _ReconcileMixin(_BybitBase, ABC):
             status = str(existing.get('orderStatus') or '')
             if status != 'Filled' and status not in _DEAD_ORDER_STATUSES:
                 continue
-            raw = existing.get('cumExecQty')
-            try:
-                cum_exec = float(raw) if raw not in (None, '') else None
-            except (TypeError, ValueError):
-                cum_exec = None
+            cum_exec = _ended_cum_exec_qty(existing)
             if cum_exec is None:
                 continue
-            self._retire_cancelled_row(
-                row.client_order_id, cum_exec,
-                str(existing.get('orderId') or '') or None,
-            )
+            with self._journal_transaction():
+                payload = self._deliver_owed_terminal_event(
+                    row.client_order_id, existing, None)
+                self._retire_cancelled_row(
+                    row.client_order_id, cum_exec,
+                    str(existing.get('orderId') or '') or None,
+                )
+            if payload is None:
+                continue
+            event = self._owed_terminal_event(market, payload)
+            if event is not None:
+                events.append(event)
+
+    def _owed_terminal_events_still_held(self) -> list[dict]:
+        """The ready owed terminal events whose entry the engine still holds.
+
+        The engine keeps an entry whose terminal event carried no executed
+        quantity in a durable fill-evidence hold
+        (:meth:`~pynecore.core.broker.storage.RunContext.fill_evidence_holds`:
+        intent key -> the venue order ids it names). A restart re-arms it,
+        and the hold is released only after the event that settles it was
+        applied. A hold that names the order of a ready record (its venue
+        order id, or the intent key of its journal row) is therefore an owed
+        terminal event the engine has not applied. When the earlier process
+        yielded it, the engine stored it on receipt and replays it itself,
+        and the copy re-delivered here is only logged; when it never yielded
+        it (or the engine's store write of the received event failed), this
+        copy is the one that settles the hold. A released hold means the
+        engine applied it, so the event is not re-delivered.
+
+        :return: One ready record payload per order, in journal order.
+        """
+        if self.store_ctx is None:
+            return []
+        holds = self.store_ctx.fill_evidence_holds()
+        if not holds:
+            return []
+        held_order_ids = {order_id for order_ids in holds.values() for order_id in order_ids}
+        ready: dict[str, dict] = {}
+        for _ik, _coid, _oid, payload in \
+                self.store_ctx.iter_events_by_kind_for_run_id(OWED_TERMINAL_EVENT_READY_EVENT):
+            coid = payload.get('coid')
+            readback = payload.get('readback')
+            if not isinstance(coid, str) or not coid or not isinstance(readback, dict):
+                continue
+            row = self.store_ctx.get_order_for_run_id(coid)
+            if (str(readback.get('orderId') or '') in held_order_ids
+                    or (row is not None and row.intent_key in holds)):
+                ready[coid] = payload
+        return list(ready.values())
+
+    def _owed_terminal_event(self, market: 'InstrumentInfo', payload: dict) -> OrderEvent | None:
+        """Build the owed terminal event of one ready record.
+
+        :param payload: The :data:`OWED_TERMINAL_EVENT_READY_EVENT` payload.
+        :return: The event, ``None`` when the record names no order.
+        """
+        readback = payload['readback']
+        coid = str(payload.get('coid') or '')
+        if not coid:
+            return None
+        identity = self._resolve_identity(coid, str(readback.get('orderId') or '') or None)
+        if identity[2] is None:
+            # A restart does not re-home the closed row: the identity the
+            # settlement recorded names the order.
+            stored = payload.get('identity') or [None, None, None]
+            identity = (stored[0], stored[1],
+                        LegType(stored[2]) if stored[2] is not None else None)
+        return self._order_lifecycle_event(
+            readback, str(payload.get('event_type') or 'cancelled'), coid, identity, market,
+        )
 
     def _rows_have_exposure(self, position_rows: list[dict]) -> bool:
         """Whether any position row carries a non-zero size."""
@@ -572,6 +863,9 @@ class _ReconcileMixin(_BybitBase, ABC):
           unexpected-cancel policy).
         * A found dead order with zero fills → CANCELLED (retired with the
           dual signal + policy).
+        * Before either CANCELLED verdict a close row journals how its order
+          ended (:meth:`~_EventStreamMixin._journal_close_ending`), which is
+          what settles a close the core holds.
         * Either CANCELLED verdict carries the venue-driven reason its
           ``cancelType`` names (a reduce-only squeeze, an OCA sibling
           trigger, a cleared position): the push of a venue cancel can be
@@ -579,9 +873,12 @@ class _ReconcileMixin(_BybitBase, ABC):
           cancel — the tracker retires the row without the policy. A
           ``Rejected`` order carries the venue-rejected reason: only the
           venue can reject.
-        * A transport failure, or a not-found row (never landed, or a dead
-          order aged out of the < 24h history retention) → INCONCLUSIVE: a
-          cancel is only ever concluded from a FOUND dead order.
+        * A transport failure, a not-found row (never landed, or a dead
+          order aged out of the < 24h history retention), or an ended order
+          whose ``cumExecQty`` is missing, unparsable or a zero its
+          status contradicts → INCONCLUSIVE: a
+          cancel is only ever concluded from a FOUND dead order with its
+          executed quantity.
         """
         existing, conclusive = await self._confirm_lookup(market, row.client_order_id)
         if not conclusive:
@@ -591,10 +888,15 @@ class _ReconcileMixin(_BybitBase, ABC):
         status = str(existing.get('orderStatus') or '')
         if status in _LIVE_ORDER_STATUSES:
             return MissingConfirmation(MissingResolution.STILL_PRESENT)
-        try:
-            cum_exec = Decimal(str(existing.get('cumExecQty') or '0') or '0')
-        except (InvalidOperation, TypeError, ValueError):
-            cum_exec = Decimal(0)
+        venue_cum_exec = _ended_cum_exec_qty(existing)
+        if venue_cum_exec is None:
+            # An ended order without a readable executed quantity, or with
+            # a zero one its status contradicts (``Filled``,
+            # ``PartiallyFilledCanceled``), proves neither a fill nor its
+            # absence: the retirement would take the
+            # row's cursor as the terminal figure and journal a zero as proof.
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+        cum_exec = Decimal(str(venue_cum_exec))
         if market.category != CATEGORY_SPOT:
             self._note_unbooked_fills(row, str(existing.get('orderId') or ''), cum_exec)
         if status in _DEAD_ORDER_STATUSES:
@@ -608,7 +910,13 @@ class _ReconcileMixin(_BybitBase, ABC):
             # residual is a genuine cancellation — dual signal, plus the
             # policy unless the venue itself names the cause. A rejected
             # order is always the venue's verdict (the push path books it
-            # as a reject, never as an intervention).
+            # as a reject, never as an intervention). A close row journals
+            # the ending first: the push that would have carried it is the
+            # one that went missing.
+            if (row.extras or {}).get('kind') == 'close':
+                self._journal_close_ending(
+                    row.client_order_id, status, venue_cum_exec,
+                )
             if status == 'Rejected':
                 cancel_reason: str | None = CANCEL_REASON_VENUE_REJECTED
             else:
@@ -698,7 +1006,10 @@ class _ReconcileMixin(_BybitBase, ABC):
             order_type=(OrderType.LIMIT if lt is LegType.TAKE_PROFIT
                         else OrderType.STOP if lt is LegType.STOP_LOSS
                         else OrderType.MARKET),
-            qty=row.qty, filled_qty=row.filled_qty,
+            # The order's executed quantity, with what reducing fills netted
+            # out of the row: the core keeps an entry's protection on it.
+            qty=row.qty + venue_filled_qty(row) - row.filled_qty,
+            filled_qty=venue_filled_qty(row),
             remaining_qty=max(0.0, row.qty - row.filled_qty),
             price=None, stop_price=None, average_fill_price=None,
             status=OrderStatus.CANCELLED, timestamp=now_ts, fee=0.0,
@@ -708,6 +1019,8 @@ class _ReconcileMixin(_BybitBase, ABC):
         market = self._market
         if market is not None and market.is_inverse:
             order = self._inverse_order_to_base(order)
+        # The inverse anchor is keyed by the wire id; the core reads its own.
+        order = replace(order, client_order_id=self._core_client_order_id(row.client_order_id))
         return OrderEvent(
             order=order, event_type='cancelled',
             fill_price=None, fill_qty=None, timestamp=now_ts,

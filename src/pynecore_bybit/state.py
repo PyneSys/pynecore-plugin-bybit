@@ -21,6 +21,7 @@ plus the broker lifecycle glue:
 """
 import asyncio
 import logging
+import math
 from abc import ABC
 from dataclasses import replace
 from decimal import Decimal
@@ -68,6 +69,57 @@ _ORDER_STATUS_MAP = {
 }
 
 
+#: Small float slack when comparing executed quantities — the quantities come
+#: from exact decimal strings, the slack only absorbs the float round-trip.
+_FILL_EPS = 1e-9
+
+#: ``orderStatus`` values of an order that can no longer execute.
+_ENDED_ORDER_STATUSES = frozenset({
+    'Filled', 'Cancelled', 'PartiallyFilledCanceled', 'Deactivated', 'Rejected',
+})
+
+
+def _cum_exec_qty(entry: dict) -> float | None:
+    """The ``cumExecQty`` of one venue order object.
+
+    :return: The figure, or ``None`` when it is absent, unparsable, not finite
+        or negative: such a figure proves neither a fill nor its absence.
+    """
+    raw = entry.get('cumExecQty')
+    if raw is None or raw == '':
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0.0:
+        return None
+    return value
+
+
+#: Ended order statuses that state an execution: an order in one of them with
+#: a zero ``cumExecQty`` contradicts itself.
+_EXECUTED_ORDER_STATUSES = frozenset({'Filled', 'PartiallyFilledCanceled'})
+
+
+def _ended_cum_exec_qty(entry: dict) -> float | None:
+    """The ``cumExecQty`` of an ended venue order, checked against its status.
+
+    The figure an ended order's retirement, journal and verdicts are built
+    on: :func:`_cum_exec_qty`, but also ``None`` when the ``orderStatus``
+    states an execution (``Filled``, ``PartiallyFilledCanceled``) while the
+    figure is zero. Such an object proves neither a fill nor its absence, so
+    it must never become the zero that closes a row as unfilled.
+
+    :return: The figure, or ``None`` when it proves nothing.
+    """
+    value = _cum_exec_qty(entry)
+    if (value is not None and value <= _FILL_EPS
+            and str(entry.get('orderStatus') or '') in _EXECUTED_ORDER_STATUSES):
+        return None
+    return value
+
+
 def _order_type_of(entry: dict) -> OrderType:
     """Map one realtime/WS order payload to the PyneCore order type."""
     if str(entry.get('triggerPrice') or ''):
@@ -79,12 +131,23 @@ def _order_type_of(entry: dict) -> OrderType:
 def parse_exchange_order(entry: dict) -> ExchangeOrder:
     """Build an :class:`ExchangeOrder` from one order payload.
 
-    Shared by :meth:`_StateMixin.get_open_orders` and the private-stream
-    ``order`` topic — the REST ``realtime`` rows and the WS pushes carry
-    the same field names.
+    Shared by :meth:`_StateMixin.get_open_orders`, the private-stream
+    ``order`` topic and the order-history readback — the REST rows and the
+    WS pushes carry the same field names.
+
+    ``filled_qty`` is the venue's ``cumExecQty`` only when the payload
+    proves it: :func:`_ended_cum_exec_qty` for an ended order,
+    :func:`_cum_exec_qty` for a live one. A missing, unparsable or
+    status-contradicting figure yields ``filled_qty=0.0`` with
+    ``filled_qty_known=False`` (a lower bound, never a proven zero); a
+    caller that holds the execution already seen raises ``filled_qty`` to it.
     """
     qty = float(entry.get('qty') or 0.0)
-    filled = float(entry.get('cumExecQty') or 0.0)
+    if str(entry.get('orderStatus') or '') in _ENDED_ORDER_STATUSES:
+        cum_exec = _ended_cum_exec_qty(entry)
+    else:
+        cum_exec = _cum_exec_qty(entry)
+    filled = cum_exec if cum_exec is not None else 0.0
     price = float(entry.get('price') or 0.0)
     trigger = float(entry.get('triggerPrice') or 0.0)
     avg = float(entry.get('avgPrice') or 0.0)
@@ -108,6 +171,7 @@ def parse_exchange_order(entry: dict) -> ExchangeOrder:
         fee_currency='',
         reduce_only=bool(entry.get('reduceOnly', False)),
         client_order_id=str(entry.get('orderLinkId') or '') or None,
+        filled_qty_known=cum_exec is not None,
     )
 
 
@@ -417,7 +481,9 @@ class _StateMixin(_BybitBase, ABC):
                 break
         if market.is_inverse:
             out = [self._inverse_order_to_base(order) for order in out]
-        return out
+        # The inverse anchor is keyed by the wire id; the core reads its own.
+        return [replace(order, client_order_id=self._core_client_order_id(order.client_order_id))
+                for order in out]
 
     def _inverse_order_to_base(self, order: ExchangeOrder) -> ExchangeOrder:
         """Convert one wire (contract-denominated) order row to base units.

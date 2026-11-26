@@ -139,6 +139,24 @@ def _stamp_of(broker, coid):
     return (row.extras or {}).get('missing_pending_since')
 
 
+def __test_helper_storing_sink(broker, record):
+    """A quarantine sink that stores the latch the way the engine's sink does.
+
+    The engine persists every requested latch
+    (:meth:`~pynecore.core.broker.storage.RunContext.record_quarantine`), and the
+    disappearance tracker retires an unexpected-cancel row only once
+    :meth:`~pynecore.core.broker.storage.RunContext.intervention_latch_stored`
+    confirms it. ``record`` receives each call's ``(reason, ctx, kind)``.
+    """
+    def sink(reason, ctx, *, kind):
+        record(reason, ctx, kind)
+        broker.store_ctx.record_quarantine(
+            'q-test', kind=str(kind), reason=reason, intent_key=None,
+            context=ctx, entered_ts_ms=0,
+        )
+    return sink
+
+
 # === Verdict: CANCELLED (dual signal + policy) =============================
 
 def __test_grace_expired_cancel_emits_event_and_quarantines__(tmp_path):
@@ -152,7 +170,8 @@ def __test_grace_expired_cancel_emits_event_and_quarantines__(tmp_path):
         history_by_coid={'c1': _order(order_id='o1', coid='c1', status='Cancelled')},
     )
     broker.on_unexpected_cancel = 'stop'
-    broker.quarantine_sink = lambda reason, ctx, *, kind: calls.append((reason, ctx, kind))
+    broker.quarantine_sink = __test_helper_storing_sink(
+        broker, lambda reason, ctx, kind: calls.append((reason, ctx, kind)))
     _open(tmp_path, broker)
     _seed(broker, 'c1', exchange_order_id='o1')
     _stamp(broker, 'c1')
@@ -176,7 +195,8 @@ def __test_grace_expired_partial_entry_cancel_keeps_the_exposure_owned__(tmp_pat
                                       status='Cancelled', cum='0.004')},
     )
     broker.on_unexpected_cancel = 'stop'
-    broker.quarantine_sink = lambda reason, ctx, *, kind: calls.append(kind)
+    broker.quarantine_sink = __test_helper_storing_sink(
+        broker, lambda _reason, _ctx, kind: calls.append(kind))
     _open(tmp_path, broker)
     _seed(broker, 'c9', exchange_order_id='o9', filled=0.004)
     _stamp(broker, 'c9')

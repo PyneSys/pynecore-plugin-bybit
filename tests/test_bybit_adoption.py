@@ -2,16 +2,19 @@
 @pyne
 """
 import asyncio
+import sqlite3
 from collections.abc import AsyncGenerator
+from decimal import Decimal
 from typing import cast
 
 import pytest
 
 from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
-from pynecore.core.broker.storage import BrokerStore
+from pynecore.core.broker.storage import BrokerStore, FillReceipt
 from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION
 
+import pynecore_bybit.events as events_module
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import BybitAdoptionBaselineError, BybitConnectionError
 from pynecore_bybit.models import InstrumentInfo
@@ -1022,3 +1025,288 @@ def __test_startup_gate_replay_owns_each_fill_once__(tmp_path):
     # duplicate did not move it again.
     assert broker.store_ctx.get_order('c1').filled_qty == 0.01
     assert broker.store_ctx.get_order('c2').filled_qty == 0.002
+
+
+# === Durable per-order fill recovery across a restart ======================
+
+def __test_helper_restart(broker, fresh) -> None:
+    """Close ``broker``'s run instance and open the next one into ``fresh``."""
+    store = broker.store_ctx._store
+    broker.store_ctx.close()
+    identity = RunIdentity(
+        strategy_id="adopt", symbol=fresh._market.symbol, timeframe="1",
+        account_id="adopt-account",
+    )
+    fresh.store_ctx = store.open_run(identity, script_source="// adopt")
+
+
+def __test_helper_after_close_restart(**overrides) -> _AdoptionFake:
+    """The restarted process: venue long 0.01 (0.004 of it someone else's)."""
+    values = dict(
+        market=_linear_instrument(),
+        positions=[_pos(side='Buy', size='0.01')],
+        execs={'o1': [_exec('e1', '0.01')], 'ocl': [_exec('e-cl', '0.004')]},
+        order_lookups={'c1': {'orderId': 'o1', 'orderStatus': 'Filled',
+                              'cumExecQty': '0.01'}},
+    )
+    values.update(overrides)
+    return _AdoptionFake(**values)
+
+
+def __test_closed_close_row_fill_recovery_survives_a_restart__(tmp_path):
+    # The run held 0.01 long and sent a 0.01 close; the venue cancelled its
+    # remainder after 0.004 executed. The terminal push retired the close
+    # row, and the process stopped before the execution was booked. The next
+    # instance does not inherit the closed row, so only the durable target
+    # tells it the reduce is owed: the baseline nets it from the entry rows
+    # exactly once, seeds its execution id, and clears the target.
+    first = _AdoptionFake(market=_linear_instrument())
+    _open(tmp_path, first)
+    _seed(first, 'c1', qty=0.01, filled_qty=0.01)
+    _seed(first, 'cl1', qty=0.01, side='sell', kind='close', exchange_order_id='ocl')
+    first._retire_cancelled_row('cl1', 0.004, 'ocl', venue_status='PartiallyFilledCanceled')
+    assert first.store_ctx.get_order('cl1').closed_ts_ms is not None
+    assert first._unbooked_fill_orders == {'cl1': ('ocl', Decimal('0.004'))}
+    assert first._durable_fill_recovery_targets() == {'cl1': ('ocl', Decimal('0.004'))}
+
+    fresh = __test_helper_after_close_restart()
+    __test_helper_restart(first, fresh)
+    assert fresh.store_ctx.get_order('cl1') is None, "a closed row is not re-homed"
+    _adopt(fresh)
+    assert 'ocl' in _exec_list_order_ids(fresh)
+    assert 'e-cl' in fresh._seen_exec_ids
+    assert fresh._run_owned_signed_size() == pytest.approx(0.006)
+    assert fresh._durable_fill_recovery_targets() == {}
+    assert fresh._unbooked_fill_orders == {}
+    assert _clamp_events(fresh) == []
+
+    # A later restart neither reads the order again nor nets the reduce twice.
+    third = __test_helper_after_close_restart()
+    __test_helper_restart(fresh, third)
+    _adopt(third)
+    assert 'ocl' not in _exec_list_order_ids(third)
+    assert third._run_owned_signed_size() == pytest.approx(0.006)
+
+
+def __test_failed_adoption_write_commits_nothing_and_the_retry_nets_once__(tmp_path):
+    # The baseline nets a closed close row's unbooked reduce from the entry
+    # rows, voids the ledger credits an earlier process left and marks the
+    # recovery target done: one commit. A failed done write rolls all of it
+    # back and leaves the baseline unlatched, so the retry starts from the
+    # same journal and nets the reduce exactly once.
+    first = _AdoptionFake(market=_linear_instrument())
+    _open(tmp_path, first)
+    _seed(first, 'c1', qty=0.01, filled_qty=0.01)
+    _seed(first, 'cl1', qty=0.01, side='sell', kind='close', exchange_order_id='ocl')
+    first._retire_cancelled_row('cl1', 0.004, 'ocl', venue_status='PartiallyFilledCanceled')
+    first._persist_ledger_credits(0, [[999.0, 0.002, 1.0]])
+
+    fresh = __test_helper_after_close_restart()
+    __test_helper_restart(first, fresh)
+    real_done = fresh._journal_fill_recovery_done
+    calls: list[str] = []
+
+    def failing_done(coid, order_id, cum_exec, **payload):
+        calls.append(coid)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_done(coid, order_id, cum_exec, **payload)
+
+    fresh._journal_fill_recovery_done = failing_done
+    with pytest.raises(sqlite3.OperationalError):
+        _adopt(fresh)
+    assert not fresh._adoption_baselined
+    assert 'e-cl' not in fresh._seen_exec_ids
+    assert fresh._run_owned_signed_size() == pytest.approx(0.01), "the netting rolled back"
+    assert fresh._load_persisted_ledger_credits() == {0: [[999.0, 0.002, 1.0]]}
+    assert fresh._durable_fill_recovery_targets() == {'cl1': ('ocl', Decimal('0.004'))}
+
+    _adopt(fresh)
+    assert fresh._adoption_baselined
+    assert 'e-cl' in fresh._seen_exec_ids
+    assert fresh._run_owned_signed_size() == pytest.approx(0.006)
+    assert fresh._load_persisted_ledger_credits() == {0: []}
+    assert fresh._durable_fill_recovery_targets() == {}
+
+
+def __test_inherited_entry_fill_is_delivered_once_with_its_fee__(tmp_path):
+    # The earlier process journaled the entry's two executions; the engine
+    # took the first (its receipt is stored) and the process ended before it
+    # took the second. The baseline seeds both into the de-dup frontier, so
+    # only its flagged delivery can bring the second fill's fee to the
+    # engine: it goes out once, journaled_before_restart, with its fee. The
+    # next restart finds the receipt and delivers nothing.
+    first = _AdoptionFake(market=_linear_instrument())
+    _open(tmp_path, first)
+    _seed(first, 'c1', qty=0.01, filled_qty=0.01)
+    first.store_ctx.record_fill_receipts([FillReceipt('e1a', booked=True, fee=0.1)])
+    executions = [
+        {**_exec('e1a', '0.006'), 'execPrice': '30000', 'execFee': '0.1',
+         'execTime': '1709999000000', 'side': 'Buy', 'orderId': 'o1'},
+        {**_exec('e1b', '0.004'), 'execPrice': '30010', 'execFee': '0.07',
+         'execTime': '1709999001000', 'side': 'Buy', 'orderId': 'o1'},
+    ]
+    restart = dict(
+        positions=[_pos(side='Buy', size='0.01')], execs={'o1': executions},
+        order_lookups={'c1': {'orderId': 'o1', 'orderStatus': 'Filled', 'cumExecQty': '0.01'}},
+    )
+    fresh = _AdoptionFake(market=_linear_instrument(), **restart)
+    __test_helper_restart(first, fresh)
+    _adopt(fresh)
+    events = fresh._inherited_fill_events
+    assert [(e.fill_id, e.journaled_before_restart, e.event_type) for e in events] == \
+        [('e1b', True, 'filled')]
+    event = events[0]
+    assert event.fee == pytest.approx(0.07) and event.fee_currency == 'USDT'
+    assert event.fill_qty == pytest.approx(0.004) and event.fill_price == pytest.approx(30010)
+    assert event.pine_id == 'Long' and event.order.filled_qty == pytest.approx(0.01)
+    assert fresh.store_ctx.get_order('c1').filled_qty == pytest.approx(0.01), \
+        "the delivery moves no plugin state"
+    delivered = asyncio.run(fresh._run_deriv_fill_backfill(fresh._market))
+    assert [e.fill_id for e in delivered] == ['e1b']
+    assert fresh._inherited_fill_events == []
+
+    fresh.store_ctx.record_fill_receipts([FillReceipt('e1b', booked=True, fee=0.07)])
+    third = _AdoptionFake(market=_linear_instrument(), **restart)
+    __test_helper_restart(fresh, third)
+    _adopt(third)
+    assert third._inherited_fill_events == []
+
+
+def __test_inherited_fill_survives_a_failing_reconcile_step__(tmp_path, monkeypatch):
+    # The pass that drained the inherited fill raises in a later step (the
+    # per-order recovery): the fill's state is committed and its execId is in
+    # the de-dup frontier, so no other path would ever deliver it. It waits
+    # in the outbox and is the first event of the stream's next turn, once.
+    first = _AdoptionFake(market=_linear_instrument())
+    _open(tmp_path, first)
+    _seed(first, 'c1', qty=0.01, filled_qty=0.01)
+    first.store_ctx.record_fill_receipts([FillReceipt('e1a', booked=True, fee=0.1)])
+    executions = [
+        {**_exec('e1a', '0.006'), 'execPrice': '30000', 'execFee': '0.1',
+         'execTime': '1709999000000', 'side': 'Buy', 'orderId': 'o1'},
+        {**_exec('e1b', '0.004'), 'execPrice': '30010', 'execFee': '0.07',
+         'execTime': '1709999001000', 'side': 'Buy', 'orderId': 'o1'},
+    ]
+    fresh = _AdoptionFake(
+        market=_linear_instrument(), positions=[_pos(side='Buy', size='0.01')],
+        execs={'o1': executions},
+        order_lookups={'c1': {'orderId': 'o1', 'orderStatus': 'Filled', 'cumExecQty': '0.01'}},
+    )
+    __test_helper_restart(first, fresh)
+    _adopt(fresh)
+    assert [e.fill_id for e in fresh._inherited_fill_events] == ['e1b']
+
+    async def nothing(*_args, **_kwargs):
+        return []
+
+    async def no_window(*_args, **_kwargs):
+        return [], True
+
+    async def failing(*_args, **_kwargs):
+        raise RuntimeError("per-order recovery failed")
+
+    for name in ('_resolve_parked_dispatches', '_settle_cancelled_entries',
+                 '_fetch_position_rows', '_note_unbooked_market_entries'):
+        monkeypatch.setattr(fresh, name, nothing)
+    monkeypatch.setattr(fresh, '_reconcile_disappearance', nothing)
+    monkeypatch.setattr(fresh, '_drain_deriv_exec_window', no_window)
+    monkeypatch.setattr(fresh, '_recover_unbooked_order_fills', failing)
+    with pytest.raises(RuntimeError, match='per-order recovery failed'):
+        asyncio.run(fresh._run_deriv_reconcile(fresh._market))
+    assert fresh._inherited_fill_events == []
+    assert [(e.fill_id, e.journaled_before_restart) for e in fresh._event_outbox] == \
+        [('e1b', True)]
+
+    async def started(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(fresh, '_ensure_broker_started', started)
+    monkeypatch.setattr(fresh, '_observe_resume_baseline', started)
+
+    async def _drive():
+        agen = cast(AsyncGenerator, fresh.watch_orders())
+        event = await agen.__anext__()
+        await agen.aclose()
+        return event
+
+    event = asyncio.run(_drive())
+    assert event.fill_id == 'e1b' and event.fee == pytest.approx(0.07)
+    assert fresh._event_outbox == []
+
+
+def __test_closed_stream_keeps_the_rest_of_the_pass__(tmp_path, monkeypatch):
+    # The stream yields a reconcile pass's events one at a time through the
+    # outbox: when the stream is closed after the first one, the rest of the
+    # pass is still there for the reopened one.
+    broker = _AdoptionFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    first, second = object(), object()
+    passes = [[first, second]]
+
+    async def started(*_args, **_kwargs):
+        return None
+
+    async def stream_down(*_args, **_kwargs):
+        return BybitConnectionError("private stream down")
+
+    async def reconcile(*_args, **_kwargs):
+        return passes.pop(0) if passes else []
+
+    monkeypatch.setattr(events_module, 'RECONCILE_CADENCE_S', 0.0)
+    monkeypatch.setattr(broker, '_ensure_broker_started', started)
+    monkeypatch.setattr(broker, '_observe_resume_baseline', started)
+    monkeypatch.setattr(broker, '_open_private_ws', stream_down)
+    monkeypatch.setattr(broker, '_run_deriv_reconcile', reconcile)
+
+    async def _drive():
+        agen = cast(AsyncGenerator, broker.watch_orders())
+        yielded = [await agen.__anext__()]
+        await agen.aclose()
+        reopened = cast(AsyncGenerator, broker.watch_orders())
+        yielded.append(await reopened.__anext__())
+        await reopened.aclose()
+        return yielded
+
+    assert asyncio.run(_drive()) == [first, second]
+    assert broker._event_outbox == []
+
+
+def __test_closed_row_recovery_waits_for_the_execution_index__(tmp_path):
+    # The venue's execution index has not caught up with the target yet: the
+    # baseline must not commit a partial seed (it would net nothing and drop
+    # the obligation); the target stays open for the next attempt.
+    first = _AdoptionFake(market=_linear_instrument())
+    _open(tmp_path, first)
+    _seed(first, 'c1', qty=0.01, filled_qty=0.01)
+    _seed(first, 'cl1', qty=0.01, side='sell', kind='close', exchange_order_id='ocl')
+    first._retire_cancelled_row('cl1', 0.004, 'ocl', venue_status='PartiallyFilledCanceled')
+
+    fresh = __test_helper_after_close_restart(execs={'o1': [_exec('e1', '0.01')]})
+    __test_helper_restart(first, fresh)
+    with pytest.raises(BybitAdoptionBaselineError, match='closed order ocl'):
+        _adopt(fresh)
+    assert not fresh._adoption_baselined
+    assert fresh._durable_fill_recovery_targets() == {'cl1': ('ocl', Decimal('0.004'))}
+    assert fresh._run_owned_signed_size() == pytest.approx(0.01)
+
+
+def __test_closed_entry_row_recovery_target_is_seeded_and_cleared__(tmp_path):
+    # An entry row closed with a recovery target open (the flat sweep closed
+    # it before its execution was booked): the adopted position holds the
+    # execution, so the baseline only seeds its id and clears the target.
+    first = _AdoptionFake(market=_linear_instrument())
+    _open(tmp_path, first)
+    _seed(first, 'c2', qty=0.01, filled_qty=0.006, exchange_order_id='o2')
+    first._note_unbooked_fills(first.store_ctx.get_order('c2'), 'o2', Decimal('0.01'))
+    first.store_ctx.close_order('c2')
+
+    fresh = __test_helper_after_close_restart(
+        positions=[], execs={'o2': [_exec('e2a', '0.006'), _exec('e2b', '0.004')]},
+        order_lookups={},
+    )
+    __test_helper_restart(first, fresh)
+    _adopt(fresh)
+    assert {'e2a', 'e2b'} <= fresh._seen_exec_ids
+    assert fresh._durable_fill_recovery_targets() == {}

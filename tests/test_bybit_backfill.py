@@ -3,8 +3,11 @@
 """
 import asyncio
 import logging
+import sqlite3
 import time
 from decimal import Decimal
+
+import pytest
 
 from pynecore.core.broker import storage
 from pynecore.core.broker.disappearance import MISSING_PENDING_EXTRA, MissingResolution
@@ -22,8 +25,10 @@ from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, ENTRY_KIND_W
 from pynecore_bybit import Bybit, BybitConfig
 from pynecore_bybit.exceptions import BybitAPIError, BybitConnectionError
 from pynecore_bybit.helpers import (
+    CLOSE_VENUE_END_EXTRA,
     ENTRY_CANCEL_CUM_EXEC_EXTRA,
     EXECUTION_WINDOW_MS,
+    FILL_RECOVERY_TARGET_EVENT,
     venue_filled_qty,
 )
 from pynecore_bybit.models import InstrumentInfo
@@ -159,6 +164,161 @@ def _seed(broker, coid, *, qty, filled=None, extras=None) -> None:
 
 def _backfill(broker) -> list:
     return asyncio.run(broker._run_deriv_fill_backfill(broker._market))
+
+
+# === A failed fill write keeps the execution retryable ======================
+
+def __test_failed_fill_write_leaves_the_execution_unseen_and_retryable__(
+        tmp_path, monkeypatch):
+    """A booking whose journal write fails commits nothing and is booked by the retry.
+
+    The ``execId`` joins the de-dup frontier only after the booking
+    committed: the next read books the execution once, its cursor advances.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed(broker, 'c1', qty=0.01)
+    execution = _exec(exec_id='e1', order_id='x-c1', coid='c1', qty=0.002,
+                      price=30000, ts_ms=now - 30_000, symbol='BTCUSDT')
+    store = broker.store_ctx
+    original = store.set_filled
+
+    def failing_set_filled(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, 'set_filled', failing_set_filled)
+        with pytest.raises(sqlite3.OperationalError):
+            broker._backfill_one_execution(execution, broker._market)
+    assert store.set_filled == original
+    assert 'e1' not in broker._seen_exec_ids
+    assert store.get_order('c1').filled_qty == 0.0
+    events = broker._backfill_one_execution(execution, broker._market)
+    assert [e.fill_id for e in events] == ['e1']
+    assert abs(store.get_order('c1').filled_qty - 0.002) < 1e-12
+    assert broker._backfill_one_execution(execution, broker._market) == []
+
+
+def __test_failed_booking_rolls_the_position_ledger_back__(tmp_path, monkeypatch):
+    """A booking that fails after entering the position ledger leaves no trace there.
+
+    The ledger claimed the ``execId`` and recorded the execution before the
+    booking's transaction rolled back; the snapshot puts the ledgers back,
+    credits included, so the retry enters the execution once.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed(broker, 'c1', qty=0.01)
+    execution = {**_exec(exec_id='e1', order_id='x-c1', coid='c1', qty=0.002,
+                         price=30000, ts_ms=now - 30_000, symbol='BTCUSDT'),
+                 'seq': '700'}
+    leg = broker._opened_leg('buy')
+    broker._leg_ledger(leg).credits = [[650.0, 0.001, 1.0]]
+    original = broker._note_own_execution
+
+    def failing_note_own_execution(*args, **kwargs):
+        original(*args, **kwargs)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(broker, '_note_own_execution', failing_note_own_execution)
+        with pytest.raises(sqlite3.OperationalError):
+            broker._backfill_one_execution(execution, broker._market)
+    ledger = broker._leg_ledgers[leg]
+    assert 'e1' not in broker._ledger_exec_ids
+    assert 'e1' not in ledger.events
+    assert ledger.credits == [[650.0, 0.001, 1.0]]
+    assert broker.store_ctx.get_order('c1').filled_qty == 0.0
+    events = broker._backfill_one_execution(execution, broker._market)
+    assert [e.fill_id for e in events] == ['e1']
+    ledger = broker._leg_ledgers[leg]
+    assert 'e1' in broker._ledger_exec_ids
+    assert ledger.events['e1'].share == pytest.approx(0.002)
+    assert ledger.credits == [[650.0, 0.001, 1.0]]
+
+
+def __test_failed_second_booking_keeps_the_first_fill_of_the_frame__(
+        tmp_path, monkeypatch):
+    """A frame whose second execution fails hands the first one's fill over.
+
+    The first booking committed and its ``execId`` is seen; its event goes
+    to the outbox, and the replayed frame books only the second execution.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed(broker, 'c1', qty=0.01)
+    frame = {'topic': 'execution', 'data': [
+        _exec(exec_id='e1', order_id='x-c1', coid='c1', qty=0.002,
+              price=30000, ts_ms=now - 30_000, symbol='BTCUSDT'),
+        _exec(exec_id='e2', order_id='x-c1', coid='c1', qty=0.003,
+              price=30000, ts_ms=now - 20_000, symbol='BTCUSDT'),
+    ]}
+    original = broker._book_own_execution
+
+    def failing_second(entry, *args, **kwargs):
+        if entry['execId'] == 'e2':
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(entry, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(broker, '_book_own_execution', failing_second)
+        with pytest.raises(sqlite3.OperationalError):
+            broker._translate_private_frame(frame, broker._market)
+    assert [e.fill_id for e in broker._event_outbox] == ['e1']
+    assert 'e2' not in broker._seen_exec_ids
+    replayed = broker._translate_private_frame(frame, broker._market)
+    assert [e.fill_id for e in replayed] == ['e2']
+    assert abs(broker.store_ctx.get_order('c1').filled_qty - 0.005) < 1e-12
+
+
+def __test_failed_replay_keeps_the_commit_order_of_its_frames__(tmp_path, monkeypatch):
+    """A replayed frame that fails midway leaves the earlier frames' fills ahead of its own.
+
+    The failing frame's translator hands its committed prefix over first;
+    the replay's events of the frames before it are older and go in front
+    of that prefix, behind whatever the outbox already held.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed(broker, 'c1', qty=0.01)
+    first_frame = {'topic': 'execution', 'data': [
+        _exec(exec_id='e1', order_id='x-c1', coid='c1', qty=0.002,
+              price=30000, ts_ms=now - 30_000, symbol='BTCUSDT'),
+    ]}
+    second_frame = {'topic': 'execution', 'data': [
+        _exec(exec_id='e2', order_id='x-c1', coid='c1', qty=0.003,
+              price=30000, ts_ms=now - 20_000, symbol='BTCUSDT'),
+        _exec(exec_id='e3', order_id='x-c1', coid='c1', qty=0.001,
+              price=30000, ts_ms=now - 10_000, symbol='BTCUSDT'),
+    ]}
+    broker._pre_adoption_frames = [first_frame, second_frame]
+    earlier = object()
+    broker._event_outbox = [earlier]
+    original = broker._book_own_execution
+
+    def failing_third(entry, *args, **kwargs):
+        if entry['execId'] == 'e3':
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(entry, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(broker, '_book_own_execution', failing_third)
+        with pytest.raises(sqlite3.OperationalError):
+            broker._replay_pre_adoption_frames(broker._market)
+    assert broker._event_outbox[0] is earlier
+    assert [e.fill_id for e in broker._event_outbox[1:]] == ['e1', 'e2']
+    assert broker._pre_adoption_frames == []
+    replayed = broker._translate_private_frame(second_frame, broker._market)
+    assert [e.fill_id for e in replayed] == ['e3']
+    assert abs(broker.store_ctx.get_order('c1').filled_qty - 0.006) < 1e-12
 
 
 # === Missed fill recovered after a reconnect (emitted once) ================
@@ -844,6 +1004,28 @@ def __test_market_entry_order_truth_is_read_once__(tmp_path, monkeypatch):
     assert broker._unbooked_fill_orders == {}
 
 
+def __test_market_entry_without_a_usable_figure_is_read_again__(tmp_path, monkeypatch):
+    """A terminal market entry without a usable ``cumExecQty`` ends no check.
+
+    A missing figure is no zero: the entry is read again on the next pass,
+    and the figure, once there, queues the late fill's recovery.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_created_at(monkeypatch, broker, 'm6', now - 600_000, qty=0.01)
+    order = _venue_order('m6', status='Filled', cum_exec='0')
+    broker.orders.append(order)
+
+    asyncio.run(broker._note_unbooked_market_entries(broker._market))
+    assert broker._unbooked_fill_orders == {}
+    order['cumExecQty'] = '0.01'
+    asyncio.run(broker._note_unbooked_market_entries(broker._market))
+    assert broker.lookups == ['m6', 'm6']
+    assert broker._unbooked_fill_orders['m6'] == ('x-m6', Decimal('0.01'))
+
+
 def __test_netted_working_entry_still_books_its_later_executions__(
         tmp_path, monkeypatch):
     """A reducing fill on a partially filled working entry keeps its cursor whole.
@@ -927,6 +1109,13 @@ def __test_cancel_ack_leaves_room_for_a_late_fill_in_the_windowed_backfill__(
     assert abs(row.filled_qty - 0.005) < 1e-12
 
 
+def __test_helper_settle_cancelled(plugin) -> list:
+    """Run one cancel settlement pass; the events it handed over."""
+    events: list = []
+    asyncio.run(plugin._settle_cancelled_entries(plugin._market, events))
+    return events
+
+
 def __test_cancel_settlement_reads_the_order_and_queues_its_missing_fill__(
         tmp_path, monkeypatch):
     """A dropped terminal push: the reconcile cadence settles the cancelled entry.
@@ -952,7 +1141,7 @@ def __test_cancel_settlement_reads_the_order_and_queues_its_missing_fill__(
     broker.orders.append(_venue_order('k2', status='PartiallyFilledCanceled',
                                       cum_exec='0.006'))
 
-    asyncio.run(broker._settle_cancelled_entries(broker._market))
+    __test_helper_settle_cancelled(broker)
     row = broker.store_ctx.get_order('k2')
     assert row.closed_ts_ms is None
     assert abs(row.qty - 0.006) < 1e-12
@@ -966,7 +1155,7 @@ def __test_cancel_settlement_reads_the_order_and_queues_its_missing_fill__(
     assert broker._tracked_refs(row) == {('positions', 'BTCUSDT')}
 
     lookups = len(broker.lookups)
-    asyncio.run(broker._settle_cancelled_entries(broker._market))
+    __test_helper_settle_cancelled(broker)
     assert len(broker.lookups) == lookups
 
 
@@ -981,10 +1170,244 @@ def __test_cancel_settlement_retires_an_entry_that_never_executed__(
     assert broker.store_ctx.get_order('k3').closed_ts_ms is None
 
     broker.orders.append(_venue_order('k3', status='New', cum_exec='0'))
-    asyncio.run(broker._settle_cancelled_entries(broker._market))
+    __test_helper_settle_cancelled(broker)
     assert broker.store_ctx.get_order('k3').closed_ts_ms is None, \
         "a still-live order is re-checked, never concluded"
 
     broker.orders[0]['orderStatus'] = 'Cancelled'
-    asyncio.run(broker._settle_cancelled_entries(broker._market))
+    __test_helper_settle_cancelled(broker)
     assert broker.store_ctx.get_order('k3').closed_ts_ms is not None
+
+
+# === Durable per-order fill recovery targets ================================
+
+def __test_fill_recovery_target_is_durable_until_the_fills_book__(tmp_path, monkeypatch):
+    """The recovery target is journaled with the retirement and cleared once booked.
+
+    A partially executed entry cancel normalizes the row and queues its
+    unbooked execution; the target is in the journal before the queue, and
+    the recovery that books the execution writes the done record, so a
+    restart finds nothing left to recover.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed_created_at(monkeypatch, broker, 'k9', now - 600_000, qty=0.01,
+                     extras={'kind': ENTRY_KIND_WORKING, 'order_type': 'limit'})
+    broker._retire_cancelled_row('k9', 0.004, 'x-k9', venue_status='PartiallyFilledCanceled')
+    assert broker._unbooked_fill_orders == {'k9': ('x-k9', Decimal('0.004'))}
+    assert broker._durable_fill_recovery_targets() == {'k9': ('x-k9', Decimal('0.004'))}
+
+    assert asyncio.run(broker._recover_unbooked_order_fills(broker._market)) == []
+    assert broker._durable_fill_recovery_targets() == {'k9': ('x-k9', Decimal('0.004'))}, \
+        "an execution not indexed yet keeps the target open"
+
+    broker.executions.append(_exec(exec_id='ek9', order_id='x-k9', coid='k9',
+                                   qty=0.004, price=30000, ts_ms=now - 300_000,
+                                   symbol='BTCUSDT'))
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [e.fill_id for e in events] == ['ek9']
+    assert broker._unbooked_fill_orders == {}
+    assert broker._durable_fill_recovery_targets() == {}
+
+
+def __test_failed_recovery_target_write_leaves_the_close_row_live__(tmp_path):
+    """A store failure while persisting the target retires nothing.
+
+    The close ending, the recovery target and the row's close are one
+    transaction: when the target cannot be written the row stays live with
+    no ending journaled, so the next push or the disappearance readback
+    settles it again, and the in-memory queue holds nothing the journal
+    lacks.
+    """
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker.store_ctx.upsert_order(
+        'cl9', symbol='BTCUSDT', side='sell', qty=0.01, state='confirmed',
+        intent_key='cl9', exchange_order_id='x-cl9', extras={'kind': 'close'},
+    )
+    real_log_event = broker.store_ctx.log_event
+
+    def failing_log_event(kind, **kwargs):
+        if kind == FILL_RECOVERY_TARGET_EVENT:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_log_event(kind, **kwargs)
+
+    broker.store_ctx.log_event = failing_log_event
+    with pytest.raises(sqlite3.OperationalError):
+        broker._retire_cancelled_row('cl9', 0.004, 'x-cl9',
+                                     venue_status='PartiallyFilledCanceled')
+    broker.store_ctx.log_event = real_log_event
+    row = broker.store_ctx.get_order('cl9')
+    assert row is not None and row.closed_ts_ms is None
+    assert CLOSE_VENUE_END_EXTRA not in (row.extras or {})
+    assert broker._unbooked_fill_orders == {}
+    assert broker._durable_fill_recovery_targets() == {}
+
+    broker._retire_cancelled_row('cl9', 0.004, 'x-cl9', venue_status='PartiallyFilledCanceled')
+    row = broker.store_ctx.get_order('cl9')
+    assert row is not None and row.closed_ts_ms is not None
+    assert broker._durable_fill_recovery_targets() == {'cl9': ('x-cl9', Decimal('0.004'))}
+
+
+def __test_rolled_back_retirement_queues_no_recovery_target__(tmp_path):
+    """A retirement span that rolls back after the target write queues nothing.
+
+    The recovery queue changes only when the span commits: a target left
+    queued from a rolled back span would make the retry skip its durable
+    record as already queued, and the row would then close with no target a
+    restart could find.
+    """
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker.store_ctx.upsert_order(
+        'cl8', symbol='BTCUSDT', side='sell', qty=0.01, state='confirmed',
+        intent_key='cl8', exchange_order_id='x-cl8', extras={'kind': 'close'},
+    )
+    real_close_order = broker.store_ctx.close_order
+
+    def failing_close_order(coid, *args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    broker.store_ctx.close_order = failing_close_order
+    with pytest.raises(sqlite3.OperationalError):
+        broker._retire_cancelled_row('cl8', 0.004, 'x-cl8',
+                                     venue_status='PartiallyFilledCanceled')
+    broker.store_ctx.close_order = real_close_order
+    assert broker._unbooked_fill_orders == {}
+    assert broker._durable_fill_recovery_targets() == {}
+    assert broker.store_ctx.get_order('cl8').closed_ts_ms is None
+
+    broker._retire_cancelled_row('cl8', 0.004, 'x-cl8', venue_status='PartiallyFilledCanceled')
+    assert broker.store_ctx.get_order('cl8').closed_ts_ms is not None
+    assert broker._unbooked_fill_orders == {'cl8': ('x-cl8', Decimal('0.004'))}
+    assert broker._durable_fill_recovery_targets() == {'cl8': ('x-cl8', Decimal('0.004'))}
+
+
+def __test_hedge_close_leg_events_report_the_core_client_order_id__(tmp_path, monkeypatch):
+    """Every event of a close leg names the coid the core passed to ``close_leg``.
+
+    The wire carries the sanitized ``orderLinkId``; the core tells a netting
+    close's fill from a strategy close's by its own id. The REST recovery
+    fill, the order push and the disappearance verdict all report it, and
+    so does a restarted instance, from the journal row.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    core_coid = 'p0-c0:2#r1'
+    broker.store_ctx.upsert_order(
+        'p0-c0:2', symbol='BTCUSDT.P', side='buy', qty=10.0, state='close_leg',
+        intent_key='__pyne_reversal_close__L', pine_entry_id='__pyne_reversal_close__L',
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, '_now_ms', lambda: now - 600_000)
+        asyncio.run(broker.close_leg('BTCUSDT', '2', 10, core_coid))
+    wire = 'p0-c0_2_r1'
+    assert [body['orderLinkId'] for body in broker.created] == [wire]
+    row = broker.store_ctx.get_order(wire)
+    assert row is not None
+
+    assert broker._core_client_order_id(wire) == core_coid
+    assert broker._cancelled_event(row, now / 1000).order.client_order_id == core_coid
+    pushed = broker._translate_order_rows({
+        'topic': 'order',
+        'data': [{'symbol': 'BTCUSDT', 'orderId': 'x-' + wire, 'orderLinkId': wire,
+                  'orderStatus': 'New', 'side': 'Sell', 'orderType': 'Market',
+                  'qty': '0.01', 'cumExecQty': '0', 'createdTime': str(now)}],
+    }, broker._market)
+    assert [event.order.client_order_id for event in pushed] == [core_coid]
+
+    broker.executions.append(_exec(exec_id='el', order_id='x-' + wire, coid=wire,
+                                   qty=0.01, price=30000, ts_ms=now - 599_000,
+                                   symbol='BTCUSDT'))
+    broker.orders.append(_venue_order(wire, status='Filled', cum_exec='0.01'))
+    asyncio.run(broker._confirm_vanished_order(broker._market, row))
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [(e.fill_id, e.order.client_order_id) for e in events] == [('el', core_coid)]
+
+    restarted = _BackfillFake(market=_linear_instrument())
+    restarted.store_ctx = broker.store_ctx
+    assert restarted._core_client_order_id(wire) == core_coid
+    assert restarted._core_client_order_id('plain-coid') == 'plain-coid'
+
+
+def __test_close_leg_execution_without_order_link_id_keeps_its_row_identity__(
+        tmp_path, monkeypatch):
+    """An execution attributed by its ``orderId`` alone books on the close row.
+
+    The row's id travels with the identity: the fill moves the close row's
+    cursor (so the per-order recovery target clears) and reports the core's
+    coid, on the push and on the per-order recovery alike.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    core_coid = 'p0-c0:3#r1'
+    broker.store_ctx.upsert_order(
+        'p0-c0:3', symbol='BTCUSDT.P', side='buy', qty=10.0, state='close_leg',
+        intent_key='__pyne_reversal_close__L', pine_entry_id='__pyne_reversal_close__L',
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, '_now_ms', lambda: now - 600_000)
+        asyncio.run(broker.close_leg('BTCUSDT', '2', 10, core_coid))
+    wire = 'p0-c0_3_r1'
+    order_id = 'x-' + wire
+    broker._confirm_row(wire, order_id, dict(broker.store_ctx.get_order(wire).extras or {}))
+    assert broker._own_order_link_id('', order_id) == wire
+    assert broker._own_order_link_id('', 'unknown') == ''
+
+    recovered = {**_exec(exec_id='ea', order_id=order_id, coid=wire, qty=0.004, price=30000,
+                         ts_ms=now - 599_000, symbol='BTCUSDT'), 'orderLinkId': ''}
+    broker.executions.append(recovered)
+    broker._note_unbooked_fills(broker.store_ctx.get_order(wire), order_id, Decimal('0.004'))
+    events = asyncio.run(broker._recover_unbooked_order_fills(broker._market))
+    assert [(e.fill_id, e.order.client_order_id) for e in events] == [('ea', core_coid)]
+    assert broker.store_ctx.get_order(wire).filled_qty == pytest.approx(0.004)
+    assert wire not in broker._unbooked_fill_orders
+
+    pushed = broker._translate_private_frame({'topic': 'execution', 'data': [
+        {**_exec(exec_id='eb', order_id=order_id, coid=wire, qty=0.006, price=30000,
+                 ts_ms=now - 598_000, symbol='BTCUSDT'), 'orderLinkId': ''},
+    ]}, broker._market)
+    assert [(e.fill_id, e.order.client_order_id) for e in pushed] == [('eb', core_coid)]
+    assert broker.store_ctx.get_order(wire).filled_qty == pytest.approx(0.01)
+
+
+def __test_order_events_report_the_order_cumulative_not_the_netted_cursor__(tmp_path):
+    """Fill and cancel events carry the order's own executed quantity.
+
+    A reducing fill netted the entry row's first execution out of its owned
+    cursor. The core keys a fill without a ``fill_id`` by the order's
+    cumulative executed quantity, and keeps an entry's protection on a
+    cancelled event's executed quantity, so neither may read the netted
+    cursor: the next slice would repeat the first slice's figure, and the
+    cancel would read as unfilled.
+    """
+    now = int(time.time() * 1000)
+    broker = _BackfillFake(market=_linear_instrument())
+    _open(tmp_path, broker)
+    broker._adoption_baselined = True
+    _seed(broker, 'k7', qty=0.01, filled=0.004,
+          extras={'kind': ENTRY_KIND_WORKING, 'order_type': 'limit'})
+    broker._net_entry_row(broker.store_ctx.get_order('k7'), 0.004)
+    row = broker.store_ctx.get_order('k7')
+    assert row.filled_qty == pytest.approx(0.0) and venue_filled_qty(row) == pytest.approx(0.004)
+
+    cancelled = broker._cancelled_event(row, now / 1000)
+    assert cancelled.order.filled_qty == pytest.approx(0.004)
+    assert cancelled.order.qty == pytest.approx(0.01)
+
+    event = broker._fill_event(
+        _exec(exec_id='e7', order_id='x-k7', coid='k7', qty=0.002, price=30000,
+              ts_ms=now, symbol='BTCUSDT'),
+        broker._market, coid='k7', pine_id='Long', from_entry=None, leg_type=LegType.ENTRY,
+    )
+    assert event is not None and event.fill_qty == pytest.approx(0.002)
+    assert event.order.filled_qty == pytest.approx(0.006)
+    assert event.order.qty == pytest.approx(0.01)
+    assert event.order.remaining_qty == pytest.approx(0.004)
+    assert broker.store_ctx.get_order('k7').filled_qty == pytest.approx(0.002)

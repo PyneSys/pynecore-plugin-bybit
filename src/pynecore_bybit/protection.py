@@ -81,8 +81,10 @@ the interventions only the plugin can see:
   doubt, so a later close of it is logged as an error, never reported,
   until the late executions complete that interval.
 """
+import copy
 import logging
 import math
+import sqlite3
 from abc import ABC
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -130,6 +132,7 @@ from .ledger import (
     ORIGIN_UNPROVEN,
     ORIGIN_USER,
     ORIGIN_VENUE,
+    LedgerSnapshot,
     LegEvent,
     LegLedger,
     LegOutcome,
@@ -439,7 +442,7 @@ class _ProtectionMixin(_BybitBase, ABC):
         """
         if self.store_ctx is None:
             return
-        with self.store_ctx.transaction():
+        with self._journal_transaction():
             row = self.store_ctx.get_order(coid)
             if row is None or row.closed_ts_ms is not None:
                 return
@@ -727,10 +730,13 @@ class _ProtectionMixin(_BybitBase, ABC):
         The view of the position the execution built may have arrived before
         it (the venue pushes ``position`` and ``execution`` as separate
         frames): the newest view of the leg not older than the start then
-        sets the baseline now, so a stop someone else adds before the next
-        view is judged against it. Without such a view the leg waits for its
+        sets the baseline, so a stop someone else adds before the next view
+        is judged against it. Without such a view the leg waits for its
         first one (:attr:`_share_unviewed`): the bot may attach its own stop
-        before it arrives.
+        before it arrives. The baseline is set once the booking committed
+        (:meth:`_baseline_started_shares`): its record is a journal write of
+        the guard's own, which a rolled back booking must not leave behind
+        in the guard's memory alone.
         """
         tolerance = self._qty_tolerance(market)
         seq = _parse_seq(entry.get('seq'))
@@ -748,9 +754,56 @@ class _ProtectionMixin(_BybitBase, ABC):
                 self._share_start.pop(idx, None)
                 continue
             self._share_start[idx] = (seq, exec_ms)
-            self._baseline_bare_trading_stop_from_last_view(idx)
+            self._share_baselines_due.append(idx)
+
+    def _baseline_started_shares(self) -> None:
+        """Set the bare baselines of the shares the committed booking started.
+
+        Called right after the booking's transaction committed
+        (:meth:`~_EventStreamMixin._book_execution_once`). A leg the newest
+        view cannot baseline, or whose baseline write fails, waits for its
+        first view (:attr:`_share_unviewed`): the booking itself stands.
+        """
+        due = self._share_baselines_due
+        self._share_baselines_due = []
+        for idx in due:
+            try:
+                self._baseline_bare_trading_stop_from_last_view(idx)
+            except sqlite3.Error as exc:
+                logger.warning(
+                    "Bybit bare trading-stop baseline of position %s could not be "
+                    "journalled (%s); the first view of the leg sets it", idx, exc,
+                )
             if not self._protection_guard().known(trading_stop_key(idx)):
                 self._share_unviewed.add(idx)
+
+    def _ledger_state_snapshot(self) -> LedgerSnapshot:
+        """The position ledgers' in-memory state, for a booking to roll back to.
+
+        Taken before an own execution's booking
+        (:meth:`~_EventStreamMixin._book_execution_once`): the booking
+        enters the execution into the ledger and may take credits there, and
+        the journal writes that mirror it roll back with a failed booking.
+        """
+        return LedgerSnapshot(
+            ledgers=copy.deepcopy(self._leg_ledgers),
+            exec_ids=dict(self._ledger_exec_ids),
+            exec_seqs=dict(self._ledger_exec_seqs),
+            share_start=dict(self._share_start),
+            share_held_since=dict(self._share_held_since),
+            share_unviewed=set(self._share_unviewed),
+        )
+
+    def _restore_ledger_state(self, snapshot: LedgerSnapshot) -> None:
+        """Put back a :meth:`_ledger_state_snapshot` after a failed booking."""
+        self._leg_ledgers = snapshot.ledgers
+        self._ledger_exec_ids = snapshot.exec_ids
+        self._ledger_exec_seqs = snapshot.exec_seqs
+        self._share_start = snapshot.share_start
+        self._share_held_since = snapshot.share_held_since
+        self._share_unviewed = snapshot.share_unviewed
+        self._share_baselines_due = []
+        self._ledger_credit_taken = 0.0
 
     def _baseline_bare_trading_stop_from_last_view(self, idx: int) -> None:
         """Set the bare baseline of leg ``idx`` from the newest view already seen."""

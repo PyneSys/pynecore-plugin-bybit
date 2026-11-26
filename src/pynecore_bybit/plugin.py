@@ -146,10 +146,17 @@ class Bybit(
             misses_to_reject=_PARKED_DISPATCH_MISSES_TO_REJECT,
         )
         self._unbooked_fill_orders = {}
+        self._fill_recovery_staged = None
         self._market_entries_checked = set()
         self._created_order_ids = set()
         self._dispatch_qty = {}
         self._filled_cum = {}
+        self._undelivered_fill_ids = {}
+        self._inherited_fill_events = []
+        self._event_outbox = []
+        self._owed_terminal_restored = False
+        self._spot_bookings_pending = {}
+        self._share_baselines_due = []
         self._wire_anchor = {}
         self._inverse_net_contracts = 0.0
         self._inverse_net_base = 0.0

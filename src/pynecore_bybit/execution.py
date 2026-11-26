@@ -110,8 +110,11 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
+    EXTRAS_KEY_REJECTED_ON_ABSENCE,
+    STATE_REJECTED,
     create_bracket_ownership_row,
     create_entry_order_row,
+    is_proven_refusal,
     iter_active_bracket_ownerships,
     mark_disposition_unknown,
     mark_rejected,
@@ -138,6 +141,9 @@ from .exceptions import (
 from .helpers import (
     BRACKET_OWN_WIRE_QTY_EXTRA,
     CATEGORY_SPOT,
+    ENTRY_CANCEL_CUM_EXEC_EXTRA,
+    ENTRY_CLOSED_FLAT_EXTRA,
+    ENTRY_REMAINDER_CANCELLED_EXTRA,
     EXECUTION_SINCE_SKEW_MS,
     TRIGGER_DIRECTION_FALL,
     TRIGGER_DIRECTION_RISE,
@@ -150,10 +156,12 @@ from .helpers import (
     round_price,
     trading_stop_key,
     trading_stop_levels,
+    venue_filled_qty,
     wire_link_id,
 )
 from .models import InstrumentInfo
 from .positions import HEDGE_IDX_BUY, HEDGE_IDX_SELL, POSITION_MODE_HEDGE
+from .state import _cum_exec_qty, _ended_cum_exec_qty
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
@@ -201,6 +209,10 @@ _CLOSE_SEND_VISIBILITY_GRACE_MS = 30_000
 #: the venue order under its ``orderLinkId`` is a prior instance's, never
 #: this row's.
 _PRIOR_INSTANCE_ORDER_EXTRA = 'prior_instance_order'
+
+#: Slack when comparing an executed quantity with zero: the quantities are
+#: exact decimal strings, the slack only absorbs the float round-trip.
+_FILL_EPS = 1e-9
 
 
 class _ExecutionMixin(_BybitBase, ABC):
@@ -251,6 +263,31 @@ class _ExecutionMixin(_BybitBase, ABC):
         if kind == 'close':
             return None, extras.get('close_of_entry'), LegType.CLOSE
         return row.pine_entry_id, None, LegType.ENTRY
+
+    def _own_order_link_id(self, order_link_id: str | None, order_id: str | None) -> str:
+        """The journal row id of a venue object, its ``orderLinkId`` or its ``orderId``.
+
+        A venue object normally names the run's row by ``orderLinkId``. One
+        that carries only the ``orderId`` (an execution or order object the
+        venue sent without the link id) is attributed through the stored
+        venue order id by :meth:`_resolve_identity`; the row's id it resolves
+        to is what the fill cursor, the inverse anchor and the core's client
+        order id (:meth:`~_EventStreamMixin._core_client_order_id`) are keyed
+        by, so it must travel with the identity. A prior instance's order is
+        not the row's.
+
+        :param order_link_id: The object's ``orderLinkId``, possibly empty.
+        :param order_id: The object's ``orderId``, possibly empty.
+        :return: The row's client order id, ``''`` when neither id names one.
+        """
+        if order_link_id:
+            return order_link_id
+        if not order_id or self.store_ctx is None:
+            return ''
+        row = self.store_ctx.find_by_ref('order_id', order_id)
+        if row is None or (row.extras or {}).get(_PRIOR_INSTANCE_ORDER_EXTRA):
+            return ''
+        return row.client_order_id
 
     # --- dispatch core --------------------------------------------------------
 
@@ -443,7 +480,12 @@ class _ExecutionMixin(_BybitBase, ABC):
             status = str(order.get('orderStatus') or '')
             if status != 'Filled' and status not in _DEAD_ORDER_STATUSES:
                 return None
-            return Decimal(str(order.get('cumExecQty') or '0'))
+            ended = _ended_cum_exec_qty(order)
+            if ended is None:
+                # The ended order carries no usable executed quantity: a
+                # zero would report the close as not executed.
+                return None
+            return Decimal(str(ended))
         sent_ms = row.created_ts_ms if row is not None else since_ms
         if int(epoch_time() * 1000) - sent_ms < _CLOSE_SEND_VISIBILITY_GRACE_MS:
             return None
@@ -1415,7 +1457,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         trail_distance = self._trail_distance(market, intent.trail_offset)
         prior_owner: OrderRow | None = None
         if self.store_ctx is not None:
-            with self.store_ctx.transaction():
+            with self._journal_transaction():
                 prior_owner = self.store_ctx.get_order(own_coid)
                 for row in superseded:
                     self._release_netting_ownership(row.client_order_id)
@@ -1458,7 +1500,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         def restore_ownership() -> None:
             if self.store_ctx is None:
                 return
-            with self.store_ctx.transaction():
+            with self._journal_transaction():
                 self._restore_netting_ownership(own_coid, prior_owner)
                 for superseded_row in superseded:
                     self._restore_netting_ownership(
@@ -2107,6 +2149,25 @@ class _ExecutionMixin(_BybitBase, ABC):
         Idempotent: no matching dispatch, or an "order does not exist"
         response (already filled / cancelled — retCode 170213) is a
         benign no-op returning ``True``.
+
+        An entry is reported landed only once its journal row proves how the
+        order ended (:meth:`~_ExecutionMixin._entry_cancel_verdict` is not
+        ``UNKNOWN``): Bybit
+        processes a cancel asynchronously and a fill can still win it (the
+        private ``order`` stream documents that race), so a bare ACK returns
+        ``False`` — the engine keeps the order's mapping and its pending
+        partial protection and retries (a SOFTWARE partial-bracket parent
+        through the outcome-based cancel-tentative machine). An entry whose
+        booked fill the core has not taken yet (its event still queued,
+        :meth:`_fill_awaits_engine`) returns ``False`` too: a landed cancel
+        lets the core drop the entry's pending partial protection before the
+        fill it would arm on reaches the books. A retry does
+        not send the cancel again for an entry whose remainder cancel the
+        venue already acknowledged
+        (:data:`~pynecore_bybit.helpers.ENTRY_REMAINDER_CANCELLED_EXTRA`); it
+        answers from the row once the order's terminal push or the reconcile
+        readback (:meth:`~_ReconcileMixin._settle_cancelled_entries`) has
+        settled it.
         """
         await self._ensure_broker_started()
         intent = envelope.intent
@@ -2114,12 +2175,23 @@ class _ExecutionMixin(_BybitBase, ABC):
         market = await asyncio.to_thread(self._broker_market)
         cancelled_any = True
         for coid in self._live_coids_for_cancel(intent):
-            if await self._cancel_by_coid(market, coid):
+            entry_row = self._entry_row(coid)
+            if (entry_row is None or entry_row.closed_ts_ms is not None
+                    or not (entry_row.extras or {}).get(ENTRY_REMAINDER_CANCELLED_EXTRA)):
+                if not await self._cancel_by_coid(market, coid):
+                    cancelled_any = False
+                    continue
                 # Only the unfilled remainder is gone. The ACK carries no
                 # fill figure, so an entry row stays live until the venue's
                 # terminal order truth settles what it executed.
                 self._retire_cancelled_row(coid)
-            else:
+            entry_row = self._entry_row(coid)
+            if entry_row is None:
+                continue
+            verdict = self._entry_cancel_verdict(entry_row, None)
+            if verdict is CancelDispositionOutcome.UNKNOWN or (
+                    verdict is CancelDispositionOutcome.ALREADY_FILLED
+                    and self._fill_awaits_engine(coid)):
                 cancelled_any = False
         # A trading-stop-attached exit has no venue order to cancel — its
         # "cancel" is clearing the position attributes and releasing the
@@ -2129,6 +2201,29 @@ class _ExecutionMixin(_BybitBase, ABC):
             for row in self._owned_netting_stop_rows(intent.pine_id, intent.from_entry):
                 await self._clear_owned_trading_stop(market, row)
         return cancelled_any
+
+    def _fill_awaits_engine(self, coid: str) -> bool:
+        """Whether a fill event this process emitted for ``coid`` is not booked by the core yet.
+
+        The plugin books a fill on its row when the execution arrives, and
+        the event reaches the core's books only when the core drains it; the
+        core's durable fill receipt
+        (:meth:`~pynecore.core.broker.storage.RunContext.fill_delivered`) is
+        the proof it did. Delivered ids are pruned. Without persistence there
+        is no receipt to read, and nothing is reported pending.
+
+        :param coid: The order's ``orderLinkId``.
+        """
+        ids = self._undelivered_fill_ids.get(coid)
+        if not ids or self.store_ctx is None:
+            return False
+        store = self.store_ctx
+        pending = {fill_id for fill_id in ids if not store.fill_delivered(fill_id)}
+        if pending:
+            self._undelivered_fill_ids[coid] = pending
+            return True
+        del self._undelivered_fill_ids[coid]
+        return False
 
     async def _clear_owned_trading_stop(
             self, market: InstrumentInfo, row,
@@ -2242,13 +2337,17 @@ class _ExecutionMixin(_BybitBase, ABC):
         existing = await self._lookup_order_by_coid(coid)
         if existing is None:
             return None, None
-        try:
-            executed = Decimal(str(existing.get('cumExecQty') or '0'))
-        except (InvalidOperation, TypeError, ValueError):
+        status = str(existing.get('orderStatus') or '')
+        ended = status == 'Filled' or status in _DEAD_ORDER_STATUSES
+        figure = _ended_cum_exec_qty(existing) if ended else _cum_exec_qty(existing)
+        if figure is None:
+            # A missing, unparsable or status-contradicting ``cumExecQty``
+            # proves no zero: never safe to re-dispatch.
             return False, None
+        executed = Decimal(str(figure))
         if executed > 0:
             return False, executed
-        if str(existing.get('orderStatus') or '') in _DEAD_ORDER_STATUSES:
+        if ended:
             return True, Decimal(0)
         return None, None
 
@@ -2258,15 +2357,27 @@ class _ExecutionMixin(_BybitBase, ABC):
     ) -> CancelDispositionOutcome:
         """Cancel and classify the precise disposition.
 
-        A clean cancel response is a confirmed cancel. On an
-        "order does not exist" reject the order's terminal status is read
-        back by ``orderLinkId`` from the history endpoint: ``Filled`` →
-        the race was lost to a fill; ``Cancelled`` (or the partial-fill
-        cancel variant) → the cancel landed earlier; anything unreadable
-        stays UNKNOWN so the cancel-tentative machine keeps retrying.
-        Multi-leg intents (a bracket's TP+SL) aggregate conservatively:
-        any leg lost to a fill dominates, any ambiguity degrades to
-        UNKNOWN, and only an all-legs-confirmed round reports confirmed.
+        Every live dispatch the intent addresses is cancelled
+        (:meth:`_cancel_outcome_for`). A clean cancel response is a confirmed
+        cancel for an exit leg; for an entry it only acknowledges the request,
+        and the entry's journal row decides (a later probe reads the order
+        back when the row proves nothing). On an
+        "order does not exist" reject the order is read back by
+        ``orderLinkId``; an entry is then classified from that order and its
+        journal row (:meth:`_entry_cancel_verdict`), an exit leg from the
+        order alone: ``Filled`` → the race was lost to a fill; a dead status →
+        the cancel landed earlier; anything unreadable stays UNKNOWN so the
+        cancel-tentative machine keeps retrying. Multi-leg intents (a
+        bracket's TP+SL) aggregate conservatively: any leg lost to a fill
+        dominates, any ambiguity degrades to UNKNOWN, and only an
+        all-legs-confirmed round reports confirmed.
+
+        An entry with no live row left has already ended: a cancel push, the
+        flat sweep, a refused dispatch or a restart pass closed its row. The
+        probe then answers from the entry's most recent row of the run
+        (:meth:`_ended_entry_cancel_outcome`), reading the order back only
+        when the row alone proves nothing, instead of answering UNKNOWN until
+        the cancel-tentative grace halts the run.
         """
         await self._ensure_broker_started()
         intent = envelope.intent
@@ -2276,7 +2387,9 @@ class _ExecutionMixin(_BybitBase, ABC):
         owned = ([] if intent.from_entry is None
                  else self._owned_netting_stop_rows(intent.pine_id, intent.from_entry))
         if not coids and not owned:
-            return CancelDispositionOutcome.UNKNOWN
+            if intent.from_entry is not None:
+                return CancelDispositionOutcome.UNKNOWN
+            return await self._ended_entry_cancel_outcome(market, intent.pine_id)
         outcomes: list[CancelDispositionOutcome] = []
         for coid in coids:
             outcomes.append(await self._cancel_outcome_for(market, coid))
@@ -2294,6 +2407,154 @@ class _ExecutionMixin(_BybitBase, ABC):
             return CancelDispositionOutcome.ALREADY_FILLED
         if all(o is CancelDispositionOutcome.CANCEL_CONFIRMED for o in outcomes):
             return CancelDispositionOutcome.CANCEL_CONFIRMED
+        if all(o is CancelDispositionOutcome.FILLED_AND_CLOSED for o in outcomes):
+            return CancelDispositionOutcome.FILLED_AND_CLOSED
+        return CancelDispositionOutcome.UNKNOWN
+
+    def _last_entry_row(self, pine_id: str) -> 'OrderRow | None':
+        """The most recently created closed entry row of ``pine_id`` in the run.
+
+        Read across every process instance of the run, since a row closed
+        before a restart stays with the instance that closed it. A row
+        retired as a prior instance's order (:meth:`_retire_spent_dispatch`)
+        never held this run's order and is skipped.
+
+        :param pine_id: The entry's Pine id.
+        :return: The row, or ``None`` when the run has no closed entry row of
+            the id (none was written, or the retention purge removed it).
+        """
+        if self.store_ctx is None:
+            return None
+        last: 'OrderRow | None' = None
+        for row in self.store_ctx.iter_orders_closed_since_for_run_id(0):
+            extras = row.extras or {}
+            if (extras.get('kind') not in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)
+                    or row.pine_entry_id != pine_id
+                    or extras.get(_PRIOR_INSTANCE_ORDER_EXTRA)):
+                continue
+            if last is None or row.created_ts_ms >= last.created_ts_ms:
+                last = row
+        return last
+
+    async def _ended_entry_cancel_outcome(
+            self, market: InstrumentInfo, pine_id: str,
+    ) -> CancelDispositionOutcome:
+        """The cancel outcome of an entry that has no live row left.
+
+        The cancel aims at the entry's most recent order, whose row is closed
+        (:meth:`_last_entry_row`). Its journal answers first
+        (:meth:`_entry_cancel_verdict`); when the journal alone proves
+        nothing, the order is read back by ``orderLinkId`` and the verdict is
+        taken again with it. A failed read decides nothing, and neither does
+        an order the venue no longer shows, except for a dispatch the
+        parked-dispatch resolver rejected on its absence
+        (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_REJECTED_ON_ABSENCE`):
+        a complete read that still does not show it confirms the cancel.
+
+        :param market: The run's instrument.
+        :param pine_id: The entry's Pine id.
+        :return: The outcome; ``UNKNOWN`` without a row or a proof.
+        """
+        row = self._last_entry_row(pine_id)
+        if row is None:
+            return CancelDispositionOutcome.UNKNOWN
+        outcome = self._entry_cancel_verdict(row, None)
+        if outcome is not CancelDispositionOutcome.UNKNOWN:
+            return outcome
+        order, conclusive = await self._confirm_lookup(market, row.client_order_id)
+        if not conclusive:
+            return CancelDispositionOutcome.UNKNOWN
+        if order is None:
+            # The resolver rejected the dispatch because the venue did not
+            # show it; a complete read made now still does not, so the order
+            # never landed. Any other row the venue does not show proves
+            # nothing.
+            if (row.state == STATE_REJECTED and row.closed_ts_ms is not None
+                    and venue_filled_qty(row) <= _FILL_EPS
+                    and (row.extras or {}).get(EXTRAS_KEY_REJECTED_ON_ABSENCE)):
+                return CancelDispositionOutcome.CANCEL_CONFIRMED
+            return CancelDispositionOutcome.UNKNOWN
+        return self._entry_cancel_verdict(row, order)
+
+    @staticmethod
+    def _entry_cancel_verdict(
+            row: 'OrderRow', order: dict | None,
+    ) -> CancelDispositionOutcome:
+        """Classify a cancel of an entry order from its journal row and venue order.
+
+        The one verdict of the cancel probe for an entry, for a row of this
+        process and one a restart adopted or left closed alike. Fills booked
+        on the row (:func:`~pynecore_bybit.helpers.venue_filled_qty`) and its
+        open or closed state are the journal's evidence; the venue order
+        (``orderStatus`` with ``cumExecQty``, the order's cumulative executed
+        quantity) is the venue's, ``None`` when it was not read or not found.
+        An entry row stays live for as long as the position its fills opened
+        (the flat sweep closes it), so a live row with an execution is a
+        position still open. A closed row proves its position closed only
+        with :data:`~pynecore_bybit.helpers.ENTRY_CLOSED_FLAT_EXTRA`: the other
+        closers (the FIFO netting of reducing fills, a startup orphan pass, a
+        disappearance verdict) do not tie the close to this entry's trade.
+
+        ==========  =====================================  ======  ===================
+        Row         Venue order                            Booked  Outcome
+        ==========  =====================================  ======  ===================
+        any         not ended (working)                    any     ``UNKNOWN``
+        any         ended, ``cumExecQty`` unreadable       any     ``UNKNOWN``
+        any         dead, ``cumExecQty`` 0                 no      ``CANCEL_CONFIRMED``
+        any         ``Filled`` / partial cancel, 0         any     ``UNKNOWN``
+        any         dead, 0, but fills booked              yes     ``UNKNOWN``
+        live        executed (``cumExecQty`` > 0)          any     ``ALREADY_FILLED``
+        live        not read / not found                   yes     ``ALREADY_FILLED``
+        live        not read / not found                   no      ``UNKNOWN``
+        closed      not read / not found                   no      see below
+        closed      executed, or not read                  yes     see below
+        ==========  =====================================  ======  ===================
+
+        A closed row with nothing booked and no venue order is
+        ``CANCEL_CONFIRMED`` when the journal proves it ended unfilled: the
+        venue's zero ``cumExecQty`` recorded under
+        :data:`~pynecore_bybit.helpers.ENTRY_CANCEL_CUM_EXEC_EXTRA`, or a
+        ``rejected`` row the venue's answer made one (a create the venue
+        refused, a pending dispatch the startup recovery found dead with
+        nothing executed, one the parked-dispatch resolver found refused:
+        :func:`~pynecore.core.broker.store_helpers.is_proven_refusal`);
+        otherwise ``UNKNOWN``. A row the parked-dispatch resolver rejected only
+        because the venue did not show the order is no proof: the order may
+        still show up executed. A closed row with
+        fills booked is ``FILLED_AND_CLOSED`` when the flat sweep closed it,
+        otherwise ``UNKNOWN``; a closed row whose execution the venue shows
+        but the journal never booked is ``UNKNOWN`` too.
+
+        :param row: The entry's journal row.
+        :param order: The venue order object, or ``None``.
+        :return: The outcome.
+        """
+        extras = row.extras or {}
+        booked = venue_filled_qty(row) > _FILL_EPS
+        if order is None:
+            if not booked:
+                if row.closed_ts_ms is None:
+                    return CancelDispositionOutcome.UNKNOWN
+                zero = extras.get(ENTRY_CANCEL_CUM_EXEC_EXTRA)
+                if is_proven_refusal(row) or (
+                        isinstance(zero, (int, float)) and abs(float(zero)) <= _FILL_EPS):
+                    return CancelDispositionOutcome.CANCEL_CONFIRMED
+                return CancelDispositionOutcome.UNKNOWN
+        else:
+            status = str(order.get('orderStatus') or '')
+            if status != 'Filled' and status not in _DEAD_ORDER_STATUSES:
+                return CancelDispositionOutcome.UNKNOWN
+            cum_exec = _ended_cum_exec_qty(order)
+            if cum_exec is None:
+                return CancelDispositionOutcome.UNKNOWN
+            if cum_exec <= _FILL_EPS:
+                if status in ('Filled', 'PartiallyFilledCanceled') or booked:
+                    return CancelDispositionOutcome.UNKNOWN
+                return CancelDispositionOutcome.CANCEL_CONFIRMED
+        if row.closed_ts_ms is None:
+            return CancelDispositionOutcome.ALREADY_FILLED
+        if booked and extras.get(ENTRY_CLOSED_FLAT_EXTRA):
+            return CancelDispositionOutcome.FILLED_AND_CLOSED
         return CancelDispositionOutcome.UNKNOWN
 
     async def _cancel_outcome_for(
@@ -2306,6 +2567,14 @@ class _ExecutionMixin(_BybitBase, ABC):
         request never reached the venue or its answer was lost) raises
         :class:`OrderDispositionUnknownError`, so the sync engine's
         cancel-retry loop does not count it as a probe the venue answered.
+        A clean cancel response of an entry only acknowledges the request
+        (Bybit processes it asynchronously, and a fill can still win), so the
+        entry is classified by :meth:`_entry_cancel_verdict` from its journal
+        row alone: fills booked → ``ALREADY_FILLED``, a row a terminal push
+        already closed as unfilled → ``CANCEL_CONFIRMED``, otherwise
+        ``UNKNOWN`` until a later probe reads the ended order back. On "order
+        does not exist" an entry is classified by the same verdict from its
+        row and the order read back.
         """
         try:
             await self._call('/v5/order/cancel', method='post', body={
@@ -2326,17 +2595,18 @@ class _ExecutionMixin(_BybitBase, ABC):
                 raise reject_error(e) from e
             existing = await self._lookup_order_by_coid(coid)
             status = str((existing or {}).get('orderStatus') or '')
+            if existing is not None and status in _DEAD_ORDER_STATUSES:
+                self._retire_cancelled_row(
+                    coid, _ended_cum_exec_qty(existing),
+                    str(existing.get('orderId') or '') or None,
+                    venue_status=status,
+                )
+            entry_row = self._entry_row(coid)
+            if entry_row is not None:
+                return self._entry_cancel_verdict(entry_row, existing)
             if status == 'Filled':
                 return CancelDispositionOutcome.ALREADY_FILLED
             if status in _DEAD_ORDER_STATUSES:
-                try:
-                    cum_exec: float | None = float(
-                        (existing or {}).get('cumExecQty') or 0.0)
-                except (TypeError, ValueError):
-                    cum_exec = None
-                self._retire_cancelled_row(
-                    coid, cum_exec, str((existing or {}).get('orderId') or '') or None,
-                )
                 return CancelDispositionOutcome.CANCEL_CONFIRMED
             return CancelDispositionOutcome.UNKNOWN
         except BybitError as e:
@@ -2345,7 +2615,25 @@ class _ExecutionMixin(_BybitBase, ABC):
                 client_order_id=coid, cause=e,
             ) from e
         self._retire_cancelled_row(coid)
+        entry_row = self._entry_row(coid)
+        if entry_row is not None:
+            # Bybit acknowledges a cancel request asynchronously: an entry
+            # may still execute after the ACK, so the ACK proves no unfilled
+            # end. The journal answers (booked fills, or a terminal push that
+            # already closed the row as unfilled); otherwise the next probe
+            # reads the order back.
+            return self._entry_cancel_verdict(entry_row, None)
         return CancelDispositionOutcome.CANCEL_CONFIRMED
+
+    def _entry_row(self, coid: str) -> 'OrderRow | None':
+        """The journal row of ``coid`` when it is an entry's, else ``None``."""
+        if self.store_ctx is None:
+            return None
+        row = self.store_ctx.get_order(coid)
+        if row is None or (row.extras or {}).get('kind') not in (
+                ENTRY_KIND_POSITION, ENTRY_KIND_WORKING):
+            return None
+        return row
 
     @override
     async def cancel_broker_order_ref(self, ref: str) -> None:

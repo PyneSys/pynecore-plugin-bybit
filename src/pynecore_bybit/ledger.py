@@ -936,3 +936,24 @@ class LegLedger:
         if abs(share) <= room + tolerance:
             return share if abs(share) > tolerance else 0.0
         return room * direction
+
+
+@dataclass(slots=True, frozen=True)
+class LedgerSnapshot:
+    """The plugin's position-ledger state at one moment, for a rollback.
+
+    Every field is a copy: the live state may change freely after the
+    snapshot is taken.
+    """
+    ledgers: dict[int, LegLedger]
+    """Each leg's ledger."""
+    exec_ids: dict[str, None]
+    """The ``execId`` values the ledgers entered."""
+    exec_seqs: dict[int, None]
+    """The execution ``seq`` values the ledgers know."""
+    share_start: dict[int, tuple[int, int]]
+    """Per leg: ``(seq, execTime)`` of the own execution that started the run's share."""
+    share_held_since: dict[int, int]
+    """Per leg: since when the run is proven to hold its share."""
+    share_unviewed: set[int]
+    """The legs whose share waits for its first position view."""

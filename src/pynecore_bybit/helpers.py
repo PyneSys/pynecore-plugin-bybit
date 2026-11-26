@@ -136,6 +136,67 @@ ENTRY_REMAINDER_CANCELLED_EXTRA: str = 'remainder_cancelled'
 # cadence then reads the order by ``orderLinkId`` until it is settled.
 ENTRY_CANCEL_CUM_EXEC_EXTRA: str = 'cancel_cum_exec'
 
+# Row ``extras`` key of an entry row whose terminal event (``cancelled`` /
+# ``rejected``) went to the core without the venue's executed quantity
+# (``ExchangeOrder.filled_qty_known=False``, nothing seen executed): the core
+# kept the entry's mapping, legs and tentative state, and the same terminal
+# event is owed again with the venue's figure. Payload: ``event_type`` and
+# the push's ``cancel_type``. Cleared in the transaction that settles the
+# row from the venue's ``cumExecQty``, after which the event goes out once.
+ENTRY_TERMINAL_EVENT_OWED_EXTRA: str = 'terminal_event_owed'
+
+# Journal event kinds of the per-order fill recovery (the venue's
+# ``cumExecQty`` of an order proves executions its row's cursor lacks). A
+# target (``exchange_order_id`` = the venue ``orderId``, payload
+# ``cum_exec_qty`` = the wire-domain goal) is written before the in-memory
+# queue entry, in the transaction that retires the row when one does; a done
+# record (same payload) is written once the executions are accounted. A
+# restart reads the targets without a done record covering them: a row a
+# process closed is not re-homed into the next one, so nothing else would
+# ever read its order again.
+FILL_RECOVERY_TARGET_EVENT: str = 'bybit_fill_recovery_target'
+FILL_RECOVERY_DONE_EVENT: str = 'bybit_fill_recovery_done'
+
+# Journal event of an owed terminal event (:data:`ENTRY_TERMINAL_EVENT_OWED_EXTRA`)
+# that a delivery made ready (payload ``coid``, ``event_type``, the venue
+# ``readback`` order object and the Pine ``identity``): the cancel settlement's
+# history readback or a terminal ``order`` push with the figure. Written by
+# :meth:`~pynecore_bybit.events._EventStreamMixin._deliver_owed_terminal_event`,
+# the one place that clears the mark, in the transaction that settles the row. The settled
+# row is read by nothing else again, so a restart re-delivers the ready events
+# whose entry the engine still holds for its execution evidence
+# (:meth:`~pynecore_bybit.reconcile._ReconcileMixin._owed_terminal_events_still_held`).
+OWED_TERMINAL_EVENT_READY_EVENT: str = 'bybit_owed_terminal_event_ready'
+
+# Row ``extras`` flag of an entry row the flat sweep closed: the venue showed
+# the position flat (spot: the inventory below the least tradable quantity)
+# while the row's fills were booked, so the position the entry opened has
+# closed. Rows closed any other way (an exposure-netting FIFO consumption, a
+# startup orphan pass, a disappearance verdict) do not carry it.
+ENTRY_CLOSED_FLAT_EXTRA: str = 'closed_flat'
+
+# Row ``extras`` key of a close row whose venue order ended: the venue's
+# terminal ``orderStatus`` and ``cumExecQty`` (wire domain) it was settled
+# from. Present only once the ending is journaled; it also makes the
+# journaling idempotent across the ``order`` push and the reconcile backstop.
+CLOSE_VENUE_END_EXTRA: str = 'venue_end'
+
+# Row ``extras`` key of a row whose ``orderLinkId`` is the wire form
+# (:func:`wire_link_id`) of a core client order id that does not fit Bybit's
+# charset or length: the core's own id, which every order and fill event of
+# the row reports as :attr:`~pynecore.core.broker.models.ExchangeOrder.client_order_id`.
+# The core tells a netting close's fill from another close's by that id, also
+# after a restart, so it is stored with the persist-first row.
+CORE_CLIENT_ORDER_ID_EXTRA: str = 'core_coid'
+
+# Audit event of a close row whose venue order ended after executing its whole
+# quantity: the journal's completion event, written under the close's client
+# order id with the venue's terminal ``cumExecQty`` in the payload. An ending
+# with nothing or only part executed is journaled with the core's marks
+# (:data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_UNFILLED_EVENT`,
+# :data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_PARTIALLY_EVENT`).
+CLOSE_EXECUTED_EVENT: str = 'confirmed'
+
 # Row ``extras`` key holding every quantity (wire domain) the bot sent for a
 # guarded resting order: its dispatch and each own amend, recorded before the
 # request leaves. A venue view showing any other quantity was amended by

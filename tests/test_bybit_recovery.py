@@ -4,6 +4,8 @@
 import asyncio
 from decimal import Decimal
 
+import pytest
+
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import (
@@ -18,6 +20,7 @@ from pynecore.core.broker.store_helpers import (
 )
 
 from pynecore_bybit import Bybit, BybitConfig
+from pynecore_bybit.helpers import CLOSE_VENUE_END_EXTRA
 from pynecore_bybit.models import InstrumentInfo
 
 
@@ -238,6 +241,30 @@ def __test_recover_rejected_terminal_retires_row__(tmp_path):
     row = broker.store_ctx.get_order('c2')
     assert row.state == 'rejected'
     assert 'c2' not in _live_coids(broker)   # closed
+
+
+@pytest.mark.parametrize(('status', 'cum'), [
+    ('Cancelled', None), ('Cancelled', ''), ('Cancelled', 'nan'),
+    ('PartiallyFilledCanceled', '0'), ('Filled', '0'), ('Filled', None),
+], ids=['missing', 'empty', 'nan', 'partial_cancel_zero', 'filled_zero', 'filled_missing'])
+def __test_recover_ended_order_without_usable_cum_exec_stays_pending__(tmp_path, status, cum):
+    # An ended order whose cumExecQty is missing, unreadable or a zero its
+    # status contradicts proves neither a refusal nor a fill: the row stays
+    # pending (the parked-dispatch resolver reads it again) instead of being
+    # retired as a rejection the cancel probe would take as proof.
+    order = _order(order_id='o9', coid='c9', status=status)
+    if cum is None:
+        del order['cumExecQty']
+    else:
+        order['cumExecQty'] = cum
+    broker = _RecoveryFake(market=_linear_instrument(), history_by_coid={'c9': order})
+    _open(tmp_path, broker)
+    _seed(broker, 'c9', qty=0.01)
+    _recover(broker)
+    row = broker.store_ctx.get_order('c9')
+    assert row.state == 'submitted'
+    assert row.closed_ts_ms is None
+    assert row.filled_qty == 0.0
 
 
 def __test_recover_cancelled_with_fill_confirms_not_rejects__(tmp_path):
@@ -767,9 +794,34 @@ def __test_parked_found_dead_with_zero_fills_is_rejected_at_once__(tmp_path, cap
     assert 'venue reports Rejected' in records[0].getMessage()
 
 
-def __test_parked_found_dead_with_fills_is_left_to_the_fill_path__(tmp_path):
+@pytest.mark.parametrize(('status', 'cum'), [
+    ('Cancelled', None), ('Rejected', 'nan'), ('PartiallyFilledCanceled', '0'),
+], ids=['missing', 'nan', 'partial_cancel_zero'])
+def __test_parked_dead_order_without_usable_cum_exec_is_not_refused__(tmp_path, status, cum):
+    # A dead order whose executed quantity proves nothing is no refusal: the
+    # row stays parked and no rejected resolution is recorded, so neither the
+    # engine's redispatch nor the cancel probe reads it as never executed.
+    order = _order(order_id='o8', coid='p8', status=status)
+    if cum is None:
+        del order['cumExecQty']
+    else:
+        order['cumExecQty'] = cum
+    broker = _RecoveryFake(market=_linear_instrument(), history_by_coid={'p8': order})
+    _open(tmp_path, broker)
+    _park_unknown(broker, 'p8')
+    _resolve(broker, passes=3)
+    row = broker.store_ctx.get_order('p8')
+    assert row.state == 'disposition_unknown'
+    assert row.closed_ts_ms is None
+    assert _resolution_of(broker.store_ctx, 'p8') is None
+
+
+def __test_parked_found_dead_with_fills_is_settled_for_the_fill_path__(tmp_path):
     # PartiallyFilledCanceled with executed qty: the fill is real exposure —
-    # never reject; the execution stream / backfill books it and unparks.
+    # never reject. The order is in no open set and its push may be lost, so
+    # the resolver confirms the row under the venue order id, normalizes the
+    # entry to the executed quantity and queues the per-order fill recovery
+    # (which books the executions; the figure itself books nothing).
     broker = _RecoveryFake(
         market=_linear_instrument(),
         history_by_coid={'p5': _order(order_id='o5', coid='p5',
@@ -778,8 +830,49 @@ def __test_parked_found_dead_with_fills_is_left_to_the_fill_path__(tmp_path):
     _open(tmp_path, broker)
     _park_unknown(broker, 'p5')
     _resolve(broker, passes=3)
-    assert broker.store_ctx.get_order('p5').state == 'disposition_unknown'
+    row = broker.store_ctx.get_order('p5')
+    assert row.state == 'confirmed'
+    assert row.exchange_order_id == 'o5'
+    assert row.closed_ts_ms is None
+    assert row.qty == pytest.approx(0.004)
+    assert row.filled_qty == 0.0
+    assert broker._unbooked_fill_orders == {'p5': ('o5', Decimal('0.004'))}
     assert _resolution_of(broker.store_ctx, 'p5') is None
+    assert broker.store_ctx._store._conn.execute(
+        "SELECT COUNT(*) FROM pending_verifications WHERE client_order_id = ?", ('p5',),
+    ).fetchone()[0] == 0
+
+
+def __test_parked_close_found_partially_cancelled_is_settled__(tmp_path):
+    # The create reply and the terminal push of a close were both lost; the
+    # venue cancelled its remainder after 0.004 executed. The REST read is
+    # the only evidence: the close's ending is journaled (the core settles a
+    # held close only from it), the row is retired, and its unbooked
+    # execution is a durable per-order recovery target.
+    broker = _RecoveryFake(
+        market=_linear_instrument(),
+        history_by_coid={'p9': _order(order_id='o9', coid='p9',
+                                      status='PartiallyFilledCanceled', cum='0.004')},
+    )
+    _open(tmp_path, broker)
+    _seed(broker, 'p9', qty=0.01, state='disposition_unknown',
+          extras={'kind': 'close', 'order_type': 'market'})
+    broker.store_ctx.record_park('p9', 'p9')
+    broker.store_ctx._store._conn.execute(
+        "UPDATE orders SET created_ts_ms = created_ts_ms - 120000 "
+        "WHERE client_order_id = ?", ('p9',),
+    )
+    broker.store_ctx._store._conn.commit()
+    _resolve(broker)
+    row = broker.store_ctx.get_order('p9')
+    assert row.closed_ts_ms is not None
+    assert row.state == 'confirmed'
+    assert row.exchange_order_id == 'o9'
+    assert (row.extras or {})[CLOSE_VENUE_END_EXTRA] == {
+        'order_status': 'PartiallyFilledCanceled', 'cum_exec_qty': 0.004}
+    assert broker._unbooked_fill_orders == {'p9': ('o9', Decimal('0.004'))}
+    assert broker._durable_fill_recovery_targets() == {'p9': ('o9', Decimal('0.004'))}
+    assert _resolution_of(broker.store_ctx, 'p9') is None
 
 
 def __test_parked_within_grace_is_not_looked_up__(tmp_path):
