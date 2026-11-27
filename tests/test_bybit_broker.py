@@ -1341,7 +1341,7 @@ def __test_bybit_exit_leg_reduce_only_zero_position_is_proven_flat__():
     leg with 110017. This is NOT an unprotected-position emergency — surfacing
     it as a full-size BracketAttachAfterFillRejectedError makes the engine
     dispatch a defensive close that ITSELF rejects reduce-only against the flat
-    position and halts the run (the live-lab multi-entry-bracket failure). The
+    position (the live-lab multi-entry-bracket failure halted the run then). The
     plugin signals proven-flat (``qty=0``) so the engine skips the defensive
     close and runs only the OCA / residual cleanup cascade.
     """
@@ -2607,7 +2607,7 @@ def __test_bybit_trading_stop_write_failure_is_disposition_unknown__():
 
 
 def __test_bybit_position_port_read_failure_is_connection_error__():
-    """A failed hedge-leg read parks the dispatch instead of halting the bot"""
+    """A failed hedge-leg read parks the dispatch for a retry"""
     # Live halt, bybit c370 2026-11-05: a hedge-mode exit modify runs the core
     # bracket fan-out inside the engine's dispatch bridge, whose first step is
     # this read; a raw transport fault escaping it halted the run.
@@ -4216,8 +4216,8 @@ def __test_cancel_with_outcome_transport_failure_raises_unknown__():
 
     The sync engine's cancel-retry loop counts a returned ``UNKNOWN`` as a
     probe the venue answered; a refused connection must surface as
-    ``OrderDispositionUnknownError`` instead so the probe is not evidence
-    for the stale-grace halt.
+    ``OrderDispositionUnknownError`` instead so the probe is not counted as
+    an answer against the stale grace.
     """
     plugin = _FakeBrokerBybit(responses=[BybitConnectionError("connection refused")])
     plugin._order_identity['coid-long'] = ('Long', None, LegType.ENTRY)

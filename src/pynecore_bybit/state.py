@@ -368,7 +368,14 @@ class _StateMixin(_BybitBase, ABC):
         (``position_port = self``, the cTrader HEDGED precedent); a
         one-way account keeps the cheaper netting-native ``execute_*``
         path. The engine reads ``position_port`` per dispatch, so setting
-        it here — before the first dispatch — is race-free.
+        it here — before the first dispatch — is race-free. A one-way
+        account declares
+        :attr:`~BrokerPlugin.supports_held_execution_close`
+        here the same way: its ``execute_close`` sizes that close against
+        the venue position and sends it ``reduceOnly``. So does spot once its
+        inventory manager runs (persistence on): that close sells at most what
+        the inventory ledger holds, which takes in a held order's execution
+        once the plugin read it from the venue.
 
         Persist-first crash recovery runs last in this one-shot sequence
         (after the category startup, before ``_broker_started`` latches):
@@ -402,6 +409,12 @@ class _StateMixin(_BybitBase, ABC):
                             f"restart."
                         )
                     self.position_port = self
+                else:
+                    # A one-way account closes a venue quantity no journal
+                    # row owns with a native ``reduceOnly`` market order
+                    # (``execute_close``); a hedge account needs no opt-in,
+                    # the core one-way emulation closes its legs.
+                    self.supports_held_execution_close = True
                 if market.is_inverse:
                     self._inverse_seed_net(
                         await self._fetch_position_rows(market),
@@ -420,6 +433,7 @@ class _StateMixin(_BybitBase, ABC):
                     account_id=self.account_id,
                     symbol=self.symbol or market.symbol,
                     request_quarantine=self.quarantine_sink,
+                    release_quarantine=self.quarantine_release_sink,
                     on_inventory_conflict=self.on_inventory_conflict,
                 )
                 # Exposed for the startup contract probe's port-surface
@@ -428,6 +442,9 @@ class _StateMixin(_BybitBase, ABC):
                 result = await manager.startup()
                 self._spot_manager = manager
                 self._spot_port = port
+                # The spot close over a held entry sells at most what the
+                # inventory ledger holds (``execute_close``).
+                self.supports_held_execution_close = True
                 if result.quarantined:
                     logger.error(
                         "Bybit spot inventory startup quarantined: %s",

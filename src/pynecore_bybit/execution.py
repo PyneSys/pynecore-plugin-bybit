@@ -618,7 +618,7 @@ class _ExecutionMixin(_BybitBase, ABC):
         on derivatives), the derivative minimum (``minOrderQty``) and the
         QUOTE-denominated minimum notional (spot ``minOrderAmt`` /
         derivative ``minNotionalValue``) all skip loudly — a single
-        out-of-range order must not halt the bot. The linear market-order
+        out-of-range order is declined, never a stop of trading. The linear market-order
         notional check uses the latest observed trade price (with no price
         seen yet the venue-side reject is the backstop); on inverse the
         contract count IS the notional.
@@ -896,6 +896,84 @@ class _ExecutionMixin(_BybitBase, ABC):
                          'qty_step': market.qty_step_str},
             )
         return contracts
+
+    async def _held_execution_close_qty(
+            self, market: InstrumentInfo, intent: CloseIntent, *, label: str,
+    ) -> tuple[Decimal, Decimal | None]:
+        """Size a ``held_execution_close`` against the venue position.
+
+        The engine read the venue position (:meth:`get_position`) right
+        before and sends it as ``intent.qty``; it includes an execution no
+        journal row booked, so neither the journal nor the inverse
+        net-position mirror can size it (a full-cover close through
+        :meth:`_inverse_reduce_contracts` would snap onto the mirror's
+        contract count and leave the unbooked contracts open). The position
+        is read again here (:meth:`~_PositionsMixin._venue_exposure_to_close`)
+        and the close covers it, by the venue's own wire size when
+        ``intent.qty`` covers what the venue reports, else by ``intent.qty``
+        (the venue grew meanwhile). The order is ``reduceOnly`` besides, so
+        it can never open or grow opposite exposure.
+
+        On inverse the conversion anchor is the venue's contracts over the
+        base the core is told they are worth, so the close's fills convert
+        back to that base.
+
+        Spot has no reduce-only order and no position object: what the bot
+        owns of the wallet is its inventory ledger, which takes in the held
+        order's execution once the plugin read it (the engine's recovery,
+        :meth:`~_OrderHistoryMixin.fetch_order_execution`, or the inventory
+        reconcile). So the spot close sells at most what the ledger holds
+        right now (:meth:`get_position`, read fresh; dust below the least
+        sellable quantity is flat), never the wallet's other base coins, and
+        a sell without borrowing (``isLeverage=0``) cannot open a short. A
+        spot account holds no short, so a buy close is declined.
+
+        :return: ``(wire quantity, anchor)``, the anchor ``None`` off inverse.
+        :raises OrderSkippedByPlugin: When the venue (on spot: the ledger) is
+            flat or holds the other side, on a spot buy close, or when the
+            quantity is zero on the grid; nothing was sent.
+        :raises ExchangeConnectionError: Or another broker-taxonomy error when
+            the venue read fails; nothing was sent.
+        """
+        if market.category == CATEGORY_SPOT:
+            if intent.side != 'sell':
+                raise OrderSkippedByPlugin(
+                    f"Skipping {label}: a spot account holds no short to "
+                    f"close. No order sent.",
+                    intent_key=intent.intent_key, reason="unsupported",
+                    context={'symbol': market.symbol, 'qty': intent.qty},
+                )
+            owned = await self.get_position(market.symbol)
+            target = (None if owned is None or owned.side != 'long'
+                      else (quantize_qty(owned.size, market.qty_step_str), owned.size))
+        else:
+            target = await self._venue_exposure_to_close(market, intent.side)
+        if target is None:
+            raise OrderSkippedByPlugin(
+                f"Skipping {label}: the venue holds no {market.symbol} "
+                f"position this {intent.side} closes. No order sent.",
+                intent_key=intent.intent_key, reason="position_flat",
+                context={'symbol': market.symbol, 'qty': intent.qty},
+            )
+        wire, core = target
+        covers = intent.qty >= core * (1.0 - 1e-9)
+        anchor: Decimal | None = None
+        if market.is_inverse:
+            anchor = wire / Decimal(str(core))
+            qty = wire if covers else min(
+                base_to_contracts_reduce(intent.qty, anchor, market.qty_step_str), wire,
+            )
+        else:
+            qty = wire if covers else min(quantize_qty(intent.qty, market.qty_step_str), wire)
+        if qty <= 0:
+            raise OrderSkippedByPlugin(
+                f"Skipping {label}: size {intent.qty} is zero on the "
+                f"{market.symbol} grid ({market.qty_step_str}). No order sent.",
+                intent_key=intent.intent_key, reason="below_min_size",
+                context={'symbol': market.symbol, 'qty': intent.qty,
+                         'qty_step': market.qty_step_str},
+            )
+        return qty, anchor
 
     def _record_anchor(self, coid: str, anchor: Decimal | None,
                        extras: dict) -> dict:
@@ -1370,7 +1448,7 @@ class _ExecutionMixin(_BybitBase, ABC):
             # dispatches, so a definitive leg reject leaves the inventory
             # OPEN AND UNPROTECTED (possibly with the sibling leg already
             # resting). Surface it distinctly so the sync engine flattens
-            # with a defensive market close instead of halting; the
+            # with a defensive market close; the
             # already-placed sibling is enumerated by
             # :meth:`get_residual_orders_after_bracket_attach_reject`.
             #
@@ -1380,8 +1458,8 @@ class _ExecutionMixin(_BybitBase, ABC):
             # close that already flattened the shared position — the exit is
             # moot, not an unprotected-position emergency. Signal proven-flat
             # (``qty=0``): the engine skips the defensive close (which would
-            # itself reject reduce-only against the flat position and halt)
-            # and runs only the OCA / residual cleanup.
+            # itself reject reduce-only against the flat position) and runs
+            # only the OCA / residual cleanup.
             cause = exc.__cause__
             proven_flat = (
                 isinstance(cause, BybitAPIError)
@@ -2011,6 +2089,13 @@ class _ExecutionMixin(_BybitBase, ABC):
         sends a native ``reduceOnly`` market order against the one-way
         position (a hedge account routes closes through the emulator's
         ``close_leg`` primitive instead of this path).
+
+        A ``held_execution_close`` (the engine's close over an entry whose
+        execution evidence never arrived) is sized against the venue, not the
+        journal: :meth:`_held_execution_close_qty`. It goes out as the same
+        ``reduceOnly`` market order, journaled and labelled like any close
+        (``from_entry`` is the intent's ``pine_id``), so its fills reach the
+        engine under the envelope's ``KIND_CLOSE`` client order id.
         """
         await self._ensure_broker_started()
         intent = envelope.intent
@@ -2019,7 +2104,11 @@ class _ExecutionMixin(_BybitBase, ABC):
         coid = envelope.client_order_id(KIND_CLOSE)
         label = f"{market.symbol} close id={intent.pine_id!r}"
         anchor: Decimal | None = None
-        if market.is_inverse:
+        if intent.synthetic_kind == 'held_execution_close':
+            qty, anchor = await self._held_execution_close_qty(
+                market, intent, label=label,
+            )
+        elif market.is_inverse:
             qty, anchor = await self._inverse_reduce_contracts(
                 market, intent.qty, intent_key=intent.intent_key, label=label,
             )
@@ -2376,8 +2465,8 @@ class _ExecutionMixin(_BybitBase, ABC):
         flat sweep, a refused dispatch or a restart pass closed its row. The
         probe then answers from the entry's most recent row of the run
         (:meth:`_ended_entry_cancel_outcome`), reading the order back only
-        when the row alone proves nothing, instead of answering UNKNOWN until
-        the cancel-tentative grace halts the run.
+        when the row alone proves nothing, instead of answering UNKNOWN and
+        blocking new entries past the cancel-tentative stale grace.
         """
         await self._ensure_broker_started()
         intent = envelope.intent

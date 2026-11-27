@@ -26,6 +26,7 @@ from ._base import _BybitBase
 from .config import BybitConfig
 from .events import _EventStreamMixin
 from .execution import _ExecutionMixin
+from .history import _OrderHistoryMixin
 from .hosts import resolve_hosts
 from .live_provider import _LiveProviderMixin
 from .positions import _PositionsMixin
@@ -48,6 +49,7 @@ __all__ = [
 
 class Bybit(
     _EventStreamMixin,
+    _OrderHistoryMixin,
     _ExecutionMixin,
     _ReconcileMixin,
     _ProtectionMixin,

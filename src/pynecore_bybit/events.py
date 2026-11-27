@@ -23,9 +23,12 @@ The stream owns the private transport: it reconnects with bounded backoff
 on any death and never raises for transient trouble — the engine's
 ``run_event_stream`` does not restart a failed stream, so an escaping
 exception here would leave the bot fill-blind for the rest of the run.
-The only deliberate raises are the halt signals
+The only deliberate raises are the manual-intervention signals
 (:class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError`
-descendants) from the inventory manager's fail-closed paths.
+descendants: the inventory manager's conflict whose quarantine hook was
+missing or failed, the disappearance tracker's unexpected cancel): the engine
+latches the quarantine each one carries and opens the stream again, and the
+process keeps running.
 
 A per-category reconcile pass piggybacks on this loop at a fixed cadence,
 mirroring the cTrader plugin's reconcile piggyback pattern: spot runs the
@@ -267,7 +270,7 @@ class _EventStreamMixin(_BybitBase, ABC):
             # strands none of the rest.
             while self._event_outbox:
                 yield self._event_outbox.pop(0)
-            self._raise_pending_halt()
+            self._raise_inventory_conflict()
             self._event_outbox.extend(self._retry_spot_bookings(market))
             self._event_outbox.extend(self._replay_pre_adoption_frames(market))
             if self._event_outbox:
@@ -411,14 +414,22 @@ class _EventStreamMixin(_BybitBase, ABC):
         """
         self._event_outbox[start:start] = events
 
-    def _raise_pending_halt(self) -> None:
-        """Deliver an armed inventory-halt signal on the engine's channel."""
+    def _raise_inventory_conflict(self) -> None:
+        """Raise the spot inventory conflict the manager armed, on the engine's channel.
+
+        The manager arms it when its quarantine hook was missing or failed
+        (:meth:`~SpotInventoryManager.consume_pending_halt`,
+        taken once). Raised out of the event stream, the engine latches the
+        quarantine it carries
+        (:attr:`~SpotInventoryConflictError.kind`)
+        and opens the stream again; nothing stops the process.
+        """
         manager = self._spot_manager
         if manager is None:
             return
-        halt = manager.consume_pending_halt()
-        if halt is not None:
-            raise halt
+        conflict = manager.consume_pending_halt()
+        if conflict is not None:
+            raise conflict
 
     def soak_subscribe_account_updates(
             self, callback: Callable[[dict], None],
@@ -465,12 +476,12 @@ class _EventStreamMixin(_BybitBase, ABC):
         Never raises for transient trouble: credential validity was
         already proven by the account-identity latch at startup, so a
         failing private connect is recoverable and :meth:`watch_orders`
-        retries it forever, paced by :data:`PRIVATE_WS_BACKOFF_S` — halting
-        the bot on it would strand the user's open exposure.
+        retries it forever, paced by :data:`PRIVATE_WS_BACKOFF_S` — giving
+        up on it would leave the bot blind to the fills of its open exposure.
 
         :return: ``None`` once the stream is open, else the connect error.
         """
-        self._raise_pending_halt()
+        self._raise_inventory_conflict()
         host = self._hosts.ws_private
         if not host:
             raise BrokerManualInterventionError(
@@ -2192,7 +2203,8 @@ class _EventStreamMixin(_BybitBase, ABC):
         retries. The disappearance pass then stamps / retires the resting
         orders + settled positions that vanished behind the engine's back
         (see :meth:`_reconcile_disappearance`), emitting the synthetic
-        cancelled events and re-raising a halting-policy escalation. The
+        cancelled events and re-raising the tracker's intervention signal
+        (a ``stop`` policy whose quarantine hook was missing or failed). The
         execution backfill is the cadence safety net for the reconnect
         catch-up: a disappearance FILLED verdict deliberately books no fill
         slice (:meth:`_confirm_vanished_order`) and relies on this pass to
@@ -2251,8 +2263,9 @@ class _EventStreamMixin(_BybitBase, ABC):
         """Run one inventory reconcile pass, emitting recovered fills.
 
         Transient failures are logged and swallowed (the manager already
-        skips its cycle on a failed balance read); a deliberate halt
-        propagates so the engine performs its graceful stop.
+        skips its cycle on a failed balance read); the manager's conflict
+        signal propagates, and the engine latches the quarantine it carries
+        while the process keeps running.
         """
         events: list[OrderEvent] = []
         start = len(self._event_outbox)
@@ -2285,7 +2298,7 @@ class _EventStreamMixin(_BybitBase, ABC):
                 exc, exc_info=traceback_wanted(exc),
             )
             return
-        self._raise_pending_halt()
+        self._raise_inventory_conflict()
         for row in recovered:
             event = self._recovered_row_event(row, market)
             if event is not None:

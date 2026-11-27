@@ -83,6 +83,9 @@ from .exceptions import (
 from .helpers import (
     CATEGORY_SPOT,
     CORE_CLIENT_ORDER_ID_EXTRA,
+    ENTRY_CANCEL_CUM_EXEC_EXTRA,
+    ENTRY_EXECUTION_HOLD_EXTRA,
+    ENTRY_REMAINDER_CANCELLED_EXTRA,
     EXECUTION_SINCE_SKEW_MS,
     contracts_to_base,
     execution_sort_key,
@@ -321,6 +324,55 @@ class _PositionsMixin(_BybitBase, ABC):
             owned += filled if row.side == 'buy' else -filled
         return owned
 
+    def _held_entry_exposure(self) -> dict[str, float]:
+        """The execution of the run's held entries that no journal row booked, per side.
+
+        The engine owes its book the execution of these orders
+        (:meth:`~pynecore.core.broker.storage.RunContext.held_execution_order_ids`,
+        read fresh on every pass): an entry whose order ended at the venue
+        while the terminal event did not report how much executed, and the
+        orders a venue close the engine sent over such an entry took the
+        execution of, until that close is retired.
+        Its row's fill cursor never saw that execution, so the run-owned size
+        (:meth:`_run_owned_signed_size`) leaves out a leg the held order may
+        have opened. What the row keeps beyond its cursor is that execution:
+        the venue's terminal ``cumExecQty`` once known
+        (:data:`~pynecore_bybit.helpers.ENTRY_CANCEL_CUM_EXEC_EXTRA`, the row's
+        ``qty`` normalized to it), otherwise the room the ended order left
+        (:data:`~pynecore_bybit.helpers.ENTRY_REMAINDER_CANCELLED_EXTRA`, an
+        upper bound the caller caps at the physical leg), or the row's
+        whole unbooked quantity once the plugin handed the ended order to the
+        engine (:data:`~pynecore_bybit.helpers.ENTRY_EXECUTION_HOLD_EXTRA`).
+        A held entry whose
+        order the plugin has not seen end (a cancel still parked) is left out:
+        its executions arrive on the stream as usual.
+
+        :return: Entry side (``'buy'`` / ``'sell'``) -> wire-domain quantity.
+        """
+        if self.store_ctx is None:
+            return {}
+        held_order_ids = self.store_ctx.held_execution_order_ids()
+        if not held_order_ids:
+            return {}
+        exposure: dict[str, float] = {}
+        for row in self.store_ctx.iter_live_orders():
+            extras = row.extras or {}
+            if extras.get('kind') not in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING):
+                continue
+            if extras.get(ADOPTED_STARTUP_EXTRA_KEY):
+                continue
+            if not (extras.get(ENTRY_REMAINDER_CANCELLED_EXTRA)
+                    or extras.get(ENTRY_EXECUTION_HOLD_EXTRA)
+                    or ENTRY_CANCEL_CUM_EXEC_EXTRA in extras):
+                continue
+            order_id = row.exchange_order_id or str(extras.get('order_id') or '')
+            if order_id not in held_order_ids:
+                continue
+            unbooked = float(row.qty) - float(row.filled_qty)
+            if unbooked > _FILL_EPS:
+                exposure[row.side] = exposure.get(row.side, 0.0) + unbooked
+        return exposure
+
     def _scope_hedge_rows_to_run(self, rows: list[dict]) -> list[dict]:
         """Project account hedge rows onto the exposure owned by this run.
 
@@ -330,24 +382,35 @@ class _PositionsMixin(_BybitBase, ABC):
         journal state can never authorize an oversized reduction. Store-less
         unit paths retain the raw account view because they have no ownership
         ledger to consult.
+
+        A held entry's unbooked execution (:meth:`_held_entry_exposure`) is
+        the run's too: it is added to the leg of its side, bounded by the
+        physical leg like the rest. Without it the leg the held order opened
+        stays invisible, and the engine's close over that entry
+        (``held_execution_close``, fanned out over these legs by the core
+        one-way emulation) would leave the unbooked execution open.
         """
         if self.store_ctx is None:
             return rows
         owned = self._run_owned_signed_size()
-        if abs(owned) <= _FILL_EPS:
-            return []
-        wanted_idx = HEDGE_IDX_BUY if owned > 0.0 else HEDGE_IDX_SELL
+        held = self._held_entry_exposure()
+        shares = {
+            HEDGE_IDX_BUY: max(owned, 0.0) + held.get('buy', 0.0),
+            HEDGE_IDX_SELL: max(-owned, 0.0) + held.get('sell', 0.0),
+        }
+        scoped_rows: list[dict] = []
         for row in rows:
-            if self._position_row_index(row) != wanted_idx:
+            share = shares.pop(self._position_row_index(row), 0.0)
+            if share <= _FILL_EPS:
                 continue
             physical = self._position_row_size(row)
-            scoped = min(abs(owned), physical)
+            scoped = min(share, physical)
             if scoped <= _FILL_EPS:
-                return []
+                continue
             projected = dict(row)
             projected['size'] = format_decimal(Decimal(str(scoped)))
-            return [projected]
-        return []
+            scoped_rows.append(projected)
+        return scoped_rows
 
     async def _fetch_deriv_position(
             self, market: InstrumentInfo,
@@ -404,6 +467,52 @@ class _PositionsMixin(_BybitBase, ABC):
                     _wire_int(row.get('tradeMode'), field='tradeMode'), 'cross',
                 ),
             )
+        return None
+
+    async def _venue_exposure_to_close(
+            self, market: InstrumentInfo, close_side: str,
+    ) -> tuple[Decimal, float] | None:
+        """Read the one-way venue position a close of ``close_side`` reduces, fresh.
+
+        The sizing source of a ``held_execution_close``
+        (:meth:`~_ExecutionMixin.execute_close`): that close is sized against
+        the venue, which holds an execution no journal row booked, so neither
+        the journal nor the inverse net-position mirror can size it. The
+        core-facing base is the figure :meth:`_fetch_deriv_position` reports
+        for the same row (:meth:`_inverse_core_size` on inverse), so it is
+        comparable with the close's ``qty``.
+
+        :param market: The chart instrument (a derivative category).
+        :param close_side: The close order's side (``'sell'`` closes a long).
+        :return: ``(wire size, core-facing base size)`` of the position the
+            close reduces: the exact wire size (base on linear, contracts on
+            inverse) and the base the core is told it holds. ``None`` when the
+            venue is flat or holds the other side.
+        :raises ExchangeConnectionError: Or another broker-taxonomy error
+            (:func:`~pynecore_bybit.exceptions.classify_read_error`) when the
+            read fails; nothing was sent.
+        """
+        position_side = 'buy' if close_side == 'sell' else 'sell'
+        try:
+            rows = await self._fetch_position_rows(market)
+            for row in rows:
+                size = self._position_row_size(row)
+                if size <= 0.0:
+                    continue
+                if str(row.get('side') or '').lower() != position_side:
+                    return None
+                wire = Decimal(str(row.get('size')))
+                if not market.is_inverse:
+                    return wire, size
+                avg = _wire_float(row.get('avgPrice'), field='avgPrice')
+                if avg <= 0.0:
+                    raise BybitPositionDataError(
+                        f"Bybit inverse position of {market.symbol} carries no "
+                        f"usable avgPrice ({row.get('avgPrice')!r})"
+                    )
+                return wire, self._inverse_core_size(position_side, size, avg)
+        except BybitError as e:
+            raise classify_read_error(e) from e
         return None
 
     # --- startup adoption baseline (double-count barrier) -----------------------
@@ -945,6 +1054,7 @@ class _PositionsMixin(_BybitBase, ABC):
             self._seen_exec_ids.update(seen)
             self._unbooked_fill_orders.update(requeue)
             self._queue_inherited_entry_fills(inherited, market)
+            self._queue_inherited_hold_closes(market)
             for side in {str(entry.get('side') or '').lower()
                          for entry in (*stop_executions, *closeouts)}:
                 # The venue clears a fired stop with the position it closed.
@@ -1305,8 +1415,9 @@ class _PositionsMixin(_BybitBase, ABC):
         A failed venue read raises the broker taxonomy
         (:func:`~pynecore_bybit.exceptions.classify_read_error`), never a raw
         plugin error: the core emulator calls this as the first step of a
-        hedge dispatch, where an untranslated transient fault halts the bot
-        instead of parking the dispatch for a retry.
+        hedge dispatch, where the taxonomy's connection error parks the
+        dispatch for a plain retry; an untranslated fault is parked as a
+        write of unknown outcome under an entry block instead.
         """
         try:
             return await self._fetch_raw_position_legs(symbol)
@@ -1433,7 +1544,7 @@ class _PositionsMixin(_BybitBase, ABC):
     async def reject_out_of_range(
             self, envelope: DispatchEnvelope, qty: float,
     ) -> None:
-        """Raise the non-halting volume-bounds skip when ``qty`` is out of range."""
+        """Raise the volume-bounds skip (the order is declined) when ``qty`` is out of range."""
         intent = envelope.intent
         assert isinstance(intent, EntryIntent)
         market = await asyncio.to_thread(self._broker_market)

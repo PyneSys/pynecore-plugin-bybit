@@ -282,12 +282,13 @@ def __test_reappearance_clears_stamp__(tmp_path):
     assert _stamp_of(broker, 'c5') is None           # cleared on reappearance
 
 
-# === Halt propagation ======================================================
+# === Intervention signal propagation =======================================
 
-def __test_halting_policy_propagates_through_reconcile__(tmp_path):
+def __test_unexpected_cancel_signal_propagates_through_reconcile__(tmp_path):
     # ``stop`` policy with NO quarantine sink wired falls back to the
-    # process-exiting halt: the reconcile pass must RE-RAISE it (a graceful
-    # engine stop), not swallow it as a transient failure.
+    # UnexpectedCancelError signal: the reconcile pass must RE-RAISE it (the
+    # engine latches the external-intervention quarantine it carries and the
+    # process keeps running), not swallow it as a transient failure.
     broker = _DisappearanceFake(
         market=_linear_instrument(),
         history_by_coid={'c7': _order(order_id='o7', coid='c7', status='Cancelled')},

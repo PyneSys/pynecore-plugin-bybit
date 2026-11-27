@@ -33,7 +33,7 @@ class BybitError(ProviderError):
 class BybitConnectionError(BybitError):
     """Transport-level failure (HTTP timeout, connection refused, WS drop).
 
-    Retryable: the live runner waits and reconnects instead of halting."""
+    Retryable: the live runner waits and reconnects."""
 
     retryable = True
 

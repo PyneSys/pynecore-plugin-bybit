@@ -145,6 +145,23 @@ ENTRY_CANCEL_CUM_EXEC_EXTRA: str = 'cancel_cum_exec'
 # row from the venue's ``cumExecQty``, after which the event goes out once.
 ENTRY_TERMINAL_EVENT_OWED_EXTRA: str = 'terminal_event_owed'
 
+# Row ``extras`` flag of an entry row the plugin handed to the engine's
+# held-execution path (``BrokerPlugin.request_execution_hold``): its order
+# ended at the venue, and what it executed is read back from the venue's
+# history by the engine (``fetch_order_execution``), not delivered by the
+# stream. The order has nothing left to vanish, so the disappearance pass
+# leaves the row alone; it owns what the order executed once that is booked.
+ENTRY_EXECUTION_HOLD_EXTRA: str = 'execution_hold'
+
+# Journal event kind of one venue close of a handed-over entry's position
+# delivered to the engine as the entry's close fill (``client_order_id`` =
+# the entry row, payload ``exec_id`` and the wire-domain ``qty``). The
+# adoption baseline folds a close that ran while the bot was down without an
+# event; once the engine books the held entry's opening, its book holds what
+# the venue closed meanwhile, so the close is delivered after the opening,
+# once per ``execId``.
+EXECUTION_HOLD_CLOSE_EVENT: str = 'execution_hold_close_delivered'
+
 # Journal event kinds of the per-order fill recovery (the venue's
 # ``cumExecQty`` of an order proves executions its row's cursor lacks). A
 # target (``exchange_order_id`` = the venue ``orderId``, payload

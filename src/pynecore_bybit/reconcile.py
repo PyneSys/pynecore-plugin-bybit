@@ -37,8 +37,9 @@ Bybit's ``orderLinkId`` echo makes the confirmation deterministic (no
 heuristic, unlike the cTrader deal-history bridge). The reconcile pass
 swallows transient errors so a failing snapshot never tears down the PUSH
 stream, but RE-RAISES :class:`~pynecore.core.broker.exceptions.BrokerManualInterventionError`
-(the tracker's halting-policy escalation) so the engine performs its
-graceful stop.
+(the tracker's unexpected-cancel signal of a ``stop`` policy whose quarantine
+hook was missing or failed) so the engine latches the external-intervention
+quarantine it carries; the process keeps running.
 """
 import asyncio
 import logging
@@ -80,6 +81,7 @@ from .execution import _DEAD_ORDER_STATUSES
 from .helpers import (
     CATEGORY_SPOT,
     ENTRY_CANCEL_CUM_EXEC_EXTRA,
+    ENTRY_EXECUTION_HOLD_EXTRA,
     ENTRY_REMAINDER_CANCELLED_EXTRA,
     ENTRY_TERMINAL_EVENT_OWED_EXTRA,
     EXECUTION_CURSOR_OVERLAP_MS,
@@ -207,9 +209,18 @@ class _ReconcileMixin(_BybitBase, ABC):
         entry) in ``positions`` by symbol. A fleeting unfilled MARKET entry
         and any row with no broker handle are left untracked (an empty set
         exempts the row).
+
+        An order whose execution the engine still owes its book
+        (:meth:`~pynecore.core.broker.storage.RunContext.held_execution_order_ids`)
+        is never tracked: the engine reads it back from the venue, and its
+        absence from the venue is no intervention.
         """
         extras = row.extras or {}
         kind = extras.get('kind')
+        ref = row.exchange_order_id or extras.get('order_id')
+        if (ref and self.store_ctx is not None
+                and str(ref) in self.store_ctx.held_execution_order_ids()):
+            return set()
         if kind in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING):
             if row.filled_qty >= row.qty - _FILL_EPS:
                 # Settled position — tracked by symbol on the derivatives
@@ -217,6 +228,11 @@ class _ReconcileMixin(_BybitBase, ABC):
                 market = self._market
                 if market is not None and market.category != CATEGORY_SPOT:
                     return {('positions', row.symbol)}
+                return set()
+            if extras.get(ENTRY_EXECUTION_HOLD_EXTRA):
+                # The order ended on the venue; the engine books what it
+                # executed from the venue's history
+                # (:meth:`~_RecoveryMixin._hand_over_unreported_execution`).
                 return set()
             if extras.get(ENTRY_REMAINDER_CANCELLED_EXTRA):
                 # Our own cancel retired the working remainder: nothing is
@@ -226,14 +242,12 @@ class _ReconcileMixin(_BybitBase, ABC):
                 # quantity, when it is tracked as a settled position.
                 return set()
             if kind == ENTRY_KIND_WORKING:
-                ref = row.exchange_order_id or extras.get('order_id')
                 return {('orders', str(ref))} if ref else set()
             # Unfilled MARKET entry — fills near-instantly and leaves the
             # open set; stamping it would only churn until the confirm
             # bridge cleared it, so it is left to the PUSH / recovery path.
             return set()
         if kind in ('exit_leg', 'close'):
-            ref = row.exchange_order_id or extras.get('order_id')
             return {('orders', str(ref))} if ref else set()
         return set()
 
@@ -262,9 +276,9 @@ class _ReconcileMixin(_BybitBase, ABC):
         position exposure), then drives the tracker's stamp / clear / grace
         protocol. A transient failure while reading or confirming is
         swallowed so the PUSH stream survives — the next pass retries — but
-        a :class:`BrokerManualInterventionError` from a halting policy
-        RE-RAISES so the engine performs its graceful stop. A no-op without
-        persistence.
+        the tracker's :class:`BrokerManualInterventionError` signal
+        RE-RAISES so the engine latches the quarantine it carries. A no-op
+        without persistence.
 
         :param market: The chart instrument.
         :param position_rows: The derivative position snapshot already read

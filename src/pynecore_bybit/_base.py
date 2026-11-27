@@ -607,7 +607,15 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     ) -> 'ExchangePosition | None': ...
 
     @abstractmethod
+    async def _venue_exposure_to_close(
+            self, market: 'InstrumentInfo', close_side: str,
+    ) -> 'tuple[Decimal, float] | None': ...
+
+    @abstractmethod
     def _inverse_seed_net(self, rows: list[dict]) -> None: ...
+
+    @abstractmethod
+    def _inverse_core_size(self, side: str, contracts: float, avg_price: float) -> float: ...
 
     @abstractmethod
     def _apply_inverse_fill(self, side: str, contracts: float, base: float) -> None: ...
@@ -700,6 +708,39 @@ class _BybitBase(BrokerPlugin[BybitConfig], ABC):
     def _inherited_fill_event(
             self, row: 'OrderRow', entry: dict, market: 'InstrumentInfo',
     ) -> 'OrderEvent | None': ...
+
+    @abstractmethod
+    def _translate_executions(
+            self, frame: dict, market: 'InstrumentInfo',
+    ) -> 'list[OrderEvent]': ...
+
+    @abstractmethod
+    def _backfill_one_execution(
+            self, entry: dict, market: 'InstrumentInfo',
+    ) -> 'list[OrderEvent]': ...
+
+    @abstractmethod
+    def _book_execution_once(
+            self, exec_id: str, entry: dict, market: 'InstrumentInfo', *, coid: str,
+            pine_id: str | None, from_entry: str | None,
+            leg_type: LegType | None,
+            claims: 'list[tuple[str, str | None, LegType, float]]',
+    ) -> 'list[OrderEvent]': ...
+
+    @abstractmethod
+    async def _drain_deriv_exec_window(
+            self, market: 'InstrumentInfo', start_ms: int, end_ms: int,
+    ) -> tuple[list[dict], bool]: ...
+
+    @abstractmethod
+    def _close_entry_rows_when_flat(self, market: 'InstrumentInfo') -> None: ...
+
+    # --- Order-history read (history.py) ---
+    @abstractmethod
+    def _queue_inherited_hold_closes(self, market: 'InstrumentInfo') -> None: ...
+
+    @abstractmethod
+    def _hand_over_failed_pass(self, start: int, events: 'list[OrderEvent]') -> None: ...
 
     @abstractmethod
     def _persist_leg_row(

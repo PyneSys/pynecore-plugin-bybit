@@ -91,9 +91,21 @@ def spot_manager_for(
         account_id: str,
         symbol: str,
         request_quarantine,
+        release_quarantine,
         on_inventory_conflict: str,
 ) -> tuple[SpotInventoryManager, '_BybitSpotPort']:
-    """Build the inventory manager and its Bybit venue port."""
+    """Build the inventory manager and its Bybit venue port.
+
+    Both quarantine sinks go to the manager: it latches its own trouble as an
+    entry block under its cause through ``request_quarantine`` and ends that
+    block in the running process through ``release_quarantine`` once a
+    reconcile measured the venue again.
+
+    :param request_quarantine: The engine's latch
+        (:attr:`~BrokerPlugin.quarantine_sink`).
+    :param release_quarantine: The engine's release of a cause
+        (:attr:`~BrokerPlugin.quarantine_release_sink`).
+    """
     port = spot_port_for(plugin, market)
     store_ctx = plugin.store_ctx
     if store_ctx is None:
@@ -104,6 +116,7 @@ def spot_manager_for(
         account_id=account_id,
         symbol=symbol,
         request_quarantine=request_quarantine,
+        release_quarantine=release_quarantine,
         on_inventory_conflict=on_inventory_conflict,
     )
     return manager, port

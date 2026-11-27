@@ -2053,7 +2053,7 @@ class _ProtectionMixin(_BybitBase, ABC):
                 self._persist_ledger_credits(idx, ledger.credits)
             if outcomes:
                 # The journal books the venue truth before anything is
-                # reported: a halting policy raises.
+                # reported: a report may raise the intervention signal.
                 self._sync_leg_journal(idx, ledger, tolerance)
                 self._ledger_apply(idx, outcomes, market)
         self._judge_pending_tpsl_orders(market)
@@ -2320,7 +2320,8 @@ class _ProtectionMixin(_BybitBase, ABC):
     ) -> None:
         """Log and report what the ledger decided for leg ``idx``.
 
-        The reports come last, since a halting policy raises.
+        The reports come last, since a report may raise the intervention
+        signal (a ``stop`` policy without a working quarantine hook).
         """
         reports: list[tuple[LegEvent, LegOutcome]] = []
         for outcome in outcomes:

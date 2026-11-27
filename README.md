@@ -88,6 +88,21 @@ The provider accepts TradingView-style notation:
 - **Push order events**: order state and fills arrive over the private
   WebSocket `order` / `execution` / `position` topics — no polling. Crash
   recovery reconciles missed fills from REST history on restart.
+- **Execution recovery without an operator**: when the stream never
+  delivered what an order executed, PyneCore asks the plugin
+  (`fetch_order_execution`), which reads the order from
+  `/v5/order/realtime` / `/v5/order/history` and its executions from
+  `/v5/execution/list`, on every category. The executions keep their
+  `execId`, so nothing is booked twice. An order neither order endpoint
+  shows (and with no execution listed) counts as never executed. Bybit
+  keeps an order with any execution in its history, and a fully cancelled
+  one only for 24 hours. When an entry that executed while the bot was down
+  had its position closed before the restart (a trading stop, a
+  liquidation, a manual close), those closes reach PyneCore right after the
+  entry, as the entry's close fills with their own `execId` and price
+  (linear and inverse, one-way and hedge). A close whose process ended
+  before PyneCore took it is delivered again after the restart, flagged
+  `journaled_before_restart`, until PyneCore's fill receipt exists.
 
 ## Category notes
 
@@ -100,12 +115,27 @@ The provider accepts TradingView-style notation:
 - **Fee dust**: Bybit charges the spot buy fee in the *base* coin, so round
   trips leave sub-precision dust behind. Balances below one quantity-grid
   step are treated as flat.
+- **Close over an entry whose fill never arrived** (`held_execution_close`):
+  supported once the inventory ledger runs (persistence on). Spot has no
+  reduce-only order, so the close sells at most the base the bot's own
+  inventory ledger holds, never other coins in the wallet, and it never
+  borrows (`isLeverage=0`). The ledger takes in the held order's execution
+  as soon as the plugin reads it back from the venue (see below).
 
 ### Linear (USDT/USDC perpetuals and futures)
 
 - Real venue position model with native short selling and `reduceOnly`.
 - One-way position mode is the native path; hedge-mode accounts run through
   PyneCore's one-way emulation layer, so Pine one-way semantics hold on both.
+- **Close over an entry whose fill never arrived** (`held_execution_close`):
+  supported. When an entry's fill evidence never arrives and the strategy
+  asks to close or reverse, PyneCore closes the real venue position. On a
+  one-way account the plugin sizes that close from a fresh read of the
+  venue position and sends it as a `reduceOnly` market order, so it cannot
+  flip the position; on a hedge account the held order's unbooked
+  execution is part of the bot's leg, so the one-way emulation closes it
+  too. New entries stay blocked until PyneCore recovers the entry's
+  execution from the venue.
 
 ### Inverse (coin-margined)
 
@@ -113,6 +143,9 @@ The provider accepts TradingView-style notation:
   plugin maps Pine's base-quantity model onto USD contracts at dispatch, so
   strategies behave exactly as on linear (this matches TradingView, which
   also applies linear `qty * Δprice` accounting to inverse symbols).
+- One-way position mode only (a hedge-mode inverse account is refused at
+  startup). The close over an entry whose fill never arrived is supported
+  as on linear one-way: it closes the venue's own contract count.
 - **Collateral switch gotcha**: on a Unified Trading Account the settle
   coin's collateral switch must be **ON**, otherwise every inverse order is
   rejected with `retCode 110101`. Enable it under margin/collateral settings

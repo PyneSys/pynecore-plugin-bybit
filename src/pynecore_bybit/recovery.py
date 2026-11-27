@@ -79,6 +79,7 @@ from .exceptions import BybitError, traceback_wanted
 from .execution import _DEAD_ORDER_STATUSES
 from .helpers import (
     CATEGORY_SPOT,
+    ENTRY_EXECUTION_HOLD_EXTRA,
     EXECUTION_PAGE_LIMIT,
     EXECUTION_SINCE_SKEW_MS,
     EXECUTION_WINDOW_MS,
@@ -145,7 +146,7 @@ class _RecoveryMixin(_BybitBase, ABC):
         Never raises out of this pass for a recoverable condition — a
         transport failure while reading a snapshot leaves the affected rows
         parked and the orphan pass skipped, so an ambiguous restart keeps
-        running rather than halting the bot; genuine auth failures
+        running and the later passes settle it; genuine auth failures
         propagate as usual through the underlying REST reads.
         """
         if self.store_ctx is None:
@@ -199,8 +200,12 @@ class _RecoveryMixin(_BybitBase, ABC):
             ended_cum_exec = _ended_cum_exec_qty(existing)
             if ended_cum_exec is None:
                 # An ended order without a usable executed quantity proves
-                # neither a refusal nor a fill: the row stays pending for the
-                # parked-dispatch resolver, which reads it again in-run.
+                # neither a refusal nor a fill. An entry goes to the engine's
+                # held-execution path, which reads the order's execution
+                # until the venue tells it; any other row stays pending for
+                # the parked-dispatch resolver, which reads it again in-run.
+                self._hand_over_unreported_execution(
+                    row, existing, "ended without a usable executed quantity")
                 return False
             cum_exec = Decimal(str(ended_cum_exec))
         else:
@@ -249,9 +254,18 @@ class _RecoveryMixin(_BybitBase, ABC):
                 # inconsistent venue read: fills exist, their ids do not).
                 # Advancing ``filled_qty`` on either would let a replay of
                 # these same executions pass the de-dup gate and
-                # double-count. Leave the row parked: the private stream
-                # re-applies the fills once (recovery touched nothing), and
-                # a later restart / verification resolves the dispatch.
+                # double-count. Recovery touches nothing. An entry whose
+                # order ended has no stream left to deliver the fills: it
+                # goes to the engine's held-execution path, which reads them
+                # back with :meth:`fetch_order_execution`. Any other row stays
+                # parked: the private stream re-applies a working order's
+                # fills once, and a later restart / verification resolves it.
+                status = str(existing.get('orderStatus') or '')
+                if status in _DEAD_ORDER_STATUSES or status == 'Filled':
+                    self._hand_over_unreported_execution(
+                        row, existing,
+                        "its executions could not be read" if not seeded
+                        else "the venue lists none of its executions")
                 return False
             self._seen_exec_ids.update(exec_ids)
         extras = dict(row.extras or {})
@@ -283,6 +297,47 @@ class _RecoveryMixin(_BybitBase, ABC):
                      'kind': extras.get('kind')},
         )
         return True
+
+    def _hand_over_unreported_execution(self, row, existing: dict, why: str) -> None:
+        """Hand a pending entry whose ended order the plugin cannot report to the engine.
+
+        The earlier process sent the entry and never learnt its outcome; the
+        venue shows the order ended (``Filled`` or dead), but this recovery
+        cannot book what it executed (``why``), and the order is in no open
+        set, so no stream event will ever carry it. Left pending, the
+        engine's startup adoption folds the venue position while the row
+        waits, and a later in-run delivery of the same execution would come
+        on top of it. So the order goes to the engine's held-execution path
+        (:meth:`~BrokerPlugin.request_execution_hold`) before the engine's
+        first sync: the row gets the venue order id, the entry is held, and
+        the engine reads the execution with :meth:`fetch_order_execution`
+        until it can book it. The row is flagged
+        (:data:`~pynecore_bybit.helpers.ENTRY_EXECUTION_HOLD_EXTRA`) once the
+        request is stored. A row the hold does not apply to (no entry, or no
+        longer waiting for the venue) or a request that could not be stored
+        stays pending, as before.
+
+        :param row: The pending row.
+        :param existing: The venue order object found by ``orderLinkId``.
+        :param why: Why the execution cannot be booked here, for the log.
+        """
+        store = self.store_ctx
+        order_id = str(existing.get('orderId') or '')
+        if store is None or not order_id:
+            return
+        current = store.get_order(row.client_order_id)
+        if current is None or not store.execution_hold_applies(current):
+            return
+        if not self.request_execution_hold(current.client_order_id, order_id):
+            return
+        extras = dict(current.extras or {})
+        extras[ENTRY_EXECUTION_HOLD_EXTRA] = True
+        store.upsert_order(current.client_order_id, extras=extras)
+        logger.warning(
+            "Bybit: entry order %s (%s) ended on the venue while the bot was down and "
+            "%s; handed to the engine, which reads its execution from the venue "
+            "history before it books it", order_id, current.client_order_id, why,
+        )
 
     def _retire_recovered_rejected(self, row, existing: dict) -> None:
         """Land a rejected / cancelled recovered row in ``rejected`` + retire it.
@@ -526,7 +581,8 @@ class _RecoveryMixin(_BybitBase, ABC):
         live exposure: the bot was stopped, then the order filled-and-closed
         or was cancelled manually outside it. Close the row and delete its
         envelope anchor, so the runtime reconcile does not later stamp a
-        missing-pending marker and halt a clean restart.
+        missing-pending marker and report a vanished order of a clean restart
+        as an unexpected cancel.
 
         Guards (the cTrader orphan-pass rules):
 
